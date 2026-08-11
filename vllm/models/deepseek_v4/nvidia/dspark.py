@@ -21,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -60,6 +61,12 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_TARGET_EMBED_KEYS = {
+    "embed.weight",
+    "model.embed.weight",
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+}
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -415,6 +422,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_end = n_local_head * (tp_rank + 1)
 
         for name, loaded_weight in weights:
+            if get_pp_group().world_size > 1 and name in _TARGET_EMBED_KEYS:
+                embed_name = "model.embed_tokens.weight"
+                param = params_dict[embed_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(embed_name)
+                continue
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue

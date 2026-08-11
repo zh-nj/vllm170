@@ -15,6 +15,7 @@ from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
@@ -33,6 +34,43 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def verify_dspark_pp_layout(
+    target_model_config: ModelConfig,
+    draft_model_config: ModelConfig,
+    target_parallel_config: ParallelConfig,
+) -> None:
+    """Verify that a last-rank DSpark drafter can consume target features."""
+    pp_size = target_parallel_config.pipeline_parallel_size
+    if pp_size <= 1:
+        return
+
+    draft_hf_config = draft_model_config.hf_config
+    target_layer_ids = getattr(
+        draft_hf_config, "dspark_target_layer_ids", None
+    ) or getattr(draft_hf_config, "target_layer_ids", None)
+    if not target_layer_ids:
+        raise ValueError(
+            "DSpark+PP requires explicit dspark_target_layer_ids or "
+            "target_layer_ids."
+        )
+
+    num_hidden_layers = target_model_config.hf_config.num_hidden_layers
+    start_layer, end_layer = get_pp_indices(num_hidden_layers, pp_size - 1, pp_size)
+    remote_layers = [
+        layer_id
+        for layer_id in target_layer_ids
+        if not start_layer <= layer_id < end_layer
+    ]
+    if remote_layers:
+        raise ValueError(
+            "DSpark+PP keeps the drafter on the last pipeline rank, but "
+            f"auxiliary target layers {remote_layers} are outside its layer "
+            f"partition [{start_layer}, {end_layer}). Adjust "
+            "VLLM_PP_LAYER_PARTITION or add an explicit auxiliary-state relay."
+        )
+
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
@@ -1078,6 +1116,16 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+                if self.method == "dspark":
+                    # The DSpark draft is instantiated only on the target's last
+                    # pipeline rank and runs there as a complete model. It must not
+                    # inherit the target model's pipeline partitioning.
+                    self.draft_parallel_config.pipeline_parallel_size = 1
+                    verify_dspark_pp_layout(
+                        self.target_model_config,
+                        self.draft_model_config,
+                        self.target_parallel_config,
+                    )
         return self
 
     def _validate_suffix_decoding(self):

@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config.speculative import verify_dspark_pp_layout
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
 
@@ -163,3 +165,36 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
                 distributed_executor_backend="external_launcher",
             ),
         )
+
+
+def test_dspark_pp_accepts_aux_layers_on_last_partition():
+    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_target_layer_ids=[40, 41, 42])
+    )
+    parallel = SimpleNamespace(pipeline_parallel_size=3)
+
+    verify_dspark_pp_layout(target, draft, parallel)
+
+
+def test_dspark_pp_rejects_aux_layers_on_remote_partition():
+    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_target_layer_ids=[14, 41, 42])
+    )
+    parallel = SimpleNamespace(pipeline_parallel_size=3)
+
+    with pytest.raises(ValueError, match="outside its layer partition"):
+        verify_dspark_pp_layout(target, draft, parallel)
+
+
+def test_dspark_pp_respects_manual_layer_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "15,15,13")
+    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_target_layer_ids=[29, 41, 42])
+    )
+    parallel = SimpleNamespace(pipeline_parallel_size=3)
+
+    with pytest.raises(ValueError, match=r"partition \[30, 43\)"):
+        verify_dspark_pp_layout(target, draft, parallel)

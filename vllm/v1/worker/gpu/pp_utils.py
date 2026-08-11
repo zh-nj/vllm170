@@ -30,6 +30,8 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
+    # Proposed tokens from the last rank. Present only for DSpark-over-PP.
+    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -49,6 +51,24 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     return need_sampled_mask if need_sampled_mask.any() else None
 
 
+def pad_sampled_tokens(
+    sampled_token_ids: torch.Tensor, max_sample_len: int
+) -> torch.Tensor:
+    """Pad a sampled-token matrix to the fixed PP collective width."""
+    width = sampled_token_ids.shape[-1]
+    if width == max_sample_len:
+        return sampled_token_ids
+    if width > max_sample_len:
+        raise ValueError(
+            f"sample width {width} exceeds PP buffer width {max_sample_len}"
+        )
+    padded = sampled_token_ids.new_full(
+        (sampled_token_ids.shape[0], max_sample_len), -1
+    )
+    padded[:, :width] = sampled_token_ids
+    return padded
+
+
 class PPHandler:
     """Runs the PP sampled-token broadcast/recv on a side stream so the
     default stream isn't gated by the matching peer call. Step T's recv is
@@ -60,11 +80,18 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        relay_draft_tokens: bool = False,
     ):
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
+        self.relay_draft_tokens = relay_draft_tokens
+        if relay_draft_tokens and num_speculative_steps < 1:
+            raise ValueError("Draft-token relay requires speculative decoding.")
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
@@ -121,6 +148,7 @@ class PPHandler:
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
+            draft_tokens=slot.draft_tokens,
         )
 
     def receive(self, input_batch: InputBatch) -> bool:
@@ -149,12 +177,25 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            draft_tokens = None
+            if self.relay_draft_tokens:
+                draft_tokens = torch.empty(
+                    num_reqs,
+                    self.max_sample_len - 1,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
             sampled_tokens.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
+            if draft_tokens is not None:
+                draft_tokens.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -164,6 +205,7 @@ class PPHandler:
             input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
+            draft_tokens,
         )
         return bool(need_sampled_mask.all())
 
@@ -181,6 +223,11 @@ class PPHandler:
 
         assert sampled_token_ids.dtype == torch.int64
 
+        # The receiver always posts a fixed-width buffer. Prefill and the first
+        # decode step may produce only one sampled token, so pad before issuing
+        # the collective to keep NCCL element counts identical on every rank.
+        sampled_token_ids = pad_sampled_tokens(sampled_token_ids, self.max_sample_len)
+
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 
@@ -197,3 +244,26 @@ class PPHandler:
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
+
+    def broadcast_draft(
+        self, draft_tokens: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        """Relay DSpark proposals from the last rank to target PP stages."""
+        assert self.is_last_rank
+        if not self.relay_draft_tokens:
+            raise RuntimeError("Draft-token relay is not enabled for this PP handler.")
+        if compute_need_sampled_mask(input_batch) is None:
+            return
+        expected_width = self.max_sample_len - 1
+        if draft_tokens.ndim != 2 or draft_tokens.shape[1] != expected_width:
+            raise ValueError(
+                "DSpark draft-token shape must be "
+                f"[num_reqs, {expected_width}], got {tuple(draft_tokens.shape)}"
+            )
+        draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                draft_tokens, src=self.last_rank, group=self.broadcast_group
+            )
+            draft_tokens.record_stream(self.broadcast_stream)

@@ -209,7 +209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                if self.use_pp and self.speculative_config.method != "dspark":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -253,6 +253,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                relay_draft_tokens=(
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "dspark"
+                ),
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -835,7 +839,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+                draft_tokens = outputs.pop("draft_tokens", None)
+                idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
+                if draft_tokens is not None:
+                    valid = idx_mapping >= 0
+                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
+                        valid
+                    ]
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -1584,6 +1595,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.pp_handler is not None:
+                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

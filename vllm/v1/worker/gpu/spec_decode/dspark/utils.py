@@ -46,8 +46,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+    is_pp = get_pp_group().world_size != 1
 
     target_language_model = (
         target_model.get_language_model()
@@ -59,20 +58,36 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
-    if target_embed is not None and _should_share(
+    target_embed_is_materialized = (
+        target_embed is not None and getattr(target_embed, "weight", None) is not None
+    )
+    if target_embed_is_materialized and _should_share(
         draft_model, "has_own_embed_tokens", draft_embed, target_embed
     ):
         if draft_embed is not None:
             del draft_inner.embed_tokens
         draft_inner.embed_tokens = target_embed
+    elif is_pp and getattr(draft_embed, "weight", None) is None:
+        raise RuntimeError(
+            "DSpark+PP requires a materialized draft embedding on the last "
+            "pipeline rank."
+        )
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
+    target_lm_head_is_materialized = (
+        target_lm_head is not None
+        and getattr(target_lm_head, "weight", None) is not None
+    )
+    if target_lm_head_is_materialized and _should_share(
         draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
+    elif is_pp:
+        raise RuntimeError(
+            "DSpark+PP expects the target lm_head on the last pipeline rank."
+        )
 
     return draft_model
