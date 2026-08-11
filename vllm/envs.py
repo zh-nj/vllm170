@@ -58,6 +58,10 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
+    VLLM_INDEXER_LOGITS_MAXNREG: int = 0
+    VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+    VLLM_INDEXER_PAGED_Q_BF16: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1052,6 +1056,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
+        os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
+    ),
+    "VLLM_INDEXER_LOGITS_MAXNREG": lambda: int(
+        os.getenv("VLLM_INDEXER_LOGITS_MAXNREG", "0")
+    ),
+    "VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M": lambda: int(
+        os.getenv("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
+    ),
+    "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
+        os.getenv("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
