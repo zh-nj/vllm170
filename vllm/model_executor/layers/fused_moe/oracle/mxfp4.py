@@ -107,6 +107,8 @@ class Mxfp4MoeBackend(Enum):
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
+    # vllm170 experimental DSV4 backend: approximate MXFP4 -> INT8 on SM80.
+    MXFP4_INT8_SM80 = "MXFP4_INT8_SM80"
     # ROCm AITER backends
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel
     # Keep the legacy name as an alias while the ROCm split backend rename settles.
@@ -221,6 +223,13 @@ def backend_to_kernel_cls(
 
         return [BatchedMarlinExperts]
 
+    elif backend == Mxfp4MoeBackend.MXFP4_INT8_SM80:
+        from vllm.model_executor.layers.fused_moe.experts.mxfp4_int8_sm80 import (
+            Mxfp4Int8Sm80Experts,
+        )
+
+        return [Mxfp4Int8Sm80Experts]
+
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
         from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
             AiterW4A16ExpertsMonolithic,
@@ -288,6 +297,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
         "marlin": [Mxfp4MoeBackend.MARLIN],
+        "mxfp4_int8_sm80": [Mxfp4MoeBackend.MXFP4_INT8_SM80],
         "aiter": [
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.AITER_MXFP4_FP8,
@@ -645,6 +655,11 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         # DeepGEMM requires M/N/K alignment
+        intermediate_size = round_up(intermediate_size, 128)
+        hidden_size = round_up(hidden_size, 128)
+    elif backend == Mxfp4MoeBackend.MXFP4_INT8_SM80:
+        # The INT8 MMA K tile is 128. The current implementation is further
+        # restricted to DSV4's already-aligned TP1 dimensions.
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
@@ -1292,6 +1307,40 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    if mxfp4_backend == Mxfp4MoeBackend.MXFP4_INT8_SM80:
+        if w13_bias is not None or w2_bias is not None:
+            raise ValueError("mxfp4_int8_sm80 does not support expert bias")
+        from vllm.model_executor.layers.quantization.utils.mxfp4_int8_sm80 import (
+            remap_mxfp4_weight_for_int8,
+        )
+
+        w13_packed, w13_shift2, w13_channel_scale = remap_mxfp4_weight_for_int8(
+            w13_weight,
+            w13_weight_scale,
+            headroom_bits=3,
+        )
+        w2_packed, w2_shift2, w2_channel_scale = remap_mxfp4_weight_for_int8(
+            w2_weight,
+            w2_weight_scale,
+            headroom_bits=3,
+        )
+        layer.register_parameter(
+            "w13_mxfp4_int8_shift2",
+            torch.nn.Parameter(w13_shift2, requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_mxfp4_int8_shift2",
+            torch.nn.Parameter(w2_shift2, requires_grad=False),
+        )
+        return (
+            w13_packed,
+            w2_packed,
+            w13_channel_scale,
+            w2_channel_scale,
+            None,
+            None,
+        )
+
     if mxfp4_backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
             convert_to_humming_moe_kernel_format,
@@ -1666,6 +1715,7 @@ def make_mxfp4_moe_quant_config(
     elif mxfp4_backend in (
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
+        Mxfp4MoeBackend.MXFP4_INT8_SM80,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
@@ -1731,7 +1781,10 @@ def make_mxfp4_moe_kernel(
     logger.info_once("Using %s", experts_cls.__name__)
 
     extra_kwargs = {}
-    if mxfp4_backend == Mxfp4MoeBackend.HUMMING:
+    if mxfp4_backend in (
+        Mxfp4MoeBackend.HUMMING,
+        Mxfp4MoeBackend.MXFP4_INT8_SM80,
+    ):
         assert layer is not None
         extra_kwargs["layer"] = layer
 

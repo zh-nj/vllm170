@@ -131,6 +131,7 @@ MoEBackend = Literal[
     "flashinfer_cutedsl",
     "flashinfer_b12x",
     "marlin",
+    "mxfp4_int8_sm80",
     "humming",
     "triton_unfused",
     "aiter",

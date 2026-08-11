@@ -1344,6 +1344,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
                    " in CUDA target architectures")
   endif()
 
+  # vllm170 experimental DSV4 MXFP4 -> INT8 MoE kernel. Keep this source
+  # isolated and compile it only when an SM80-family target is requested;
+  # the Python oracle never selects it automatically.
+  cuda_archs_loose_intersection(MXFP4_INT8_SM80_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+  if(MXFP4_INT8_SM80_ARCHS)
+    set(MXFP4_INT8_SM80_SRC
+      "csrc/libtorch_stable/moe/mxfp4_int8_sm80/mxfp4_int8_moe_entry.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${MXFP4_INT8_SM80_SRC}"
+      CUDA_ARCHS "${MXFP4_INT8_SM80_ARCHS}")
+    set_source_files_properties(${MXFP4_INT8_SM80_SRC}
+      PROPERTIES COMPILE_FLAGS
+      "--expt-relaxed-constexpr --use_fast_math -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -DCUTLASS_DEBUG_TRACE_LEVEL=0")
+    list(APPEND VLLM_MOE_EXT_SRC "${MXFP4_INT8_SM80_SRC}")
+    message(STATUS "Building experimental MXFP4-int8 MoE kernel for: ${MXFP4_INT8_SM80_ARCHS}")
+  endif()
+
   # DeepSeek V3 router GEMM kernel requires SM90+ and CUDA >= 12.0.
   # (fp32_router_gemm has been migrated to _C_stable_libtorch above.)
   cuda_archs_sm90plus(SM90PLUS_ROUTER_GEMM_ARCHS "${CUDA_ARCHS}")
