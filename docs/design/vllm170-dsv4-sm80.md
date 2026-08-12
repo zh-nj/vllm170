@@ -2,7 +2,7 @@
 
 ## 目标与边界
 
-`vllm170` 从官方 `v0.27.0` 标签（`4bdc8a788d`）派生，目标部署为 5 张
+`vllm170` 从官方 `v0.27.1` 标签（`6e448d0ea9`）派生，目标部署为 5 张
 170HX 中 3 张运行 DeepSeek V4 Flash，另外 2 张保留给其他模型。由于卡间互联
 带宽有限，DSV4F 固定采用 `PP=3, TP=1`，不把 MoE expert 或 attention head 横跨
 显卡切分。
@@ -11,7 +11,7 @@
 
 1. 保留 vLLM 的模型注册、attention backend、MoE oracle 和 modular MoE 边界，
    不使用启动时 monkey patch；新增模型或设备后端按同样边界扩展。
-2. 官方 `v0.27.0` 中已有的 DSV4、mHC、输入 GEMM 多流、eager scratch、辅助
+2. 官方 `v0.27.1` 中已有的 DSV4、mHC、输入 GEMM 多流、eager scratch、辅助
    hidden state、MXFP4 MoE 和 sequence-parallel 优化继续作为主体。
 3. PP+DSpark 和 SM80 sparse-MLA 是本部署的正确性路径；MXFP4→INT8 是近似
    实验后端，必须显式选择，验证前不进入 `auto` 优先级。
@@ -22,7 +22,7 @@
 
 ### 官方 vLLM
 
-`v0.27.0` 已包含完整的 DSV4 NVIDIA 模型与 DSpark 框架，且 target model 已实现
+`v0.27.1` 已包含完整的 DSV4 NVIDIA 模型与 DSpark 框架，且 target model 已实现
 `SupportsPP`。缺口不是重新实现 DSV4，而是：
 
 - DSpark 原先禁止 PP，draft 并未按“只在末级完整运行”处理；
@@ -45,7 +45,33 @@
 这些提交形成了新增代码的约束：SM80 attention 复用现有 metadata/workspace，INT8 MoE
 接入 modular experts/oracle，PP 只补 token 状态，不回退到第三方旧版 model runner。
 
-基于 `v0.27.0` 之后的官方提交，当前处理如下：
+#### PR #50424：量化 DSpark Markov head
+
+`v0.27.1` 已通过提交 `7ce42a9bb8` 吸收官方
+[`#50424`](https://github.com/vllm-project/vllm/pull/50424)：
+
+- `DSparkMarkovHead` 新增可选 `quant_config`，并把它交给 `markov_w2` 的
+  `ParallelLMHead`，从而复用标准量化方法选择和权重加载；
+- `Qwen3DSparkModel` 传入自身的 `self.quant_config`，支持带 `weight_scale_2` 的
+  W4A16 Markov projection；
+- 该 PR 只改变量化配置和权重注册，不包含新的 kernel，也不直接带来运行时加速。
+
+DSV4F 不能机械照搬 Qwen3 的调用方式。对官方
+`deepseek-ai/DeepSeek-V4-Flash-DSpark` 的 `model-00048-of-00048.safetensors`
+做 range header 检查，当前 checkpoint 只包含以下 Markov tensor：
+
+| tensor | dtype | shape | 量化 scale |
+| --- | --- | --- | --- |
+| `mtp.2.markov_head.markov_w1.weight` | BF16 | `[129280, 256]` | 无 |
+| `mtp.2.markov_head.markov_w2.weight` | BF16 | `[129280, 256]` | 无 |
+
+因此 vllm170 保留上游新增的可选接口，但 DSV4 的 `DSparkMarkovHead` 当前仍使用默认
+`quant_config=None`。将全局 `DeepseekV4FP8Config` 直接传入会把 BF16 `markov_w2`
+错误地按 FP8 linear 注册，并期待 checkpoint 不存在的 scale。未来如果出现量化 DSV4
+Markov head，必须根据其独立量化元数据构造 head-specific config，并同时验证 weight、
+`weight_scale_2`/`scale_inv`、logits parity 和显存收益，不能仅按模型全局量化类型推断。
+
+基于 `v0.27.1` 之后的官方提交，当前处理如下：
 
 | 提交 | 思路 | vllm170 处理 |
 | --- | --- | --- |
@@ -92,7 +118,7 @@ vllm170 将其实现为 `mxfp4_int8_sm80`，而 Marlin 仍是未指定 backend �
 
 PP relay 的静态参考点是 `deepseek-v4-cmp170hx` 提交
 `2d10b1672d90b6c6b4fbbf85728e09236e23d72e` 中拆分保存的补丁；本分支按
-`v0.27.0` 当前接口重新实现，并增加配置期 partition 验证，而不是直接套用补丁。
+`v0.27.1` 当前接口重新实现，并增加配置期 partition 验证，而不是直接套用补丁。
 
 选择“target PP3，draft PP1 只驻留最后一级”的方案：
 
@@ -226,6 +252,10 @@ DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再
   对比无 speculative、5-token、7-token。
 - 验证所有 auxiliary hidden IDs 位于最后 stage，并检查 draft embedding/lm_head 权重
   的加载、共享与显存占用。
+- 检查日志与参数注册，确认当前官方 checkpoint 的 `markov_w1/markov_w2` 均按 BF16
+  加载且没有缺失 scale；记录 Markov projection 延迟和约 126 MiB 的双矩阵显存占用。
+- 若以后测试量化 Markov checkpoint，先验证 `weight_scale_2`/`scale_inv` 的命名、shape
+  和量化方法分派，再比较 bias logits、acceptance rate、显存和逐 draft-token 延迟。
 - A/B 官方后续的 top-k Markov projection（`5789897aa4`），只在 parity 通过后采用。
 
 ### 3. attention/indexer
