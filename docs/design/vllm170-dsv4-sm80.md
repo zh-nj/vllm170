@@ -30,20 +30,53 @@
 - Triton 在 SM89 以下拒绝原生 E4M3 转换；
 - 官方 MXFP4 自动后端没有针对 SM80 INT8 Tensor Core 的实验路径。
 
-本分支没有另写一套 DSV4 主循环，而是直接保留 `v0.27.0` 已合入的官方性能主干：
+本分支没有另写一套 DSV4 主循环，而是直接保留 `v0.27.1` 已合入的官方性能主干。
+针对本部署重点审计的 performance push 如下；上游百分比均来自其特定高端 GPU、TP/EP
+和请求形状，不能直接当作 170HX PP3 的预期收益。
 
-| 已包含的官方提交 | 保留并复用的设计思想 |
-| --- | --- |
-| `df71917cf1` | eager break 的临时量统一进入 scratch/workspace 复用，避免循环分配 |
-| `904fae8be1` | PP intermediate tensor 按真实 mHC 形状直接传递，消除 448 MiB 重复分配/拷贝 |
-| `f70caef48b` | request 到 token 的映射由 metadata builder 缓存，不在各 kernel 前重复构造 |
-| `b0cb1da1bd`、`37e370fe93` | 无有效工作时跳过 router/top-k/空 c128 launch，而不是启动空 kernel |
-| `b2f9e4caa4`、`e18fe932ca` | top-k 宽度与 prefill chunk 根据有效长度规划，避免按最大上下文做无效工作 |
-| `837eae6458`、`442c421e79` | 去掉 full-kernel、repeat 与 copy，保持 mHC/MLA 数据在消费布局中 |
-| `38a466e7b6` | sequence-parallel 边界已进入正式模型接口；本部署 TP1 不启用，但不破坏它 |
+| PR / 提交 | 上游方法 | vllm170 的调用链与处理 |
+| --- | --- | --- |
+| `#46789` / `38a466e7b6` | attention 前 all-gather、后 reduce-scatter，MoE/MLP 保持 sequence-sharded | 完整继承；上游要求 `PP=1, TP>1, EP`，本部署 `PP3/TP1` 明确不启用 |
+| `#48957` / `37e370fe93` | CPU metadata 判断本步是否跨 C128 边界；不跨时跳过空 compress/store kernel | 完整继承并经过 SM80 公共 compressor；FULL graph 为保持可重放性不会走该 Python 分支 |
+| `#49486` / `b0cb1da1bd` | 候选数不超过 top-k 时直接填全部候选，跳过 indexer Q、logits、router/top-k | 完整继承；SM80 FP8 indexer 同样生效，K compressor/cache 写入仍保留 |
+| `#49236` / `df71917cf1` | eager break 内的 Q、compressor 和 indexer 输出改用模型级 scratch/out op | 完整继承；另为 SM80 FP8 indexer Q/weights 增加 scratch，避免上游只覆盖 MXFP4 Q 的缺口 |
+| `#50298` / `837eae6458` | `combine_topk_swa_indices` 接收 caller buffer，去掉大 `torch.full` | 上游只接入 FlashMLA；vllm170 已将同一 out-buffer 约定接入 SM80 使用的 Triton sparse prefill |
+| `#50004` / `b2f9e4caa4` | C128 metadata 行宽按当前上下文自适应，不总循环 8192 列 | metadata builder 被 SM80 backend 继承，运行时有效；warmup 仍预留最大 workspace，防止锁定后扩容 |
+| `#50312` / `904fae8be1` | 只在投机模型需要时分配/复制 pre-hc hidden buffer | 完整继承；进一步识别 DSpark 消费 aux hidden states，不再在 PP 最后一级保留无用 pre-hc buffer |
+| `#48993` / `f3a920a076` | MXFP4 indexer 行由 132B 降至 68B，并让 packed cache group 稠密 overlay | 通用 group overlay 已生效；SM80 当前禁止 MXFP4 indexer，所以 68B 行优化尚不启用 |
+| `#48047` / `b49eaf205a` | FlashInfer >=0.6.14 在 SM100/SM120 支持 8/16/32 heads，去掉 q-head padding | 代码完整保留，但 SM80 走 Triton backend，当前部署不经过该路径 |
 
 这些提交形成了新增代码的约束：SM80 attention 复用现有 metadata/workspace，INT8 MoE
 接入 modular experts/oracle，PP 只补 token 状态，不回退到第三方旧版 model runner。
+
+逐项算法与收益口径：
+
+- `#46789` 的收益来自 TP/EP 内把 token 维分片后减少每 rank 的 MoE/MLP 工作，并用一次
+  attention 边界 collective 恢复所需布局；它不是 PP 优化。170HX 互联受限且固定 TP1，
+  强行开启只会增加通信并破坏当前 INT8 MoE 的 TP1 contract。
+- `#48957` 仍执行 `save_partial_states`，只在没有形成完整 C128 block 时跳过后半段
+  compress/norm/RoPE/cache store。上游 B300 microbench 为 eager 51.676→17.041 μs、
+  graph replay 6.150→3.356 μs；这是单步小算子，不是 E2E 2 倍。
+- `#49486` 的捷径成立条件是 `max_seq_len / compress_ratio <= index_topk`。它改善短
+  context TTFT；进入长 context 后仍必须计算真实 indexer logits/top-k。
+- `#49236` 的关键不是减少算术，而是让 eager break 两侧保持稳定地址并消除逐层
+  `torch.empty`。vllm170 的 scratch storage 让 FP4、FP8 indexer、global top-k 和 C128
+  compressor 分时 overlay；这些对象不能跨异步消费期同时复用，实机需用 compute-sanitizer
+  和多 stream 压测确认生命周期。
+- `#50298` 允许 padding 区保持未初始化，正确性依靠 `combined_lens` 限定有效列。SM80
+  移植因此必须同时传 `combined_indices` 和 `combined_lens`，不能只复用 indices。
+  上游 1.88 倍是 B300 上 8K C128 combine-index 微操作的 0.093→0.049 ms。
+- `#50004` 在 32K context 时把 C128 行宽从 8192 缩为 256；实际 width 仍取 2 的幂并
+  至少按 128 对齐。它减少 metadata kernel 循环与下游 valid width，不缩减最大持久
+  buffer；因此主要是算力/带宽优化，不应把它计作固定显存节省。
+- `#50312` 的 448 MiB 数字来自 `8192 × 4 × 7168 × BF16`。DSV4 Flash 的
+  `hidden_size=4096`，在本文启动参数 `max_num_batched_tokens=2048` 下，DSpark 扩展可
+  额外省去 64 MiB 和每 target step 的一次 copy；若用 8192 tokens 则为 256 MiB。
+- `#48993` 的 +6.50%/+12.05% block 数来自 GB200 的 FP4 indexer 配置。当前 SM80
+  FP8 行仍为 `128B value + 4B scale`；只有 packed group overlay 可直接继承。未来要
+  启用 68B MXFP4 行，必须先实现并验证 SM80 的 MXFP4 Q/K 软件解码 logits kernel。
+- `#48047` 只影响 FlashInfer sparse-MLA SM100/SM120。SM80 无需为了它引入或固定
+  FlashInfer 版本，也不应把 q-head padding 逻辑搬进 Triton backend。
 
 #### PR #50424：量化 DSpark Markov head
 
@@ -252,6 +285,9 @@ DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再
   对比无 speculative、5-token、7-token。
 - 验证所有 auxiliary hidden IDs 位于最后 stage，并检查 draft embedding/lm_head 权重
   的加载、共享与显存占用。
+- DSpark 启动后确认 target `_mtp_hidden_buffer is None`，而 MTP 回归配置仍分配该
+  buffer；对比修改前后 PP 最后一级显存，并确认 runner 始终把 aux hidden states 交给
+  `combine_hidden_states`，不会误用 post-hc target hidden state。
 - 检查日志与参数注册，确认当前官方 checkpoint 的 `markov_w1/markov_w2` 均按 BF16
   加载且没有缺失 scale；记录 Markov projection 延迟和约 126 MiB 的双矩阵显存占用。
 - 若以后测试量化 Markov checkpoint，先验证 `weight_scale_2`/`scale_inv` 的命名、shape
@@ -262,10 +298,29 @@ DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再
 
 - 序列长度：1K、8K、32K、128K，内存允许后再到 1M；batch 覆盖 1、8、32。
 - 对比 Torch/高精度 reference 的 top-k overlap、attention 输出最大误差和 token parity。
+- 用 profiler 分别统计 `save_partial_states` 与 C128 compress/store launch 次数；eager/
+  PIECEWISE 下非边界 step 应跳过后者，FULL graph 单独记录，不混算 `#48957` 收益。
+- 在 context 低于/跨过 `index_topk * compress_ratio` 两侧取点，确认短上下文没有 MQA
+  logits/top-k launch，跨阈值后恢复完整 indexer 路径。
+- 记录 C128 metadata 实际行宽：1K/8K/32K/128K/1M 应按自适应规则增长，禁止只看
+  预分配 buffer 的 8192 上限来判断 `#50004` 未生效。
+- 对 Triton sparse prefill 的 combined-index 做临时 A/B 分支：旧 `torch.full` 与共享
+  workspace 比较 kernel P50/P99、allocator activity、峰值显存和 valid-column parity。
+- 对 FP8 indexer scratch 做多 stream、CUDA graph replay 和 batch-size 切换压测；确认
+  Q/weights 在 logits 消费完成前未被 global-topk overlay 覆盖。
 - A/B LUT 与 ALU decode、paged-Q 预解码开关、prefill KV grouping、decode split 数。
 - 调整 `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` 的 row chunk 为 128/256/512 MiB，观察
   峰值显存、kernel 次数和长上下文 latency。
 - A/B 主线缩小 eager graph 区域（`79c865b838`），记录 graph 显存和 decode 抖动。
+
+### 3.1 cache packing 与后端边界
+
+- 用 `tests/v1/core/test_contiguous_kv_packing.py` 覆盖 group overlay，再从启动日志记录
+  FP8 indexer、C4/C128 MLA、SWA 各 cache spec 的 page size、offset 和 block 数。
+- 当前 `use_fp4_indexer_cache=False`；先测 FP8 132B/indexer-row 基线。MXFP4 68B 实验
+  必须放在独立 backend 后，不允许仅删除 SM80 配置拒绝检查。
+- `#48047` 不做 170HX A/B；只确认选择器最终为 `TRITON_MLA_SPARSE_DSV4`，没有意外
+  加载 FlashInfer sparse-MLA 或 q-head padding。
 
 ### 4. MoE backend
 

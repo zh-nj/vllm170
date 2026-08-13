@@ -868,8 +868,10 @@ class DeepseekV4Indexer(nn.Module):
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
             outputs = None
-            if self.eager_scratch_pool is not None and self.use_fp4_kv:
-                outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])
+            if self.eager_scratch_pool is not None:
+                outputs = self.eager_scratch_pool.indexer_q_outputs(
+                    q.shape[0], use_fp4=self.use_fp4_kv
+                )
             return fused_indexer_q_rope_quant(
                 positions,
                 q,

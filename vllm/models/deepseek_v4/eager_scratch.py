@@ -21,6 +21,7 @@ class DeepseekV4EagerScratchPool:
         q_head_dim: int,
         index_q_heads: int,
         index_q_head_dim: int,
+        index_q_dtype: torch.dtype,
         index_topk: int,
         device: torch.device | str,
     ) -> None:
@@ -44,17 +45,21 @@ class DeepseekV4EagerScratchPool:
             ),
             ((max_num_tokens, index_q_heads), torch.float32),
         )
+        fp8_specs = (
+            ((max_num_tokens, index_q_heads, index_q_head_dim), index_q_dtype),
+            ((max_num_tokens, index_q_heads), torch.float32),
+        )
         global_specs = (
             ((max_num_tokens, index_topk), torch.int32),
             ((max_num_tokens,), torch.int32),
         )
         compressor_specs = (((max_num_tokens, q_head_dim), torch.float32),)
-        # FP4 indexer is C4 only, global mapping after FP4 indexer
-        # compressor scratch is C128 only
+        # FP4/FP8 indexer scratch is C4 only and global mapping runs after the
+        # indexer logits/top-k consumer; compressor scratch is C128 only.
         # so here we use max instead of sum
         aux_bytes = max(
             self._packed_size(specs)
-            for specs in (fp4_specs, global_specs, compressor_specs)
+            for specs in (fp4_specs, fp8_specs, global_specs, compressor_specs)
         )
         storage = torch.empty(aux_bytes, dtype=torch.uint8, device=device)
 
@@ -64,6 +69,9 @@ class DeepseekV4EagerScratchPool:
         self._fp4_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        fp8_values, fp8_weights = self._views(storage, fp8_specs)
+        self._fp8_template = (fp8_values, fp8_weights)
+        self._fp8_outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         global_indices, global_lens = self._views(storage, global_specs)
         self._global_template = (global_indices, global_lens)
         self._global_outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -112,17 +120,26 @@ class DeepseekV4EagerScratchPool:
     def indexer_q_outputs(
         self,
         num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        output = self._fp4_outputs.get(num_tokens)
-        if output is None:
-            values, scales, weights = self._fp4_template
-            output = (
-                values[:num_tokens],
-                scales[:num_tokens],
-                weights[:num_tokens],
-            )
-            self._fp4_outputs[num_tokens] = output
-        return output
+        use_fp4: bool,
+    ) -> tuple[torch.Tensor, ...]:
+        if use_fp4:
+            output = self._fp4_outputs.get(num_tokens)
+            if output is None:
+                values, scales, weights = self._fp4_template
+                output = (
+                    values[:num_tokens],
+                    scales[:num_tokens],
+                    weights[:num_tokens],
+                )
+                self._fp4_outputs[num_tokens] = output
+            return output
+
+        fp8_output = self._fp8_outputs.get(num_tokens)
+        if fp8_output is None:
+            values, weights = self._fp8_template
+            fp8_output = (values[:num_tokens], weights[:num_tokens])
+            self._fp8_outputs[num_tokens] = fp8_output
+        return fp8_output
 
     def global_topk_outputs(
         self, topk_indices: torch.Tensor

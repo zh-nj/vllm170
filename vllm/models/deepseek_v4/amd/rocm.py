@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
@@ -124,6 +125,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
@@ -133,15 +135,18 @@ def combine_topk_swa_indices(
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
-    combined_indices = torch.full(
-        (num_tokens, combined_topk),
-        fill_value=-1,
-        dtype=torch.int32,
-        device=topk_indices.device,
-    )
-    combined_lens = torch.empty(
-        num_tokens, dtype=torch.int32, device=topk_indices.device
-    )
+    if out is None:
+        combined_indices = torch.full(
+            (num_tokens, combined_topk),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+        combined_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
+    else:
+        combined_indices, combined_lens = out
 
     num_workers = 128
     _combine_topk_swa_indices_kernel[(num_reqs, num_workers)](
@@ -558,8 +563,18 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 // self.compress_ratio
             )
             M = N + self.window_size + self.max_num_batched_tokens
+            if swa_only:
+                top_k = 0
+            elif self.compress_ratio == 128:
+                top_k = N
+            else:
+                assert self.topk_indices_buffer is not None
+                top_k = self.topk_indices_buffer.shape[-1]
+            combined_topk = round_up(top_k + self.window_size, 128)
             current_workspace_manager().get_simultaneous(
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.max_num_batched_tokens, combined_topk), torch.int32),
+                ((self.max_num_batched_tokens,), torch.int32),
             )
             output.zero_()
             return
@@ -715,9 +730,14 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         )
 
         workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        combined_topk = round_up(top_k + self.window_size, 128)
+        kv, combined_indices_out, combined_lens_out = (
+            workspace_manager.get_simultaneous(
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.max_num_batched_tokens, combined_topk), torch.int32),
+                ((self.max_num_batched_tokens,), torch.int32),
+            )
+        )
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
@@ -756,6 +776,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
+            combined_indices_chunk = combined_indices_out[: query_end - query_start]
+            combined_lens_chunk = combined_lens_out[: query_end - query_start]
 
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
@@ -769,6 +791,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 top_k,
                 M,
                 N,
+                out=(combined_indices_chunk, combined_lens_chunk),
             )
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],

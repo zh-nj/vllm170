@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -780,6 +780,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     device_capability = current_platform.get_device_capability()
     if device_capability is not None and device_capability.major == 8:
         if backend not in (None, AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4):
+            assert backend is not None
             raise ValueError(
                 f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
                 "use TRITON_MLA_SPARSE_DSV4."
@@ -826,6 +827,13 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
         and parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
         and (use_mega_moe or parallel_config.data_parallel_size > 1)
+    )
+
+
+def _needs_pre_hc_hidden_states(spec_config: SpeculativeConfig | None) -> bool:
+    return spec_config is not None and (
+        (spec_config.use_eagle() and not spec_config.use_dspark())
+        or spec_config.uses_draft_model()
     )
 
 
@@ -1051,6 +1059,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 config.head_dim,
                 config.index_n_heads,
                 config.index_head_dim,
+                current_platform.fp8_dtype(),
                 config.index_topk,
                 current_platform.device_type,
             )
@@ -1109,10 +1118,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+        needs_pre_hc_hidden_states = _needs_pre_hc_hidden_states(spec_config)
+        if get_pp_group().is_last_rank and needs_pre_hc_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,

@@ -4,6 +4,48 @@ import pytest
 import torch
 
 
+def test_triton_sparse_combine_reuses_output_buffers(monkeypatch):
+    from vllm.models.deepseek_v4.amd import rocm
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            assert grid == (1, 128)
+
+            def launch(*args, **kwargs):
+                del args, kwargs
+
+            return launch
+
+    def fail_full(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("output reuse must not launch torch.full")
+
+    monkeypatch.setattr(rocm, "_combine_topk_swa_indices_kernel", FakeKernel())
+    monkeypatch.setattr(
+        rocm.triton, "next_power_of_2", lambda value: value, raising=False
+    )
+    monkeypatch.setattr(rocm.torch, "full", fail_full)
+
+    topk_indices = torch.empty((2, 4), dtype=torch.int32)
+    combined_indices = torch.empty((2, 128), dtype=torch.int32)
+    combined_lens = torch.empty(2, dtype=torch.int32)
+    actual_indices, actual_lens = rocm.combine_topk_swa_indices(
+        topk_indices=topk_indices,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        gather_lens=torch.tensor([2], dtype=torch.int32),
+        window_size=2,
+        compress_ratio=4,
+        topk=4,
+        M=4,
+        N=2,
+        out=(combined_indices, combined_lens),
+    )
+
+    assert actual_indices is combined_indices
+    assert actual_lens is combined_lens
+
+
 def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
     from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
 
