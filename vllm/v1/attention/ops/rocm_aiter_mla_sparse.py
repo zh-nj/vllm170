@@ -14,7 +14,10 @@ from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.fp8_sm80 import (
     _decode_fp8_lut,
@@ -615,6 +618,24 @@ def rocm_aiter_sparse_attn_indexer_fake(
     return topk_indices_buffer
 
 
+def _gather_indexer_chunk_kv_cache(
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    kv_cache: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+) -> None:
+    if chunk.skip_kv_gather:
+        return
+    cp_gather_indexer_k_quant_cache_triton(
+        kv_cache,
+        k_fp8,
+        k_scale,
+        chunk.block_table,
+        chunk.cu_seq_lens,
+        token_to_seq=chunk.token_to_seq,
+    )
+
+
 @eager_break_during_capture
 def rocm_aiter_sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -731,14 +752,7 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            cp_gather_indexer_k_quant_cache_triton(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-                token_to_seq=chunk.token_to_seq,
-            )
+            _gather_indexer_chunk_kv_cache(chunk, kv_cache, k_fp8, k_scale)
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
@@ -957,6 +971,15 @@ def _get_cached_wo_a_bf16(
     cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
     if cached is not None:
         return cached
+    bmm_weight = getattr(wo_a, "bmm_weight_bf16", None)
+    if bmm_weight is not None:
+        expected_shape = (n_local_groups, o_lora_rank, hidden_dim)
+        assert bmm_weight.shape == expected_shape, (
+            f"Expected preprocessed wo_a BMM weight {expected_shape}, got "
+            f"{tuple(bmm_weight.shape)}"
+        )
+        wo_a._dsv4_wo_a_bf16 = bmm_weight
+        return bmm_weight
     if hasattr(wo_a, "weight_scale_inv"):
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32

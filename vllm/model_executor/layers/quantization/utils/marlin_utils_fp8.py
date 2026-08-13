@@ -21,6 +21,10 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_unpad_output,
     should_use_atomic_add_reduce,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    scaled_dequantize,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -30,6 +34,47 @@ logger = init_logger(__name__)
 
 def is_fp8_marlin_supported():
     return current_platform.has_device_capability(75)
+
+
+def _cache_fp8_bmm_weight(
+    layer: torch.nn.Module,
+    size_k_first: bool,
+) -> None:
+    if not getattr(layer, "is_bmm", False):
+        return
+
+    weight = layer.weight.T if size_k_first else layer.weight
+    weight_block_size = getattr(layer, "weight_block_size", None)
+    if weight_block_size is not None:
+        scale = layer.weight_scale_inv
+        weight_bf16 = scaled_dequantize(
+            weight,
+            scale,
+            group_shape=GroupShape(*weight_block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        scale = layer.weight_scale.flatten().to(torch.float32)
+        if scale.numel() == 1:
+            scale = scale.expand(weight.shape[0])
+        elif scale.numel() != weight.shape[0]:
+            logical_widths = getattr(layer, "logical_widths", [])
+            if scale.numel() == len(logical_widths):
+                scale = scale.repeat_interleave(
+                    scale.new_tensor(logical_widths, dtype=torch.int64)
+                )
+            else:
+                assert weight.shape[0] % scale.numel() == 0
+                scale = scale.repeat_interleave(weight.shape[0] // scale.numel())
+        weight_bf16 = (weight.to(torch.float32) * scale[:, None]).to(torch.bfloat16)
+
+    batch_size = layer.bmm_batch_size
+    assert weight_bf16.shape[0] % batch_size == 0
+    layer.bmm_weight_bf16 = weight_bf16.view(
+        batch_size,
+        weight_bf16.shape[0] // batch_size,
+        weight_bf16.shape[1],
+    )
 
 
 def fp8_fused_exponent_bias_into_scales(scales):
@@ -128,6 +173,8 @@ def prepare_fp8_layer_for_marlin(
         assert layer.weight.shape == (part_size_k, part_size_n)
     else:
         assert layer.weight.shape == (part_size_n, part_size_k)
+
+    _cache_fp8_bmm_weight(layer, size_k_first)
 
     device = layer.weight.device
 

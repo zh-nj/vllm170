@@ -7,6 +7,7 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    mhc_pre_broadcast_tilelang,
 )
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.platforms import current_platform
@@ -187,6 +188,67 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
 
     torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(sqrsum, sqrsum_ref, atol=8.0, rtol=5e-4)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 128])
+def test_mhc_pre_broadcast_tilelang_without_deep_gemm(num_tokens, monkeypatch):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    hidden_size = 4096
+    hc_mult = 4
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    residual = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    fn = torch.randn((hc_mult3, hc_mult, hidden_size), dtype=torch.float32).flatten(
+        1, 2
+    )
+    fn_broadcast = fn.view(hc_mult3, hc_mult, hidden_size).sum(dim=1)
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16)
+    eps = 1e-6
+
+    monkeypatch.setattr("vllm.utils.deep_gemm.is_deep_gemm_supported", lambda: False)
+    actual = mhc_pre_broadcast_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        eps,
+        eps,
+        eps,
+        1.0,
+        20,
+        norm_weight=norm_weight,
+        norm_eps=eps,
+        fn_broadcast=fn_broadcast,
+    )
+
+    residual_ref = residual[:, None, :].expand(-1, hc_mult, -1).contiguous()
+    post_ref, mix_ref, layer_input_ref = mhc_pre_ref(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        eps,
+        eps,
+        eps,
+        1.0,
+        20,
+    )
+    layer_input_ref = (
+        layer_input_ref.float()
+        * torch.rsqrt(layer_input_ref.float().square().mean(-1, keepdim=True) + eps)
+        * norm_weight.float()
+    ).bfloat16()
+
+    expected = residual_ref, post_ref, mix_ref, layer_input_ref
+    for output, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(

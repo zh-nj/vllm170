@@ -1015,6 +1015,20 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+def should_build_fa3() -> bool:
+    if USE_PRECOMPILED_EXTENSIONS:
+        return True
+    if CUDA_HOME is None or get_nvcc_cuda_version() < Version("12.3"):
+        return False
+
+    target_arches = os.getenv("TORCH_CUDA_ARCH_LIST")
+    if not target_arches:
+        return True
+
+    arches = re.split(r"[;,\s]+", target_arches)
+    return any(re.fullmatch(r"9(?:\.0)?a?(?:\+PTX)?", arch) for arch in arches)
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -1131,10 +1145,8 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
-    ):
-        # FA3 requires CUDA 12.3 or later
+    if should_build_fa3():
+        # FA3 requires CUDA 12.3 or later and targets Hopper.
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files

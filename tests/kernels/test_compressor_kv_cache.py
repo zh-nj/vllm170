@@ -28,6 +28,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _launch_two_stage_sparse_attn_compressor,
+    compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
 from vllm.platforms import current_platform
@@ -578,6 +579,97 @@ def _reference_kv_compress_norm_rope(
         ]
         quants, scales = zip(*pairs)
         return torch.stack(quants), torch.cat(scales)
+
+
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_fused_kv_insert_sparse_attention_triton(compress_ratio: int):
+    head_dim, rope_dim = 512, 64
+    overlap = int(compress_ratio == 4)
+    state_block_size = 4 if overlap else 8
+    kv_block_size = 256
+    num_tokens = 2 if overlap else 1
+    state_width = (1 + overlap) * head_dim
+
+    torch.manual_seed(11 + compress_ratio)
+    positions = torch.arange(
+        compress_ratio - 1,
+        compress_ratio * num_tokens,
+        compress_ratio,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    num_pages = int(positions.max()) // state_block_size + 2
+    state_cache = torch.randn(
+        num_pages,
+        state_block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    block_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").unsqueeze(0)
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    cos_sin_cache = torch.randn(
+        compress_ratio * num_tokens, rope_dim, dtype=torch.float32, device="cuda"
+    )
+    kv_cache = torch.zeros(1, kv_block_size, 584, dtype=torch.uint8, device="cuda")
+
+    compress_norm_rope_store_triton(
+        state_cache=state_cache,
+        num_actual=num_tokens,
+        token_to_req_indices=token_to_req,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        k_cache_metadata=SimpleNamespace(slot_mapping=slot_mapping),
+        pdl_kwargs={},
+        head_dim=head_dim,
+        rope_head_dim=rope_dim,
+        compress_ratio=compress_ratio,
+        overlap=bool(overlap),
+        use_fp4_cache=False,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+    )
+
+    actual = torch.zeros(1, num_tokens, head_dim, dtype=torch.bfloat16, device="cuda")
+    dequantize_and_gather_k_cache(
+        actual,
+        kv_cache,
+        torch.tensor([num_tokens], dtype=torch.int32, device="cuda"),
+        None,
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        kv_block_size,
+        offset=0,
+    )
+    reference = _reference_kv_compress_norm_rope(
+        state_cache,
+        block_table,
+        positions,
+        rms_weight,
+        cos_sin_cache,
+        compress_ratio,
+        overlap,
+        return_full_cache=True,
+    )
+
+    for token_idx in range(num_tokens):
+        quantized, scale = _ue8m0_reference(
+            reference[token_idx, :448].float(), 64, 448.0
+        )
+        expected_nope = (quantized.float() * scale.repeat_interleave(64)).to(
+            torch.bfloat16
+        )
+        assert torch.equal(actual[0, token_idx, :448], expected_nope)
+    assert torch.equal(actual[0, :, 448:], reference[:, 448:])
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])

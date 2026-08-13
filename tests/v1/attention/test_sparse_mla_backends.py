@@ -4,6 +4,7 @@
 
 import math
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -50,7 +51,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
     split_prefill_chunks,
 )
-from vllm.v1.attention.ops import flashmla
+from vllm.v1.attention.ops import flashmla, rocm_aiter_mla_sparse
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -1211,6 +1212,41 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
+
+
+def test_triton_indexer_query_subchunks_reuse_gathered_kv(monkeypatch):
+    gather = Mock()
+    monkeypatch.setattr(
+        rocm_aiter_mla_sparse,
+        "cp_gather_indexer_k_quant_cache_triton",
+        gather,
+    )
+    chunk = SimpleNamespace(
+        skip_kv_gather=False,
+        block_table=object(),
+        cu_seq_lens=object(),
+        token_to_seq=object(),
+    )
+    kv_cache = object()
+    k_fp8 = object()
+    k_scale = object()
+
+    rocm_aiter_mla_sparse._gather_indexer_chunk_kv_cache(
+        chunk, kv_cache, k_fp8, k_scale
+    )
+    chunk.skip_kv_gather = True
+    rocm_aiter_mla_sparse._gather_indexer_chunk_kv_cache(
+        chunk, kv_cache, k_fp8, k_scale
+    )
+
+    gather.assert_called_once_with(
+        kv_cache,
+        k_fp8,
+        k_scale,
+        chunk.block_table,
+        chunk.cu_seq_lens,
+        token_to_seq=chunk.token_to_seq,
+    )
 
 
 def test_triton_convert_returns_valid_counts():

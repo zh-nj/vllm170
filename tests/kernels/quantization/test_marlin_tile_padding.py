@@ -413,6 +413,46 @@ def test_fp8_block_marlin_padded_round_trip(shape):
     _gpu_marlin_unsupported() or not is_fp8_marlin_supported(),
     reason="FP8 Marlin is not supported on this GPU type.",
 )
+def test_fp8_block_marlin_caches_grouped_bmm_weight():
+    size_n, size_k, block, batch = 256, 256, 128, 2
+    layer = torch.nn.Module()
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    layer.orig_dtype = torch.bfloat16
+    layer.weight_block_size = [block, block]
+    layer.is_bmm = True
+    layer.bmm_batch_size = batch
+
+    torch.manual_seed(0)
+    weight = torch.randn(size_n, size_k, dtype=torch.float32, device="cuda")
+    weight = weight / size_k**0.5
+    weight_blocks = weight.view(size_n // block, block, size_k // block, block)
+    scale = weight_blocks.abs().amax(dim=(1, 3)) / 448
+    scale_expanded = scale.repeat_interleave(block, 0).repeat_interleave(block, 1)
+    weight_fp8 = (weight / scale_expanded).to(torch.float8_e4m3fn)
+    layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+    layer.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+
+    prepare_fp8_layer_for_marlin(layer, size_k_first=False)
+
+    expected = (weight_fp8.float() * scale_expanded).to(torch.bfloat16)
+    expected = expected.view(batch, size_n // batch, size_k)
+    assert layer.weight.dtype == torch.int32
+    assert layer.bmm_weight_bf16.shape == expected.shape
+    torch.testing.assert_close(layer.bmm_weight_bf16, expected, atol=0, rtol=0)
+
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _get_cached_wo_a_bf16,
+    )
+
+    cached = _get_cached_wo_a_bf16(layer, batch, size_n // batch, size_k)
+    assert cached is layer.bmm_weight_bf16
+
+
+@pytest.mark.skipif(
+    _gpu_marlin_unsupported() or not is_fp8_marlin_supported(),
+    reason="FP8 Marlin is not supported on this GPU type.",
+)
 @pytest.mark.parametrize("shape", [(200, 288), (4640, 512)])
 def test_mxfp8_marlin_padded_round_trip(shape):
     """MXFP8 exercises the e8m0 scale path, where padded 0.0 scales clamp to

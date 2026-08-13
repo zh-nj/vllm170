@@ -215,7 +215,7 @@ class DeepseekCompressor(nn.Module):
     prologue (kv/score split, save_partial_states launch). The
     compress → norm → RoPE → store step is dispatched to a triton kernel
     (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
+    SM90+ head_dim=512 path which uses the cutedsl kernel
     (``compress_norm_rope_store_cutedsl``) for better performance.
     """
 
@@ -419,12 +419,16 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+            and self.head_dim == 512
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
+            # head=512 on SM90+ uses cutedsl, for both the fp8_ds_mla
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
@@ -447,7 +451,10 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            assert not store_full_kv, (
+                "The Triton compressor requires the fp8_ds_mla paged cache layout"
+            )
+            # Indexer path, pre-SM90 CUDA, or non-CUDA GPUs (AMD, XPU, etc.).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
