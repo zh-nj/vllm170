@@ -43,6 +43,11 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.models.deepseek_v4.phase_profile import (
+    classify_target_flow,
+    phase_profile_stage,
+    phase_profile_step,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -1160,7 +1165,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        is_dspark = getattr(self.speculator, "_speculator_name", None) == "DSpark"
+        with phase_profile_stage(
+            "target.logits",
+            sample_hidden_states,
+            flow="dspark" if is_dspark else None,
+            level="stage",
+        ):
+            logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1171,19 +1183,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
-            assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
-        else:
-            # Rejection sampling for spec decoding.
-            assert self.rejection_sampler is not None
-            assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-            )
+        sample_stage = (
+            "target.sample"
+            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None
+            else "target.rejection"
+        )
+        with phase_profile_stage(
+            sample_stage,
+            logits,
+            flow="dspark" if is_dspark else None,
+            level="stage",
+        ):
+            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+                assert self.sampler is not None
+                sampler_output = self.sampler(logits, input_batch)
+            else:
+                # Rejection sampling for spec decoding.
+                assert self.rejection_sampler is not None
+                assert self.speculator is not None
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
@@ -1317,26 +1340,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
-        attn_metadata = None
-        slot_mappings_by_layer = None
-        if not (dummy_run and skip_attn_for_dummy_run):
-            assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
-            assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
-                # FULL replay reads capture-time metadata buffers. Re-stage them
-                # from the zeroed dummy block tables instead of retaining state
-                # indices from the previous real batch.
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
+        profile_flow = classify_target_flow(input_batch.is_prefilling_np)
+        profile_extra = {"token_count": input_batch.num_tokens}
+        with phase_profile_stage(
+            "target.attn_metadata",
+            input_batch.input_ids,
+            flow=profile_flow,
+            level="stage",
+            extra=profile_extra,
+        ):
+            attn_metadata = None
+            slot_mappings_by_layer = None
+            if not (dummy_run and skip_attn_for_dummy_run):
+                assert slot_mappings is not None
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
+                assert block_tables is not None
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    # FULL replay reads capture-time metadata buffers. Re-stage them
+                    # from the zeroed dummy block tables instead of retaining state
+                    # indices from the previous real batch.
+                    for_capture=(
+                        dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
+                    ),
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1365,75 +1399,94 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
                 input_ids = None
 
-        model_inputs = {
-            "input_ids": input_ids,
-            "positions": input_batch.positions,
-            "inputs_embeds": inputs_embeds,
-            "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
-        }
-        if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
-            model_inputs["inputs_embeds"] = None
-
-            # Prepare the intermediate tensors.
-            assert intermediate_tensors is not None
-            assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
+        with phase_profile_stage(
+            "target.model_inputs",
+            input_batch.input_ids,
+            flow=profile_flow,
+            level="stage",
+            extra=profile_extra,
+        ):
+            model_inputs = {
+                "input_ids": input_ids,
+                "positions": input_batch.positions,
+                "inputs_embeds": inputs_embeds,
+                "intermediate_tensors": None,
+                # NOTE: prepare_inputs values override the defaults above.
+                **self.model_state.prepare_inputs(input_batch, self.req_states),
             }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
-            del intermediate_tensors
+            if not self.is_first_pp_rank:
+                # Update for non-first PP ranks.
+                model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
+
+                # Prepare the intermediate tensors.
+                assert intermediate_tensors is not None
+                assert self.intermediate_tensors is not None
+                n = input_batch.num_tokens_after_padding
+                new_tensors = {
+                    k: v[:n]
+                    if dummy_run
+                    else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                    for k, v in self.intermediate_tensors.tensors.items()
+                }
+                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+                del intermediate_tensors
 
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
-        # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-                num_active_loras=batch_desc.num_active_loras,
-            )
-
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
-            ):
+        execution = (
+            "eager"
+            if batch_desc.cg_mode == CUDAGraphMode.NONE
+            else batch_desc.cg_mode.name.lower()
+        )
+        with phase_profile_step(
+            profile_flow,
+            token_count=input_batch.num_tokens,
+            execution=execution,
+        ):
+            # Run model.
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
+                assert self.cudagraph_manager is not None
                 self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                with phase_profile_stage(
+                    "target.model_graph_replay", input_batch.input_ids, level="total"
+                ):
+                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                # For piecewise and eager mode, just call model().
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                )
+
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                    is_padding=input_batch.is_padding,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    with phase_profile_stage(
+                        "target.model_forward", input_batch.input_ids, level="total"
+                    ):
+                        if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                            # The manager selects compiled or breakable PW graphs.
+                            assert self.cudagraph_manager is not None
+                            model_output = self.cudagraph_manager.run_pw_graph(
+                                self.model, model_inputs
+                            )
+                        else:
+                            model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

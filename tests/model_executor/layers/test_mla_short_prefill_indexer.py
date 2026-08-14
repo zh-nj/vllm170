@@ -14,6 +14,43 @@ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
 
 
+@pytest.mark.parametrize(
+    ("next_n", "num_decode_tokens", "num_rows", "seq_lens_shape", "expected"),
+    [
+        (1, 6, 6, torch.Size((6, 1)), True),
+        (6, 6, 6, torch.Size((1, 6)), True),
+        (1, 1, 1, torch.Size((1, 1)), False),
+        (1, 6, 6, torch.Size((6,)), False),
+        (7, 7, 7, torch.Size((1, 7)), False),
+    ],
+)
+def test_dspark_q6_decode_shape_detection(
+    next_n: int,
+    num_decode_tokens: int,
+    num_rows: int,
+    seq_lens_shape: torch.Size,
+    expected: bool,
+) -> None:
+    assert (
+        sparse_indexer._is_dspark_q6_decode(
+            next_n,
+            num_decode_tokens,
+            num_rows,
+            seq_lens_shape,
+        )
+        is expected
+    )
+
+
+def test_topk_audit_overlap_is_isolated_per_row() -> None:
+    reference = torch.tensor([[1, 2, 3], [3, 4, 5]])
+    candidates = torch.tensor([[1, 4, 5], [1, 2, 3]])
+
+    overlap = sparse_indexer._count_topk_overlap_per_row(reference, candidates)
+
+    assert overlap.tolist() == [1, 1]
+
+
 def make_indexer_metadata(
     *,
     num_decodes: int = 0,

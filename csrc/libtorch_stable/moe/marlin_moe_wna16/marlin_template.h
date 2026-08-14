@@ -253,6 +253,7 @@ __global__ void Marlin(
     const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
     int4* __restrict__ C,        // fp16 output buffer of shape mxn
     int4* __restrict__ C_tmp,    // fp32 tmp output buffer (for reduce)
+    float* __restrict__ C_fp32,  // optional fp32 output buffer of shape mxn
     const int4* __restrict__ b_bias_ptr,
     // float scales of input matrix, only used when is_a_8bit == true.
     // shape (m,)
@@ -1877,7 +1878,18 @@ __global__ void Marlin(
         int64_t true_idx = sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
         c_scalar_t2 topk_weight_score;
         if (mul_topk_weights) topk_weight_score = sh_block_topk_weights[row];
-        if (use_atomic_add && slice_count > 1 || mul_topk_weights) {
+        if (C_fp32 != nullptr) {
+          c_scalar_t2* sh_red_half2 =
+              reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
+          float2* C_fp32_vec = reinterpret_cast<float2*>(C_fp32 + true_idx * 8);
+  #pragma unroll
+          for (int a = 0; a < 4; a++) {
+            if (mul_topk_weights) {
+              sh_red_half2[a] = __hmul2(sh_red_half2[a], topk_weight_score);
+            }
+            C_fp32_vec[a] = Cdtype::num22float2(sh_red_half2[a]);
+          }
+        } else if (use_atomic_add && slice_count > 1 || mul_topk_weights) {
           c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[true_idx]);
           c_scalar_t2* sh_red_half2 =
               reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);

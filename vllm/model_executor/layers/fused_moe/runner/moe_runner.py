@@ -48,6 +48,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -600,20 +601,22 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            with optional_phase_profile_stage("moe.router_select", hidden_states):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            with optional_phase_profile_stage("moe.routed_experts", hidden_states):
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -863,20 +866,22 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            if self._fse_fuse_gate:
-                self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
-            else:
-                router_logits, _ = self.gate(hidden_states)
+            with optional_phase_profile_stage("moe.router_gate", hidden_states):
+                if self._fse_fuse_gate:
+                    self._maybe_fuse_gate_weights()
+                    router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
+            with optional_phase_profile_stage("moe.dispatch", hidden_states):
+                hidden_states, router_logits = self._maybe_dispatch(
+                    hidden_states,
+                    router_logits,
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -885,10 +890,11 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+            with optional_phase_profile_stage("moe.combine", hidden_states):
+                return self._maybe_combine(
+                    shared_output,
+                    hidden_states,
+                )
 
     #########################################################
     #

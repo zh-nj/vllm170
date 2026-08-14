@@ -534,22 +534,38 @@ def _fp8_mqa_logits_triton_impl(
     kv_group: int,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
+    return _fp8_mqa_logits_bf16_impl(
+        q.to(torch.bfloat16),
+        k_fp8.to(torch.bfloat16),
+        k_scales,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        kv_group,
+    )
+
+
+def _fp8_mqa_logits_bf16_impl(
+    q_bf16: torch.Tensor,
+    k_bf16: torch.Tensor,
+    k_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    kv_group: int,
+) -> torch.Tensor:
     k_scales = k_scales.reshape(-1)
 
-    M, num_heads, head_dim = q.shape
-    N = k_fp8.shape[0]
+    M, num_heads, head_dim = q_bf16.shape
+    N = k_bf16.shape[0]
 
     # The grid covers every (m, n_block) and each tile stores its full row
     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
     # is accepted for DeepGEMM signature parity only.
-    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+    logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
-
-    # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
-    q_bf16 = q.to(torch.bfloat16)
-    k_bf16 = k_fp8.to(torch.bfloat16)
 
     # Grid depends on the autotuned BLOCK_N and the M/N-selected KV_GROUP.
     grid = lambda meta: (  # noqa: E731
@@ -582,6 +598,86 @@ def _fp8_mqa_logits_triton_impl(
         FACTOR_K_SCALE=envs.VLLM_INDEXER_LOGITS_FACTOR_K_SCALE,
     )
     return logits
+
+
+def fp8_mqa_logits_streaming_topk_triton(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk: int,
+    tile_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select exact top-k without materializing the full M-by-N logits.
+
+    This SM8x prototype keeps only one K tile plus two top-k candidate sets.
+    It returns scores as well as indices so a future DCP caller can merge
+    candidates without recovering values from a full logits tensor.
+    """
+    k_fp8, k_scales = kv
+    M = q.shape[0]
+    N = k_fp8.shape[0]
+    if topk <= 0 or tile_size < topk:
+        raise ValueError("tile_size must be at least topk, and topk must be positive")
+    if N == 0:
+        return (
+            torch.full((M, topk), float("-inf"), device=q.device),
+            torch.full((M, topk), -1, dtype=torch.int32, device=q.device),
+        )
+
+    q_bf16 = q.to(torch.bfloat16)
+    best_scores = torch.full(
+        (M, topk), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    best_indices = torch.full((M, topk), -1, dtype=torch.int32, device=q.device)
+
+    for tile_start in range(0, N, tile_size):
+        tile_end = min(tile_start + tile_size, N)
+        tile_width = tile_end - tile_start
+        tile_starts = (cu_seqlen_ks - tile_start).clamp(0, tile_width).contiguous()
+        tile_ends = (cu_seqlen_ke - tile_start).clamp(0, tile_width).contiguous()
+        tile_logits = _fp8_mqa_logits_bf16_impl(
+            q_bf16,
+            k_fp8[tile_start:tile_end].to(torch.bfloat16),
+            k_scales[tile_start:tile_end],
+            weights,
+            tile_starts,
+            tile_ends,
+            kv_group=1,
+        )
+        tile_indices = torch.full((M, topk), -1, dtype=torch.int32, device=q.device)
+        torch.ops._C.top_k_per_row_prefill(
+            tile_logits,
+            tile_starts,
+            tile_ends,
+            tile_indices,
+            M,
+            tile_logits.stride(0),
+            tile_logits.stride(1),
+            topk,
+        )
+        valid = tile_indices >= 0
+        tile_absolute_indices = tile_indices + tile_starts[:, None]
+        safe_indices = tile_absolute_indices.clamp(min=0, max=tile_width - 1).to(
+            torch.int64
+        )
+        tile_scores = tile_logits.gather(1, safe_indices).masked_fill(
+            ~valid, float("-inf")
+        )
+        row_relative_offset = tile_start + tile_starts - cu_seqlen_ks
+        row_relative_indices = torch.where(
+            valid,
+            tile_indices + row_relative_offset[:, None],
+            tile_indices,
+        )
+
+        candidate_scores = torch.cat((best_scores, tile_scores), dim=1)
+        candidate_indices = torch.cat((best_indices, row_relative_indices), dim=1)
+        best_scores, selected = candidate_scores.topk(topk, dim=1)
+        best_indices = candidate_indices.gather(1, selected)
+
+    return best_scores, best_indices
 
 
 def warmup_fp8_mqa_logits_triton(

@@ -48,6 +48,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -66,6 +70,24 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def get_sparse_prefill_reqs_per_chunk(
+    *,
+    max_reqs: int,
+    num_kv_tokens: int,
+    head_dim: int,
+    budget_mb: int,
+    element_size: int = 2,
+) -> int:
+    """Bound sparse-prefill gather concurrency by a byte budget."""
+    if max_reqs <= 0 or num_kv_tokens <= 0 or head_dim <= 0 or element_size <= 0:
+        raise ValueError("Sparse-prefill workspace dimensions must be positive")
+    if budget_mb <= 0:
+        return max_reqs
+    budget_bytes = budget_mb * 1024 * 1024
+    bytes_per_req = num_kv_tokens * head_dim * element_size
+    return max(1, min(max_reqs, budget_bytes // bytes_per_req))
 
 
 @triton.jit
@@ -267,6 +289,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             head_dim=self.head_dim,
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
+            max_model_len=vllm_config.model_config.max_model_len,
             compress_ratio=self.compress_ratio,
         )
         self.indexer_rotary_emb = self.rotary_emb
@@ -353,47 +376,52 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Pre-allocate attention output with FlashMLA-padded head count.
-        # The op writes into `o_padded`; we slice to n_local_heads after.
-        num_tokens = hidden_states.shape[0]
-        o_padded = torch.empty(
-            (num_tokens, self.padded_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        with phase_profile_layer(self.prefix, compress_ratio=self.compress_ratio):
+            # Pre-allocate attention output with FlashMLA-padded head count.
+            # The op writes into `o_padded`; we slice to n_local_heads after.
+            num_tokens = hidden_states.shape[0]
+            o_padded = torch.empty(
+                (num_tokens, self.padded_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
-        # Metadata-independent input GEMMs + RMSNorm stay in the captured
-        # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
-        # compressor, MLA attention) runs in the eager break.
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
-        )
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+            # Metadata-independent input GEMMs + RMSNorm stay in the captured
+            # graph; the metadata-dependent rest runs in the eager break.
+            with phase_profile_stage(
+                "attention.input_gemm_overlap", hidden_states, level="stage"
+            ):
+                qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                    self.attn_gemm_parallel_execute(hidden_states)
+                )
+            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+            with phase_profile_stage("attention.qkv_rmsnorm", qr, level="stage"):
+                qr, kv = fused_q_kv_rmsnorm(
+                    qr,
+                    kv,
+                    self.q_norm.weight.data,
+                    self.kv_norm.weight.data,
+                    self.eps,
+                )
 
-        # attention_impl is wrapped with @eager_break_during_capture: this is
-        # where the breakable cudagraph capture breaks (the attention op runs
-        # eagerly between captured graph segments).
-        self.attention_impl(
-            hidden_states,
-            qr,
-            kv,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
-        )
-        o = o_padded[:, : self.n_local_heads, :]
+            with phase_profile_stage(
+                "attention.q_index_compress_mla", qr, level="stage"
+            ):
+                self.attention_impl(
+                    hidden_states,
+                    qr,
+                    kv,
+                    kv_score,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    o_padded,
+                )
+            o = o_padded[:, : self.n_local_heads, :]
 
-        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+            # Inverse-RoPE + wo_a + wo_b output projection.
+            with phase_profile_stage("attention.output_projection", o, level="stage"):
+                return self._o_proj(o, positions)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # MergedColumnParallelLinear returns (output, bias); bias is None.
@@ -535,9 +563,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
-        # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
-        self.forward_mqa(q, kv, positions, out)
+        # MLA attention writes into the pre-allocated `out` buffer.
+        with phase_profile_stage("attention.sparse_mla", q):
+            self.forward_mqa(q, kv, positions, out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -846,7 +874,8 @@ class DeepseekV4Indexer(nn.Module):
             if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
-                compressor(compressed_kv_score, positions, rotary_emb)
+                with phase_profile_stage("indexer.short_context_cache", hidden_states):
+                    compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
@@ -864,32 +893,37 @@ class DeepseekV4Indexer(nn.Module):
                 return self.topk_indices_buffer
 
         def wq_b_and_q_quant():
-            # ReplicatedLinear returns (output, bias); bias is None.
-            q, _ = self.wq_b(qr)
-            q = q.view(-1, self.n_head, self.head_dim)
-            outputs = None
-            if self.eager_scratch_pool is not None:
-                outputs = self.eager_scratch_pool.indexer_q_outputs(
-                    q.shape[0], use_fp4=self.use_fp4_kv
+            with phase_profile_stage("indexer.query_prepare", qr):
+                q, _ = self.wq_b(qr)
+                q = q.view(-1, self.n_head, self.head_dim)
+                outputs = None
+                if self.eager_scratch_pool is not None:
+                    outputs = self.eager_scratch_pool.indexer_q_outputs(
+                        q.shape[0], use_fp4=self.use_fp4_kv
+                    )
+                return fused_indexer_q_rope_quant(
+                    positions,
+                    q,
+                    rotary_emb.cos_sin_cache,
+                    indexer_weights,
+                    self.softmax_scale,
+                    self.n_head**-0.5,
+                    use_fp4=self.use_fp4_kv,
+                    output_buffers=outputs,
                 )
-            return fused_indexer_q_rope_quant(
-                positions,
-                q,
-                rotary_emb.cos_sin_cache,
-                indexer_weights,
-                self.softmax_scale,
-                self.n_head**-0.5,
-                use_fp4=self.use_fp4_kv,
-                output_buffers=outputs,
-            )
+
+        def compress_and_cache():
+            with phase_profile_stage("indexer.compress_cache", hidden_states):
+                return compressor(compressed_kv_score, positions, rotary_emb)
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
         (q_quant, weights), k = maybe_execute_in_parallel(
             wq_b_and_q_quant,
-            lambda: compressor(compressed_kv_score, positions, rotary_emb),
+            compress_and_cache,
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        with phase_profile_stage("indexer.select", q_quant):
+            return self.indexer_op(hidden_states, q_quant, k, weights)

@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -51,7 +52,108 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.scalar_type import ScalarType, scalar_types
+
+_MARLIN_MOE_BLOCK_SIZES = (8, 16, 32, 48, 64)
+_MARLIN_MOE_MAX_THREAD_N = 256
+
+
+def _marlin_moe_fp32_reduce_workspace_size(
+    size_n: int,
+    num_sorted_tokens: int,
+    block_size_m: int,
+    device_index: int | None = None,
+    num_sms: int | None = None,
+) -> int:
+    if num_sms is None:
+        num_sms = current_platform.num_compute_units(device_index or 0)
+    workspace_size = min(
+        size_n * num_sorted_tokens,
+        num_sms * 4 * block_size_m * _MARLIN_MOE_MAX_THREAD_N,
+    )
+    return workspace_size * 2 if block_size_m == 8 else workspace_size
+
+
+def _marlin_moe_max_sorted_tokens(
+    M: int,
+    topk: int,
+    num_experts: int,
+    block_size_m: int,
+) -> int:
+    num_tokens = M * topk
+    max_num_tokens_padded = num_tokens + num_experts * (block_size_m - 1)
+    if num_tokens < num_experts:
+        max_num_tokens_padded = min(num_tokens * block_size_m, max_num_tokens_padded)
+    return max_num_tokens_padded
+
+
+def _marlin_moe_workspace_sizes(
+    M: int,
+    N: int,
+    K: int,
+    topk: int,
+    global_num_experts: int,
+    local_num_experts: int,
+    activation: MoEActivation,
+    input_dtype: torch.dtype | None,
+    num_sms: int | None = None,
+) -> tuple[int, int]:
+    valid_M = math.ceil(M * local_num_experts / global_num_experts)
+    block_size_m = _select_marlin_moe_block_size(
+        valid_M, topk, local_num_experts, input_dtype
+    )
+    max_sorted_tokens = _marlin_moe_max_sorted_tokens(
+        M, topk, global_num_experts, block_size_m
+    )
+    w13_num_shards = 2 if activation.is_gated else 1
+    intermediate_cache13_size = M * topk * max(w13_num_shards * N, K)
+    fp32_reduce_workspace_size = _marlin_moe_fp32_reduce_workspace_size(
+        max(w13_num_shards * N, K),
+        max_sorted_tokens,
+        block_size_m,
+        num_sms=num_sms,
+    )
+    return intermediate_cache13_size, fp32_reduce_workspace_size
+
+
+def _split_marlin_moe_workspace(
+    workspace: torch.Tensor,
+    intermediate_cache13_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert workspace.element_size() == 2
+    flat_workspace = workspace.flatten()
+    intermediate_cache13 = flat_workspace[:intermediate_cache13_size]
+    fp32_reduce_workspace = flat_workspace[intermediate_cache13_size:].view(
+        torch.float32
+    )
+    return intermediate_cache13, fp32_reduce_workspace
+
+
+def _select_marlin_moe_block_size(
+    M: int,
+    topk: int,
+    num_experts: int,
+    input_dtype: torch.dtype | None,
+) -> int:
+    forced = envs.VLLM_MARLIN_MOE_BLOCK_SIZE
+    if forced and M >= envs.VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M:
+        if forced not in _MARLIN_MOE_BLOCK_SIZES:
+            raise ValueError(
+                "VLLM_MARLIN_MOE_BLOCK_SIZE must be one of "
+                f"{_MARLIN_MOE_BLOCK_SIZES}, got {forced}"
+            )
+        block_size_m = forced
+    else:
+        block_size_m = _MARLIN_MOE_BLOCK_SIZES[-1]
+        for candidate in _MARLIN_MOE_BLOCK_SIZES:
+            block_size_m = candidate
+            if M * topk / num_experts / candidate < 0.9:
+                break
+
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
 
 
 def _fused_marlin_moe(
@@ -87,6 +189,7 @@ def _fused_marlin_moe(
     workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
+    fp32_reduce_workspace: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
@@ -100,6 +203,14 @@ def _fused_marlin_moe(
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
+    profile_extra = {
+        "M": M,
+        "K": K,
+        "N": N,
+        "E": w1.size(0),
+        "topk": num_topk,
+        "block_size_m": block_size_m,
+    }
     if workspace is None:
         workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
@@ -125,6 +236,24 @@ def _fused_marlin_moe(
 
     intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
 
+    fp32_reduce_workspace_size = _marlin_moe_fp32_reduce_workspace_size(
+        max(w13_num_shards * N, K),
+        sorted_token_ids.numel(),
+        block_size_m,
+        hidden_states.device.index,
+    )
+    if fp32_reduce_workspace is None and envs.VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE:
+        fp32_reduce_workspace = torch.empty(
+            (fp32_reduce_workspace_size,),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+    elif fp32_reduce_workspace is not None:
+        assert fp32_reduce_workspace.dtype == torch.float32
+        assert fp32_reduce_workspace.device == hidden_states.device
+        assert fp32_reduce_workspace.is_contiguous()
+        assert fp32_reduce_workspace.numel() >= fp32_reduce_workspace_size
+
     a_scales1 = None
     gate_up_input = hidden_states
     if input_dtype == torch.int8:
@@ -134,48 +263,55 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
-    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
-        gate_up_input,
-        intermediate_cache1,
-        w1,
-        bias1,
-        w1_scale,
-        a_scales1,
-        global_scale1,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=num_topk,
-        mul_topk_weights=apply_router_weight_on_input,
-        b_q_type=quant_type,
-        size_m=M,
-        size_n=w13_num_shards * N,
-        size_k=K,
-        is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
+    with optional_phase_profile_stage(
+        "moe.marlin.w13_gemm", hidden_states, extra=profile_extra
+    ):
+        intermediate_cache1 = ops.moe_wna16_marlin_gemm(
+            gate_up_input,
+            intermediate_cache1,
+            w1,
+            bias1,
+            w1_scale,
+            a_scales1,
+            global_scale1,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=num_topk,
+            mul_topk_weights=apply_router_weight_on_input,
+            b_q_type=quant_type,
+            size_m=M,
+            size_n=w13_num_shards * N,
+            size_k=K,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+            fp32_reduce_workspace=fp32_reduce_workspace,
+        )
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
-    activation_func(
-        activation,
-        intermediate_cache2,
-        intermediate_cache1.view(-1, w13_num_shards * N),
-        clamp_limit=clamp_limit,
-        alpha=gemm1_alpha,
-        beta=gemm1_beta,
-        topk_ids=topk_ids,
-        expert_map=expert_map,
-        activation_situ_beta=activation_situ_beta,
-        activation_situ_linear_beta=activation_situ_linear_beta,
-    )
+    with optional_phase_profile_stage(
+        "moe.marlin.activation", hidden_states, extra=profile_extra
+    ):
+        activation_func(
+            activation,
+            intermediate_cache2,
+            intermediate_cache1.view(-1, w13_num_shards * N),
+            clamp_limit=clamp_limit,
+            alpha=gemm1_alpha,
+            beta=gemm1_beta,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
+        )
 
     if output is None:
         output = intermediate_cache3
@@ -192,34 +328,38 @@ def _fused_marlin_moe(
             intermediate_cache2, input_dtype
         )
 
-    output = ops.moe_wna16_marlin_gemm(
-        intermediate_cache2,
-        output,
-        w2,
-        bias2,
-        w2_scale,
-        a_scales2,
-        global_scale2,
-        w2_zeros,
-        g_idx2,
-        sort_indices2,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=1,
-        mul_topk_weights=not apply_router_weight_on_input,
-        b_q_type=quant_type,
-        size_m=M * num_topk,
-        size_n=K,
-        size_k=N,
-        is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
+    with optional_phase_profile_stage(
+        "moe.marlin.w2_gemm", hidden_states, extra=profile_extra
+    ):
+        output = ops.moe_wna16_marlin_gemm(
+            intermediate_cache2,
+            output,
+            w2,
+            bias2,
+            w2_scale,
+            a_scales2,
+            global_scale2,
+            w2_zeros,
+            g_idx2,
+            sort_indices2,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=not apply_router_weight_on_input,
+            b_q_type=quant_type,
+            size_m=M * num_topk,
+            size_n=K,
+            size_k=N,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+            fp32_reduce_workspace=fp32_reduce_workspace,
+        )
 
     return output
 
@@ -254,6 +394,7 @@ def fused_marlin_moe(
     workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
+    fp32_reduce_workspace: torch.Tensor | None = None,
     is_k_full: bool = True,
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
@@ -325,22 +466,28 @@ def fused_marlin_moe(
         # Set M to estimated valid tokens per rank
         M = math.ceil(M * E / global_num_experts)
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    block_size_m = _select_marlin_moe_block_size(M, topk, E, input_dtype)
 
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    profile_extra = {
+        "M": M,
+        "K": K,
+        "N": marlin_moe_intermediate_size(w1, w2),
+        "E": E,
+        "topk": topk,
+        "block_size_m": block_size_m,
+    }
+    align_extra = profile_extra.copy()
+    with optional_phase_profile_stage(
+        "moe.marlin.align", hidden_states, extra=align_extra
+    ):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
+        align_extra["num_tokens_post_padded"] = num_tokens_post_padded
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -378,6 +525,7 @@ def fused_marlin_moe(
         workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
+        fp32_reduce_workspace=fp32_reduce_workspace,
         output=None,
         input_dtype=input_dtype,
         is_k_full=is_k_full,
@@ -389,12 +537,14 @@ def fused_marlin_moe(
     if output is None:
         output = torch.empty_like(hidden_states)
 
-    if moe_sum is None:
-        if expert_map is not None:
-            ops.moe_sum(moe_output, output, topk_ids, expert_map)
-            return output
-        return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
-    else:
+    with optional_phase_profile_stage(
+        "moe.marlin.reduce", hidden_states, extra=profile_extra
+    ):
+        if moe_sum is None:
+            if expert_map is not None:
+                ops.moe_sum(moe_output, output, topk_ids, expert_map)
+                return output
+            return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
         return moe_sum(moe_output, output, topk_ids, expert_map)
 
 
@@ -425,6 +575,7 @@ def batched_fused_marlin_moe(
     workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
+    fp32_reduce_workspace: torch.Tensor | None = None,
     is_k_full: bool = True,
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
@@ -562,6 +713,7 @@ def batched_fused_marlin_moe(
         workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
+        fp32_reduce_workspace=fp32_reduce_workspace,
         output=output.view(-1, K) if output is not None else output,
         input_dtype=input_dtype,
         is_k_full=is_k_full,
@@ -759,7 +911,22 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         # Workspace/IntermediateCache allocation accounting for output buffer
         # provisioning
         workspace1 = (M * topk, max(N, K))
-        workspace2 = (M * topk * max(2 * N, K),)
+        if envs.VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE:
+            intermediate_cache13_size, fp32_reduce_workspace_size = (
+                _marlin_moe_workspace_sizes(
+                    M,
+                    N,
+                    K,
+                    topk,
+                    global_num_experts,
+                    local_num_experts,
+                    activation,
+                    self.input_dtype,
+                )
+            )
+            workspace2 = (intermediate_cache13_size + fp32_reduce_workspace_size * 2,)
+        else:
+            workspace2 = (M * topk * max(2 * N, K),)
         output = (M, K)
 
         return (workspace1, workspace2, output)
@@ -784,6 +951,23 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     ):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
+
+        if envs.VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE:
+            intermediate_size = marlin_moe_intermediate_size(w1, w2)
+            intermediate_cache13_size = (
+                hidden_states.size(0)
+                * topk_ids.size(1)
+                * max(
+                    (2 if activation.is_gated else 1) * intermediate_size,
+                    hidden_states.size(1),
+                )
+            )
+            intermediate_cache13, fp32_reduce_workspace = _split_marlin_moe_workspace(
+                workspace2, intermediate_cache13_size
+            )
+        else:
+            intermediate_cache13 = workspace2
+            fp32_reduce_workspace = None
 
         ctx = self._lora_context
         if ctx is None:
@@ -817,8 +1001,9 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 output=output,
                 # Workspaces are swapped in workspace_shapes() to account for proper
                 # output buffer allocation. Please refer to workspace_shapes().
-                intermediate_cache13=workspace2,
+                intermediate_cache13=intermediate_cache13,
                 intermediate_cache2=workspace13,
+                fp32_reduce_workspace=fp32_reduce_workspace,
                 g_idx1=self.w13_g_idx,
                 g_idx2=self.w2_g_idx,
                 sort_indices1=self.w13_g_idx_sort_indices,
@@ -946,8 +1131,9 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             moe_sum=moe_sum_with_lora,
             expert_map=expert_map,
             output=output,
-            intermediate_cache13=workspace2,
+            intermediate_cache13=intermediate_cache13,
             intermediate_cache2=workspace13,
+            fp32_reduce_workspace=fp32_reduce_workspace,
             g_idx1=self.w13_g_idx,
             g_idx2=self.w2_g_idx,
             sort_indices1=self.w13_g_idx_sort_indices,

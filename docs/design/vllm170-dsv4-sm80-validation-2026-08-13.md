@@ -136,6 +136,110 @@ because the same fallback defect was subsequently reproduced with Marlin. The
 backend remains available for experiments, but it was not selected and no
 post-fix claim is made for its long-context stability or speed.
 
+## Selective SM70 facility absorption
+
+A second comparison used source `f8105d668` and target `e24e5d09f`, while the
+implementation and real-hardware checks below ran on target HEAD `43c3e4dc4`.
+SM70 CUDA/TileLang kernels were not copied.
+
+### Deployment-length RoPE
+
+The DSV4 YaRN cache now uses the deployment `max_model_len` as its cache extent
+while preserving the 1M model limit and all frequency/mscale parameters. The
+cache extent participates in the RoPE factory key. Unit comparison found the
+bounded cache bit-identical to the same prefix of the full cache. With this
+checkpoint's FP32 width-64 cache and the selected 131,072 deployment limit,
+the static allocation falls from 256 MiB to 32 MiB per rank, saving 224 MiB.
+The PP3 model then loaded and served with the bounded cache.
+
+### q6 exact-set audit
+
+The audit compares persistent top-k against exact radix top-k on the same real
+logits and uses row-isolated set overlap. It recognizes both native q6 and the
+V2 runner's flattened six-row layout. The 32K test used an audit minimum of
+5,000 compressed tokens so warmup could not consume the sample budget.
+
+- PP0, PP1, and PP2 each captured eight layer samples.
+- The 24 samples contained 144 q6 logits rows at compressed lengths 6155–6157.
+- Every sample reported recall 1.0, zero rows with a miss, and zero worst-case
+  missing candidates.
+- The request completed all 192 output tokens; eager audit throughput was
+  14.1 tokens/s and is not a production performance number.
+
+The current SM80 persistent selector therefore remains the default. The exact
+route was not enabled; the opt-in audit remains available for longer-context
+and future-kernel checks.
+
+### Sparse-prefill byte budget
+
+Dummy/profile allocation and real forward now share one byte-budget formula.
+The 512 MiB default reduces request concurrency as the gathered BF16 KV rows
+grow and always admits at least one request. Setting the budget to zero restores
+the fixed four-request behavior. A single request still requires its complete
+gather, so 512K–1M work ultimately needs a paged indexed/no-gather kernel.
+
+### SM80 streaming top-k prototype
+
+The prototype returns score/index candidates without creating full `[M,N]`
+logits and passed exact-set and exact-score tests, including row-relative
+indices and rows shorter than top-k. CUDA-Event microbenchmarks on one CMP170HX
+produced:
+
+| Rows × K length | Tile | Full ms | Streaming ms | Peak bytes full | Peak bytes streaming |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 × 8192 | 1024 | 0.320 | 6.510 | 2,490,368 | 693,760 |
+| 8 × 32768 | 1024 | 0.421 | 31.751 | 9,568,256 | 693,760 |
+| 256 × 16384 | 1024 | 0.920 | 12.307 | 25,165,824 | 14,289,920 |
+| 256 × 16384 | 8192 | 0.988 | 1.701 | 25,165,824 | 30,542,848 |
+
+This establishes the memory opportunity but rejects the current composition
+for serving: small tiles repeat the existing selector/merge and are much too
+slow, while a large tile loses the memory benefit. Promotion requires a fused
+SM80 implementation of scoring, tile-local selection, and candidate merge.
+
+### Reproducible profiling boundary
+
+The new profile harness records a same-context warmup, exact server token
+counts, prompt/output hashes, DSpark counter deltas, ms/round, revision, and
+one trace/table per PP rank. Its real q8 PP3 smoke produced all three rank
+artifacts and a valid 16-token result. CMP170HX returned
+`CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`, so CUDA activities were absent. The
+validator correctly classified the run as `workload_accepted=true`,
+`pp_artifacts_complete=true`, and `kernel_profile_accepted=false`; operator
+traces remain usable, while kernel timings use isolated CUDA Events.
+
+### Three-flow CUDA-event profile
+
+The profile harness now opens its raw CUDA-event window only after the
+same-context warmup. It produces independent JSONL records and summaries for
+prefill, target decode, and DSpark; each record includes PP rank, stage, layer,
+token count, execution mode, and CUDA-event latency. The stage summaries use
+the maximum PP rank for each stage and explicitly reject sums across PP ranks
+or nested ranges.
+
+The superseding detailed run at
+`profiles/deepseek_v4/20260814T025725Z` used PP3/TP1, Marlin, Triton sparse
+MLA, DSpark 7, exactly 5,000 server prompt tokens, and an 8-token fixed-length
+completion. It emitted 2,277 prefill records across PP0–PP2, 4,571 target
+decode records across PP0–PP2, and 620 DSpark records on PP2. All three flows
+passed their required-detail gate. The per-round result was 284.0 ms in
+`--enforce-eager` diagnostic mode; it is not a CUDA-Graph production
+throughput claim.
+
+The prefill critical rank was PP0 at 736.3 ms across three chunks. Its layer
+time was 48.8% FFN/MoE, 41.0% attention, and 9.9% across the two mHC
+transitions. The model and layer component coverage were both about 99.9%.
+Detailed chunk, module, layer, and optimization analysis is recorded in
+`vllm170-dsv4-sm80-prefill-profile-2026-08-14.md`.
+
+A `14,15,14` partition A/B failed during PP2 DSpark Marlin weight repacking:
+the worker needed another 2.00 GiB with only 1.58 GiB free after using 61.47
+GiB. The selected `15,15,13` partition therefore remains a residency
+constraint, not an untested balancing choice.
+
+The source indexed/no-gather prefill remains default-off and lacks a real-model
+microtest. It was not copied or described as production-ready.
+
 ## Verification boundary
 
 Focused unit and GPU tests cover DSpark configuration and PP padding, Marlin

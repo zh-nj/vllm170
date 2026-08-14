@@ -29,6 +29,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.models.deepseek_v4.phase_profile import phase_profile_stage
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -102,9 +103,11 @@ class DSparkSpeculator(DFlashSpeculator):
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        with phase_profile_stage("draft.hidden_gather", head_hidden, flow="dspark"):
+            sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        with phase_profile_stage("draft.base_logits", sample_hidden, flow="dspark"):
+            base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -117,34 +120,42 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
-            markov_embed = self.model.markov_embed(prev)
-            bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            if self.draft_logits is not None:
-                # Probabilistic: sample in target vocab (a reduced draft vocab is
-                # scattered into its target columns; full vocab is already there).
-                if self._d2t_scatter_index is not None:
-                    assert self._draft_scatter_buf is not None
-                    buf = self._draft_scatter_buf[:num_reqs]
-                    buf.index_copy_(1, self._d2t_scatter_index, logits_i.to(buf.dtype))
-                    logits_i = buf
-                # sample_pos is the predicted token's position Q; the target
-                # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
-                draft_sampled_i = gumbel_sample(
-                    logits_i,
-                    idx_map[:, i],
-                    self.temperature,
-                    self.seeds,
-                    sample_pos[:, i] - 1,
-                    apply_temperature=True,
-                    output_processed_logits=self.draft_logits,
-                    output_processed_logits_col=self._step_cols[i],
-                    use_fp64=self.use_fp64_gumbel,
-                )
-            else:
-                draft_sampled_i = self.model.map_draft_to_target(
-                    logits_i.argmax(dim=-1)
-                )
+            with phase_profile_stage(
+                "draft.markov_bias", prev, flow="dspark", extra={"draft_step": i}
+            ):
+                markov_embed = self.model.markov_embed(prev)
+                bias = self.model.markov_bias(markov_embed)
+                logits_i = base_logits[:, i] + bias
+            with phase_profile_stage(
+                "draft.markov_sample",
+                logits_i,
+                flow="dspark",
+                extra={"draft_step": i},
+            ):
+                if self.draft_logits is not None:
+                    # Probabilistic sampling operates in the target vocabulary.
+                    if self._d2t_scatter_index is not None:
+                        assert self._draft_scatter_buf is not None
+                        buf = self._draft_scatter_buf[:num_reqs]
+                        buf.index_copy_(
+                            1, self._d2t_scatter_index, logits_i.to(buf.dtype)
+                        )
+                        logits_i = buf
+                    draft_sampled_i = gumbel_sample(
+                        logits_i,
+                        idx_map[:, i],
+                        self.temperature,
+                        self.seeds,
+                        sample_pos[:, i] - 1,
+                        apply_temperature=True,
+                        output_processed_logits=self.draft_logits,
+                        output_processed_logits_col=self._step_cols[i],
+                        use_fp64=self.use_fp64_gumbel,
+                    )
+                else:
+                    draft_sampled_i = self.model.map_draft_to_target(
+                        logits_i.argmax(dim=-1)
+                    )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
@@ -159,11 +170,17 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
-        head_hidden = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
-        self._sample_sequential(num_reqs, head_hidden)
+        with phase_profile_stage(
+            "draft.backbone", self.input_buffers.input_ids, flow="dspark", level="stage"
+        ):
+            head_hidden = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        with phase_profile_stage(
+            "draft.markov_total", head_hidden, flow="dspark", level="stage"
+        ):
+            self._sample_sequential(num_reqs, head_hidden)

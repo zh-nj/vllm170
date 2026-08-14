@@ -240,17 +240,34 @@ class DeepseekV4ScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
     - cos_sin_cache stored as fp32 for higher precision RoPE
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        cache_max_position_embeddings: int | None = None,
+        **kwargs,
+    ):
         # Avoid compute cache repeatedly
         kwargs.pop("init_cache", None)
         super().__init__(*args, **kwargs, init_cache=False)
+        full_cache_extent = int(self.max_position_embeddings * self.scaling_factor)
+        cache_extent = (
+            full_cache_extent
+            if cache_max_position_embeddings is None
+            else int(cache_max_position_embeddings)
+        )
+        if cache_extent <= 0 or cache_extent > full_cache_extent:
+            raise ValueError(
+                "DeepSeek V4 RoPE cache extent must be in "
+                f"[1, {full_cache_extent}], got {cache_extent}."
+            )
+        self.cache_max_position_embeddings = cache_extent
         cache_fp32 = self._compute_cos_sin_cache()
         self.register_buffer("cos_sin_cache", cache_fp32, persistent=False)
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor,
+            self.cache_max_position_embeddings,
             device=inv_freq.device,
             dtype=torch.float32,
         )

@@ -40,7 +40,8 @@ def _cache_fp8_bmm_weight(
     layer: torch.nn.Module,
     size_k_first: bool,
 ) -> None:
-    if not getattr(layer, "is_bmm", False):
+    cache_bmm = getattr(layer, "is_bmm", False)
+    if not cache_bmm:
         return
 
     weight = layer.weight.T if size_k_first else layer.weight

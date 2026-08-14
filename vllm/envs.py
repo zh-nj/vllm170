@@ -58,10 +58,24 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = False
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
+    VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT: bool = False
+    VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN: int = 0
+    VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES: int = 8
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE: bool = False
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH: str = ""
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH: str = ""
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION: bool = True
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS: str = "prefill,decode,dspark"
+    VLLM_MARLIN_MOE_BLOCK_SIZE: int = 0
+    VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M: int = 0
+    VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1057,6 +1071,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Maximum BF16 gather workspace for DeepSeek V4 sparse prefill. The
+    # implementation reduces requests per chunk as context grows. One request
+    # always remains admissible because splitting its KV rows requires an
+    # indexed/no-gather kernel.
+    "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB", "512")
+    ),
+    "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "0"))
+    ),
+    # Hardware-specific sparse prefill K tile. Zero retains the backend default.
+    "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
+    ),
     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
         os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
     ),
@@ -1068,6 +1096,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
         os.getenv("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
+    ),
+    "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES", "8")
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH", ""
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH", ""
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
+    ),
+    # Force Marlin MoE token alignment block size for hardware-specific A/B.
+    # Zero keeps the shape heuristic.
+    "VLLM_MARLIN_MOE_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "0")
+    ),
+    "VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M": lambda: int(
+        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "0")
+    ),
+    "VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE", "1"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

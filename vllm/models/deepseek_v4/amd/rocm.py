@@ -6,13 +6,18 @@ from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import (
+    DeepseekV4Attention,
+    get_sparse_prefill_reqs_per_chunk,
+)
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4.phase_profile import phase_profile_stage
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
@@ -42,6 +47,15 @@ def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
     torch.cumsum(lengths, dim=0, out=indptr[1:])
     return indptr
+
+
+def _sparse_prefill_reqs_per_chunk(max_reqs: int, M: int, head_dim: int) -> int:
+    return get_sparse_prefill_reqs_per_chunk(
+        max_reqs=max_reqs,
+        num_kv_tokens=M,
+        head_dim=head_dim,
+        budget_mb=envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB,
+    )
 
 
 # ROCm sparse prefill keeps this dense combine local so AMD-specific SWA changes
@@ -520,19 +534,23 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
-        z = rocm_inv_rope_einsum(
-            self.rotary_emb,
-            o,
-            positions,
-            self.rope_head_dim,
-            self.n_local_groups,
-            self.o_lora_rank,
-            self.wo_a,
-        )
+        with phase_profile_stage("attention.output_projection.inv_rope_wo_a", o):
+            z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
         zf = z.flatten(1)
-        if self._wo_b_scale is not None and zf.dim() == 2:
-            return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
-        return self.wo_b(zf)
+        with phase_profile_stage("attention.output_projection.wo_b", zf):
+            if self._wo_b_scale is not None and zf.dim() == 2:
+                return self._bpre_attn_gemm(
+                    self.wo_b.weight, self._wo_b_scale, zf, True
+                )
+            return self.wo_b(zf)
 
     def forward_mqa(
         self,
@@ -571,8 +589,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 assert self.topk_indices_buffer is not None
                 top_k = self.topk_indices_buffer.shape[-1]
             combined_topk = round_up(top_k + self.window_size, 128)
+            reqs_per_chunk = _sparse_prefill_reqs_per_chunk(
+                self.PREFILL_CHUNK_SIZE,
+                M,
+                q.shape[-1],
+            )
             current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
                 ((self.max_num_batched_tokens,), torch.int32),
             )
@@ -641,43 +664,45 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
-                (
-                    topk_ragged_indices,
-                    topk_ragged_indptr,
-                    topk_lens,
-                ) = compute_global_topk_ragged_indices_and_indptr(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
+                with phase_profile_stage("sparse_mla.topk_metadata", q, flow="decode"):
+                    (
+                        topk_ragged_indices,
+                        topk_ragged_indptr,
+                        topk_lens,
+                    ) = compute_global_topk_ragged_indices_and_indptr(
+                        self.topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        is_valid,
+                    )
             else:
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
-        rocm_sparse_attn_decode(
-            q=q,
-            kv_cache=kv_cache,
-            swa_k_cache=self.swa_cache_layer.kv_cache,
-            swa_only=swa_only,
-            topk_indices=topk_indices,
-            topk_lens=topk_lens,
-            swa_indices=swa_metadata.decode_swa_indices,
-            swa_lens=swa_metadata.decode_swa_lens,
-            swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
-            swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
-            topk_ragged_indices=topk_ragged_indices,
-            topk_ragged_indptr=topk_ragged_indptr,
-            attn_sink=self.attn_sink,
-            scale=self.scale,
-            head_dim=self.head_dim,
-            nope_head_dim=self.nope_head_dim,
-            rope_head_dim=self.rope_head_dim,
-            output=output,
-        )
+        with phase_profile_stage("sparse_mla.attention", q, flow="decode"):
+            rocm_sparse_attn_decode(
+                q=q,
+                kv_cache=kv_cache,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                swa_only=swa_only,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_metadata.decode_swa_indices,
+                swa_lens=swa_metadata.decode_swa_lens,
+                swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+                swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+                topk_ragged_indices=topk_ragged_indices,
+                topk_ragged_indptr=topk_ragged_indptr,
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                output=output,
+            )
 
     def _forward_prefill(
         self,
@@ -725,50 +750,57 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             N = 0
 
         M = N + self.window_size + self.max_num_batched_tokens
-        num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (
-            self.PREFILL_CHUNK_SIZE
+        reqs_per_chunk = _sparse_prefill_reqs_per_chunk(
+            self.PREFILL_CHUNK_SIZE,
+            M,
+            q.shape[-1],
         )
+        num_chunks = (num_prefills + reqs_per_chunk - 1) // reqs_per_chunk
 
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size, 128)
         kv, combined_indices_out, combined_lens_out = (
             workspace_manager.get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((reqs_per_chunk, M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
                 ((self.max_num_batched_tokens,), torch.int32),
             )
         )
         for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_start = chunk_idx * reqs_per_chunk
+            chunk_end = min(chunk_start + reqs_per_chunk, num_prefills)
             chunk_size = chunk_end - chunk_start
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
                 block_table = attn_metadata.block_table[num_decodes:]
                 # compressed_k_cache is OCP on every platform (Triton encoder).
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                    use_fnuz=False,
-                )
+                with phase_profile_stage(
+                    "sparse_mla.compressed_gather", q, flow="prefill"
+                ):
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                        use_fnuz=False,
+                    )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-                use_fnuz=current_platform.is_fp8_fnuz(),
-            )
+            with phase_profile_stage("sparse_mla.swa_gather", q, flow="prefill"):
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    swa_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    block_size=swa_metadata.block_size,
+                    offset=N,
+                    use_fnuz=current_platform.is_fp8_fnuz(),
+                )
 
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
@@ -779,29 +811,31 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             combined_indices_chunk = combined_indices_out[: query_end - query_start]
             combined_lens_chunk = combined_lens_out[: query_end - query_start]
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                M,
-                N,
-                out=(combined_indices_chunk, combined_lens_chunk),
-            )
-            rocm_sparse_attn_prefill(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices,
-                topk_length=combined_lens,
-                scale=self.scale,
-                head_dim=self.head_dim,
-                nope_head_dim=self.nope_head_dim,
-                rope_head_dim=self.rope_head_dim,
-                attn_sink=self.attn_sink,
-                output=output[query_start:query_end],
-            )
+            with phase_profile_stage("sparse_mla.combine_indices", q, flow="prefill"):
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    M,
+                    N,
+                    out=(combined_indices_chunk, combined_lens_chunk),
+                )
+            with phase_profile_stage("sparse_mla.attention", q, flow="prefill"):
+                rocm_sparse_attn_prefill(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices,
+                    topk_length=combined_lens,
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    output=output[query_start:query_end],
+                )

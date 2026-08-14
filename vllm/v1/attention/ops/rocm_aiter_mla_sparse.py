@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import (
@@ -1014,16 +1015,18 @@ def rocm_inv_rope_einsum(
     Fuses the inverse GPT-J RoPE into one Triton kernel and caches the bf16
     wo_a weight so the per-step dequant disappears.
     """
-    o_ref = _fused_inverse_rope_gptj(
-        o, positions, rotary_emb.cos_sin_cache, rope_head_dim
-    )
+    with optional_phase_profile_stage("attention.output_projection.inv_rope", o):
+        o_ref = _fused_inverse_rope_gptj(
+            o, positions, rotary_emb.cos_sin_cache, rope_head_dim
+        )
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     wo_a_weight = _get_cached_wo_a_bf16(
         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]
     )
 
-    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+    with optional_phase_profile_stage("attention.output_projection.wo_a", o_ref):
+        return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
 
 
 _DSV4_SPARSE_NOPE_DIM = 448
@@ -1827,6 +1830,11 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     attn_sink: torch.Tensor | None,
     nope_head_dim: int,
     rope_head_dim: int,
+    output: torch.Tensor | None = None,
+    *,
+    block_h: int = 16,
+    block_k: int | None = None,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -1853,26 +1861,38 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
-    block_h = 16
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
-    num_warps = 4
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    if block_k is None:
+        block_k = envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K
+        if block_k not in (0, 16, 32):
+            raise ValueError(
+                "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K must be 0, 16, or 32"
+            )
+        if block_k == 0:
+            block_k = 16 if head_dim >= 256 else 32
+    if output is None:
+        output = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert output.shape == q.shape, (
+            f"expected output shape {q.shape}, got {output.shape}"
+        )
+        assert output.dtype == torch.bfloat16 and output.device == q.device
+        assert output.stride(-1) == 1
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
         indices,
         indptr,
         attn_sink,
-        out,
+        output,
         q.stride(0),
         q.stride(1),
         q.stride(2),
         kv.stride(0),
         kv.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         num_heads,
         head_dim,
         kv.shape[0],
@@ -1883,7 +1903,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         BLOCK_K=block_k,
         num_warps=num_warps,
     )
-    return out
+    return output
 
 
 def _rocm_sparse_attn_prefill_triton(
@@ -1895,6 +1915,7 @@ def _rocm_sparse_attn_prefill_triton(
     nope_head_dim: int,
     rope_head_dim: int,
     topk_length: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
@@ -1912,6 +1933,7 @@ def _rocm_sparse_attn_prefill_triton(
         attn_sink=attn_sink,
         nope_head_dim=nope_head_dim,
         rope_head_dim=rope_head_dim,
+        output=output,
     )
 
 
@@ -2294,6 +2316,9 @@ def rocm_sparse_attn_prefill(
         rope_head_dim,
         "rocm_sparse_attn_prefill",
     )
+    caller_output = (
+        output if envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT else None
+    )
     if ragged_indices is not None and ragged_indptr is not None:
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
@@ -2304,6 +2329,7 @@ def rocm_sparse_attn_prefill(
             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
+            output=caller_output,
         )
     else:
         indices_2d = indices.reshape(indices.shape[0], -1)
@@ -2316,8 +2342,10 @@ def rocm_sparse_attn_prefill(
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
+            output=caller_output,
         )
-    output.copy_(output_chunk.to(output.dtype))
+    if caller_output is None:
+        output.copy_(output_chunk)
 
 
 def rocm_sparse_attn_decode(

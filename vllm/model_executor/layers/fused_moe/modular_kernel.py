@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.v1.worker.ubatching import (
     dbo_enabled,
     dbo_maybe_run_recv_hook,
@@ -1305,19 +1306,20 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
-        workspace13, workspace2, fused_out = self._allocate_buffers(
-            in_dtype,
-            a1q.device,
-            M_full,
-            M_full,
-            N,
-            K,
-            top_k,
-            global_num_experts,
-            local_num_experts,
-            expert_tokens_meta,
-            activation,
-        )
+        with optional_phase_profile_stage("moe.modular.workspace", a1q):
+            workspace13, workspace2, fused_out = self._allocate_buffers(
+                in_dtype,
+                a1q.device,
+                M_full,
+                M_full,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
 
         use_output_alias = (
             output_alias is not None
@@ -1339,23 +1341,24 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
-        self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        with optional_phase_profile_stage("moe.modular.kernel", a1q):
+            self.fused_experts.apply(
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         return fused_out
 
@@ -1475,14 +1478,15 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-        )
+        with optional_phase_profile_stage("moe.modular.prepare", hidden_states):
+            a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+            )
 
         # Stash the original unquantized hidden states on the LoRA context
         # so apply_w13_lora sees correct-magnitude activations instead of
@@ -1511,16 +1515,17 @@ class FusedMoEKernelModularImpl:
         if lora_ctx is not None:
             lora_ctx.original_hidden_states = None
 
-        return self._finalize(
-            output,
-            fused_out,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-        )
+        with optional_phase_profile_stage("moe.modular.finalize", hidden_states):
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
 
 
 @final

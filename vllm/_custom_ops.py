@@ -2519,6 +2519,8 @@ def moe_wna16_marlin_gemm(
     thread_k: int = -1,
     thread_n: int = -1,
     blocks_per_sm: int = -1,
+    fp32_reduce_workspace: torch.Tensor | None = None,
+    fp32_routed_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._moe_C.moe_wna16_marlin_gemm(
         input,
@@ -2550,6 +2552,8 @@ def moe_wna16_marlin_gemm(
         thread_k,
         thread_n,
         blocks_per_sm,
+        fp32_reduce_workspace,
+        fp32_routed_output,
     )
 
 
@@ -2583,6 +2587,11 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "moe_wna16_marlin_
         use_atomic_add: bool,
         use_fp32_reduce: bool,
         is_zp_float: bool,
+        thread_k: int = -1,
+        thread_n: int = -1,
+        blocks_per_sm: int = -1,
+        fp32_reduce_workspace: torch.Tensor | None = None,
+        fp32_routed_output: torch.Tensor | None = None,
     ):
         return torch.empty(
             (size_m * top_k, size_n), dtype=input.dtype, device=input.device

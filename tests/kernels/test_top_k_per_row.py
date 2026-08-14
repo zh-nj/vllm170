@@ -375,6 +375,48 @@ def test_top_k_per_row_decode_large_vocab_size(clean_logits: bool) -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_top_k_per_row_decode_dspark_q6_is_exact() -> None:
+    """Guard the exact top-512 set used by a single-request DSpark q6 pass."""
+    set_random_seed(0)
+    torch.set_default_device("cuda:0")
+    next_n = 6
+    top_k = 512
+    vocab_size = 32768
+    seq_lens = torch.tensor([vocab_size], dtype=torch.int32, device="cuda")
+    row_ends = (
+        vocab_size
+        - next_n
+        + torch.arange(1, next_n + 1, dtype=torch.int32, device="cuda")
+    )
+    logits = torch.stack(
+        [
+            torch.randperm(vocab_size, device="cuda", dtype=torch.int64).float()
+            for _ in range(next_n)
+        ]
+    )
+    logits.mul_(torch.finfo(torch.float32).eps)
+    indices = torch.empty((next_n, top_k), dtype=torch.int32, device="cuda")
+
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        next_n,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    torch.accelerator.synchronize()
+
+    expected = torch.stack(
+        [logits[row, : row_ends[row]].topk(top_k).indices for row in range(next_n)]
+    )
+    assert torch.equal(indices.sort().values, expected.to(torch.int32).sort().values)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize(
     "seq_len_range,test_id",
     [

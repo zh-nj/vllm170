@@ -191,3 +191,31 @@ def test_rope_module_cache(default_vllm_config):
         )
         # check if cache take effect
         assert id(rope) == rope_setting_id_map[str(setting)]
+
+
+def test_deepseek_v4_yarn_uses_deployment_cache_extent_without_math_drift(
+    default_vllm_config,
+):
+    rope_parameters = {
+        "rope_type": "deepseek_yarn",
+        "factor": 4,
+        "original_max_position_embeddings": 16,
+        "rope_theta": 10_000,
+        "rope_dim": 8,
+        "mscale": 0,
+        "mscale_all_dim": 0,
+        "is_deepseek_v4": True,
+    }
+    with torch.device("cuda"):
+        full = get_rope(16, 64, False, dict(rope_parameters), torch.float16)
+        bounded = get_rope(16, 37, False, dict(rope_parameters), torch.float16)
+
+    assert full is not bounded
+    assert full.cos_sin_cache.shape == (64, 8)
+    assert bounded.cos_sin_cache.shape == (37, 8)
+    torch.testing.assert_close(
+        bounded.cos_sin_cache,
+        full.cos_sin_cache[:37],
+        rtol=0,
+        atol=0,
+    )

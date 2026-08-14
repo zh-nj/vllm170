@@ -342,8 +342,8 @@ exec_config_t determine_exec_config(
 }
 
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
-               void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
-               void* perm, void* a_tmp, void* sorted_token_ids,
+               void* C_fp32, void* a_s, void* b_s, void* g_s, void* zp,
+               void* g_idx, void* perm, void* a_tmp, void* sorted_token_ids,
                void* expert_ids, void* num_tokens_past_padded,
                void* topk_weights, int moe_block_size, int num_experts,
                int top_k, bool mul_topk_weights, int prob_m, int prob_n,
@@ -387,6 +387,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* B_ptr = (const int4*)B;
   int4* C_ptr = (int4*)C;
   int4* C_tmp_ptr = (int4*)C_tmp;
+  float* C_fp32_ptr = (float*)C_fp32;
   const int4* bias_ptr = (const int4*)b_bias;
   const float* a_s_ptr = (const float*)a_s;
   const int4* b_s_ptr = (const int4*)b_s;
@@ -531,7 +532,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, C_fp32_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
@@ -557,7 +558,9 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     bool mul_topk_weights, vllm::ScalarTypeId const& b_type_id, int64_t size_m,
     int64_t size_n, int64_t size_k, bool is_k_full, bool use_atomic_add,
     bool use_fp32_reduce, bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm,
+    std::optional<torch::stable::Tensor> fp32_reduce_workspace_or_none,
+    std::optional<torch::stable::Tensor> fp32_routed_output_or_none) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.scalar_type();
@@ -712,9 +715,49 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
         (long)size_n * sorted_token_ids.size(0),
         (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
-    c_tmp = torch::stable::new_empty(a, {max_c_tmp_size}, kFloat);
+    if (fp32_reduce_workspace_or_none.has_value()) {
+      c_tmp = fp32_reduce_workspace_or_none.value();
+      STD_TORCH_CHECK(c_tmp.device().is_cuda(),
+                      "fp32_reduce_workspace is not on GPU");
+      STD_TORCH_CHECK(c_tmp.get_device() == a.get_device(),
+                      "fp32_reduce_workspace must be on the same GPU as a");
+      STD_TORCH_CHECK(c_tmp.is_contiguous(),
+                      "fp32_reduce_workspace is not contiguous");
+      STD_TORCH_CHECK(
+          c_tmp.scalar_type() == torch::headeronly::ScalarType::Float,
+          "fp32_reduce_workspace must have float32 dtype");
+      STD_TORCH_CHECK(c_tmp.numel() >= max_c_tmp_size,
+                      "fp32_reduce_workspace.numel = ", c_tmp.numel(),
+                      " is below max_c_tmp_size = ", max_c_tmp_size);
+    } else {
+      c_tmp = torch::stable::new_empty(a, {max_c_tmp_size}, kFloat);
+    }
   } else {
     c_tmp = torch::stable::new_empty(a, {0}, kFloat);
+  }
+
+  void* fp32_routed_output_ptr = nullptr;
+  if (fp32_routed_output_or_none.has_value()) {
+    torch::stable::Tensor fp32_routed_output =
+        fp32_routed_output_or_none.value();
+    STD_TORCH_CHECK(fp32_routed_output.device().is_cuda(),
+                    "fp32_routed_output is not on GPU");
+    STD_TORCH_CHECK(fp32_routed_output.get_device() == a.get_device(),
+                    "fp32_routed_output must be on the same GPU as a");
+    STD_TORCH_CHECK(fp32_routed_output.is_contiguous(),
+                    "fp32_routed_output is not contiguous");
+    STD_TORCH_CHECK(fp32_routed_output.scalar_type() ==
+                        torch::headeronly::ScalarType::Float,
+                    "fp32_routed_output must have float32 dtype");
+    STD_TORCH_CHECK(fp32_routed_output.dim() == 2,
+                    "fp32_routed_output must be two-dimensional");
+    STD_TORCH_CHECK(fp32_routed_output.size(0) == size_m * top_k &&
+                        fp32_routed_output.size(1) == size_n,
+                    "fp32_routed_output must have shape [", size_m * top_k,
+                    ", ", size_n, "]");
+    STD_TORCH_CHECK(use_fp32_reduce && !use_atomic_add,
+                    "fp32_routed_output requires the FP32 reduce path");
+    fp32_routed_output_ptr = fp32_routed_output.mutable_data_ptr();
   }
 
   // Detect groupsize and act_order
@@ -878,11 +921,12 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.const_data_ptr(), b_q_weight.const_data_ptr(), c.mutable_data_ptr(),
       c_tmp.mutable_data_ptr(), b_bias.mutable_data_ptr(),
-      a_scales.mutable_data_ptr(), b_scales.mutable_data_ptr(),
-      global_scale.mutable_data_ptr(), b_zeros.mutable_data_ptr(),
-      g_idx.mutable_data_ptr(), perm.mutable_data_ptr(),
-      a_tmp.mutable_data_ptr(), sorted_token_ids.mutable_data_ptr(),
-      expert_ids.mutable_data_ptr(), num_tokens_past_padded.mutable_data_ptr(),
+      fp32_routed_output_ptr, a_scales.mutable_data_ptr(),
+      b_scales.mutable_data_ptr(), global_scale.mutable_data_ptr(),
+      b_zeros.mutable_data_ptr(), g_idx.mutable_data_ptr(),
+      perm.mutable_data_ptr(), a_tmp.mutable_data_ptr(),
+      sorted_token_ids.mutable_data_ptr(), expert_ids.mutable_data_ptr(),
+      num_tokens_past_padded.mutable_data_ptr(),
       topk_weights.mutable_data_ptr(), moe_block_size, num_experts, top_k,
       mul_topk_weights, size_m, size_n, size_k, workspace.mutable_data_ptr(),
       a_type, b_type, c_type, s_type, has_bias, has_act_order, is_k_full,

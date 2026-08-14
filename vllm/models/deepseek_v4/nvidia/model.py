@@ -79,6 +79,10 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -748,18 +752,21 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the MoERunner class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
+            with phase_profile_stage("moe.fused_route_experts", hidden_states):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=hidden_states,
+                    input_ids=input_ids,
+                )
         else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with phase_profile_stage("moe.router", hidden_states):
+                router_logits, _ = self.gate(hidden_states)
+            with phase_profile_stage("moe.experts", hidden_states):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
         return final_hidden_states.view(org_shape)
 
@@ -849,6 +856,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        self.prefix = prefix
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
@@ -929,30 +937,70 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        with (
+            phase_profile_layer(self.prefix),
+            phase_profile_stage("layer.total", x, level="module"),
+        ):
+            return self._forward(
+                x,
+                positions,
+                input_ids,
+                post_mix,
+                res_mix,
+                residual,
+            )
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
-        if residual is None:
-            # Run standalone mhc_pre on first layer
-            if x.dim() == 2:
-                assert self.hc_attn_fn_broadcast is not None
-                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                    fn_broadcast=self.hc_attn_fn_broadcast,
-                )
+        with phase_profile_stage("layer.mhc_attention_pre", x, level="stage"):
+            if residual is None:
+                # Run standalone mhc_pre on first layer
+                if x.dim() == 2:
+                    assert self.hc_attn_fn_broadcast is not None
+                    residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                        x,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                        fn_broadcast=self.hc_attn_fn_broadcast,
+                    )
+                else:
+                    residual = x
+                    post_mix, res_mix, x = mhc_pre_tilelang(
+                        x,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                    )
             else:
-                residual = x
-                post_mix, res_mix, x = mhc_pre_tilelang(
+                residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                     x,
+                    residual,
+                    post_mix,
+                    res_mix,
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
@@ -961,18 +1009,31 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_eps,
                     self.hc_post_alpha,
                     self.hc_sinkhorn_iters,
+                    n_splits=1,
+                    tile_n=1,
                     norm_weight=attn_norm_weight,
                     norm_eps=attn_norm_eps,
                 )
-        else:
+
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+
+        with phase_profile_stage("layer.attention", x, level="module"):
+            x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
+
+        ffn_norm_weight = self.ffn_norm.weight.data
+        ffn_norm_eps = self.ffn_norm.variance_epsilon
+        with phase_profile_stage("layer.mhc_ffn_pre", x, level="stage"):
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                 x,
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_eps,
@@ -980,39 +1041,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
                 n_splits=1,
                 tile_n=1,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
+                norm_weight=ffn_norm_weight,
+                norm_eps=ffn_norm_eps,
             )
 
-        if self.use_sequence_parallel:
-            x = sp_all_gather(x)[: positions.shape[0]]
-
-        x = self.attn(positions, x, None)
-        if self.use_sequence_parallel:
-            x = sp_reduce_scatter(x)
-
-        ffn_norm_weight = self.ffn_norm.weight.data
-        ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            n_splits=1,
-            tile_n=1,
-            norm_weight=ffn_norm_weight,
-            norm_eps=ffn_norm_eps,
-        )
-
-        x = self.ffn(x, input_ids)
+        with phase_profile_stage("layer.ffn", x, level="module"):
+            x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
 
@@ -1162,7 +1196,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                with phase_profile_stage("model.embedding", input_ids, level="module"):
+                    hidden_states = self.embed_input_ids(input_ids)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1197,9 +1232,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                with phase_profile_stage(
+                    "model.aux_reconstruct", hidden_states, level="stage"
+                ):
+                    aux_recon = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -1210,9 +1248,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                with phase_profile_stage(
+                    "model.stage_reconstruct", hidden_states, level="stage"
+                ):
+                    hidden_states = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1224,15 +1265,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
-        hidden_states = self.norm(hidden_states)
+        with phase_profile_stage("model.hc_head", hidden_states, level="stage"):
+            hidden_states = hc_head_fused_kernel_tilelang(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+        with phase_profile_stage("model.final_norm", hidden_states, level="stage"):
+            hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

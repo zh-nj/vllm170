@@ -298,8 +298,10 @@ def get_rope(
                 "mscale_all_dim",
             )
         }
+        cls: type[DeepseekScalingRotaryEmbedding]
         if rope_parameters.get("is_deepseek_v4", False):
             cls = DeepseekV4ScalingRotaryEmbedding
+            extra_kwargs["cache_max_position_embeddings"] = max_position
         else:
             cls = DeepseekScalingRotaryEmbedding
         rotary_emb = cls(

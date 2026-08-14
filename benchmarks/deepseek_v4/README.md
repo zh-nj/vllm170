@@ -17,8 +17,12 @@ The defaults are the measured three-card configuration:
 - physical GPUs `1,2,3`, PP3 with `15,15,13` layers and TP1;
 - Triton sparse MLA, FP8 KV cache, block size 256;
 - CUDA Graph execution and DSpark with 7 speculative tokens;
-- 131,072-token context, 2,048 batched tokens, and 8 sequences;
+- 131,072-token context, 1,715 batched tokens, and 8 sequences;
 - a 32 MiB sparse-indexer logits budget and 1.6 GB KV cache per GPU.
+- Marlin block-M 48 for MoE batches with at least 1,000 tokens; smaller decode
+  batches retain the upstream shape heuristic.
+- sparse-prefill caller output with K tile 32 and no additional persistent
+  attention weights.
 
 Do not add `--enforce-eager`: it disables the CUDA Graph decode path and causes
 an order-of-magnitude regression on this machine. The launcher defaults to
@@ -31,7 +35,195 @@ DSV4_MODE=production benchmarks/deepseek_v4/run_cmp170hx_pp3.sh
 
 The main overrides are `DSV4_MODEL_DIR`, `CUDA_VISIBLE_DEVICES`,
 `DSV4_MOE_BACKEND`, `DSV4_DSPARK_TOKENS`, `DSV4_KV_CACHE_BYTES`, and
-`DSV4_MAX_MODEL_LEN`.
+`DSV4_MAX_MODEL_LEN`. The 1,715-token scheduler limit is specific to the
+measured 5,000-token, PP3, DSpark-7 workload: reserving 48 speculative slots
+leaves 1,667 target tokens and produces balanced `1667 + 1667 + 1666` prefill
+microbatches. Override `DSV4_MAX_BATCHED_TOKENS` for other traffic shapes. Set
+`VLLM_MARLIN_MOE_BLOCK_SIZE=0` to restore Marlin's upstream shape heuristic.
+`VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M` controls the minimum token batch affected by
+an explicit block size.
+
+The sparse-prefill gather workspace has a byte budget rather than assuming
+that four maximum-length requests always fit. The default is 512 MiB; override
+it with `VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB`. Setting it to zero restores
+the legacy four-request limit.
+
+The promoted sparse kernel switches are
+`VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT=1` and
+`VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K=32`; zero restores the previous copy
+path and backend tile. BF16 `wo_b` and indexer `wq_b` caches were measured but
+removed from serving because they add 960 MiB to PP0/PP1 or about 112 MiB per
+rank. Persistent attention memory is reserved for long-context capacity.
+
+## PP3 phase profile
+
+The canonical profile runs a same-context warmup, then opens one measurement
+window for both the per-worker Torch profiler and CUDA-event phase records.
+PP ranks are written independently. The harness records prompt/output hashes,
+server token counts, speculative acceptance, ms/round, the live Git revision,
+and the full topology. It calibrates the generated prompt through the server's
+`/tokenize` endpoint and fails unless `usage.prompt_tokens` exactly matches
+`DSV4_PROFILE_CONTEXT`:
+
+```bash
+DSV4_DSPARK_TOKENS=5 \
+DSV4_PROFILE_CONTEXT=32000 \
+DSV4_PROFILE_TOKENS=64 \
+DSV4_PROFILE_REPEATS=3 \
+benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh
+```
+
+`DSV4_PROFILE_EXECUTION=detail` is the default. It adds `--enforce-eager` so
+the following nested stages can be timed rather than hidden inside graph replay:
+
+- prefill: per-layer total, attention, FFN/MoE, both mHC transitions, embedding,
+  stage reconstruction and final norm; attention further splits input GEMMs,
+  indexer gather/logits/top-k/DCP merge, compressed/SWA gather, sparse MLA, and
+  output projection; Marlin MoE further splits gate, routing, dispatch,
+  workspace, token alignment, W13, activation, W2, weighted reduce, finalize,
+  and combine, including actual padded-row utilization by DSV4 shape;
+- decode: target stages, paged indexer logits, exact/persistent top-k,
+  top-k metadata, sparse MLA, and output projection;
+- DSpark: target logits and rejection, hidden/input preparation, context-KV,
+  draft backbone, base logits, and every Markov bias/sample step.
+
+This detailed run is diagnostic and must not be quoted as production decode
+throughput. Use `DSV4_PROFILE_EXECUTION=graph` for the deployed CUDA Graph path;
+that mode reports graph replay and eager boundary totals but intentionally does
+not claim unavailable graph-internal subdivisions.
+
+Use `DSV4_PROFILE_EXECUTION=benchmark` for an endpoint-level comparison without
+Torch profiler or CUDA-event synchronization. The harness still records exact
+tokens, TTFT, decode latency, configuration metadata, and sampled per-GPU peak
+memory. The 2,048/4,096/8,192 study and the promoted 1,715-token PP3 setting are
+documented in
+`docs/design/vllm170-dsv4-sm80-max-batched-tokens-2026-08-14.md`.
+
+The script writes per-worker traces, profiler tables, a server log,
+`result.jsonl`, raw `phase_trace/*.jsonl`, `phase_summary.json`, one Markdown
+summary for each of prefill/decode/DSpark, and `profile_status.json` under
+`profiles/deepseek_v4/<UTC timestamp>/`. With PP3, stages overlap: report each
+stage/device separately and use the critical stage for wall-time attribution.
+Never add times from all three ranks as though they were sequential. Nested
+`total`, `module`, `stage`, and `detail` ranges also overlap and must not be
+added across levels. The prefill report additionally aligns chunks by ordinal,
+reports model/layer coverage, gives per-layer attention/FFN/mHC totals, and
+ranks the Marlin sub-stages. Repeated workloads are all checked fail-closed
+and aggregated in the same phase report.
+
+The accepted CMP170HX Marlin P0 decomposition, block-M A/B and next optimization
+queue are documented in
+`docs/design/vllm170-dsv4-sm80-marlin-moe-profile-2026-08-14.md`.
+
+The follow-up W13/W2 execution-config sweep, caller-owned FP32 reduce workspace
+A/B/A, and fusion feasibility study are documented in
+`docs/design/vllm170-dsv4-sm80-marlin-moe-config-workspace-2026-08-14.md`.
+Reproduce the isolated SM80 sweep with real DSV4 shapes using:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  .venv/bin/python benchmarks/kernels/deepseek_v4_marlin_moe.py \
+  --stage both --m 1000 1666 1667 2000 4048 \
+  --routing-seeds -1 8 9 --warmup 3 --iterations 10 --samples 5 \
+  --fp32-reduce-workspace caller --output /tmp/marlin-moe.jsonl
+```
+
+Use `--fp32-reduce-workspace internal` for the same-binary allocation control.
+The production environment switch is
+`VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE=0|1`; disabling it restores C++ internal
+allocation. Execution configs remain on Marlin auto selection because no
+forced shape beat it reproducibly.
+
+The rejected W2 two-stage FP32 grouped-tail can be reproduced independently:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  .venv/bin/python \
+  benchmarks/kernels/deepseek_v4_marlin_w2_grouped_tail.py \
+  --m 1666 1667 2000 4048 --routing-seeds -1 8 9 \
+  --warmup 3 --iterations 10 --samples 5 --output /tmp/w2-fp32-tail.jsonl
+```
+
+This benchmark requests an otherwise-unused optional FP32 routed output from
+Marlin and compares a top-k6 FP32 tail with the production BF16 `moe_sum`.
+Serving never passes that output. CMP170HX measurements were exactly correct
+but 3.23%-3.61% slower with twice the routed workspace, so this is a negative
+result and not a deployment option.
+
+The accepted attention P1 A/B, memory budget, rejected indexer-Q route, and
+compressor warp study are documented in
+`docs/design/vllm170-dsv4-sm80-attention-p1-2026-08-14.md`. Reproduce the
+isolated sparse and FP8-linear sweeps with:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/kernels/deepseek_v4_sparse_mla_prefill.py \
+  --output /tmp/sparse-mla.jsonl
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/kernels/deepseek_v4_output_projection.py \
+  --m 1 6 64 256 1000 1666 1667 2000 \
+  --output /tmp/wo-b.jsonl
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/kernels/deepseek_v4_compressor_save.py \
+  --output /tmp/compressor-save.jsonl
+```
+
+The harness watches both the workload and server processes. If model loading
+fails, it exits immediately with the server log instead of waiting for the
+health-check timeout.
+
+The current CMP170HX driver reports `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`.
+The validator therefore accepts the reproducible workload and complete PP3
+operator traces but marks `kernel_profile_accepted=false`. These traces are
+useful for operator attribution, while the phase JSONL uses CUDA Events for
+GPU stage latency without CUPTI. Phase timing is not a per-kernel NCU result.
+Use CUDA Events in isolated kernel benchmarks for kernel-candidate latency and
+peak-allocation measurements; if a future driver exposes CUDA activities,
+`profile_status.json` will promote the capture automatically. Pass
+`--require-cuda` directly to `profile_validate.py` for a fail-closed
+kernel-profile gate.
+
+Use Nsight Systems/Compute on isolated kernel microbenchmarks after the PP3
+trace identifies a bottleneck. Late-attaching Nsight to already initialized
+spawned workers is not a supported acceptance path on this host.
+
+Use DSpark width 5 to audit the q6 target pass (`next_n=6`) and width 7 for the
+production q8 configuration. A captured run is acceptable only when the
+completion length matches exactly, timing fields are finite, speculative
+counters conserve their meaning, and the profiler-owned process group exits.
+
+The opt-in real-logits audit compares the persistent and exact q6 top-k sets.
+It intentionally synchronizes and therefore requires eager mode; it is a
+correctness probe, not a performance run:
+
+```bash
+VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT=1 \
+VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN=5000 \
+VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES=8 \
+DSV4_DSPARK_TOKENS=5 \
+benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh --enforce-eager
+```
+
+The minimum is measured in compressed indexer tokens. It prevents warmup and
+short-context requests from consuming the bounded per-worker sample budget.
+
+## SM80 streaming-indexer prototype
+
+The prototype benchmark compares full logits plus the production prefill
+selector against tile-local exact top-k plus candidate merge:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+    benchmarks/kernels/deepseek_v4_streaming_indexer.py \
+    --rows 8 --keys 32768 --tile-size 1024
+```
+
+It fails if either selected indices or scores differ from the mathematical
+full-logits top-k, and reports CUDA-Event latency plus peak allocated bytes as
+JSON. This is a design probe, not a serving backend. Current CMP170HX results
+show a large memory reduction for small row counts but prohibitive latency;
+production routing remains disabled until score, local selection, and
+candidate merge are fused in a native SM80 implementation.
 
 ## Minimum performance suite
 

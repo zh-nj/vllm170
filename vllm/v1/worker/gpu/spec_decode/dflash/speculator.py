@@ -11,6 +11,10 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_stage,
+    profile_dspark_step,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -300,6 +304,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     @torch.inference_mode()
+    @profile_dspark_step
     def propose(
         self,
         input_batch: InputBatch,
@@ -339,13 +344,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        with phase_profile_stage(
+            "draft.hidden_prepare", last_hidden_states, flow="dspark", level="stage"
+        ):
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -372,34 +382,37 @@ class DFlashSpeculator(DraftModelSpeculator):
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                self.temperature,
-                self.seeds,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.kernel_block_sizes[gid],
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
-            )
+        with phase_profile_stage(
+            "draft.prepare_inputs", last_hidden_states, flow="dspark", level="stage"
+        ):
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -414,40 +427,49 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        with phase_profile_stage(
+            "draft.context_kv", self.hidden_states, flow="dspark", level="stage"
+        ):
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
+        with phase_profile_stage(
+            "draft.dispatch", last_hidden_states, flow="dspark", level="stage"
+        ):
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-            step=self.num_query_per_req,
-            causal=self._group_causal,
-        )
-        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-            self.block_tables.slot_mappings[:, :num_tokens_padded],
-            self.kv_cache_config,
-        )
+        with phase_profile_stage(
+            "draft.metadata", last_hidden_states, flow="dspark", level="stage"
+        ):
+            draft_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=self.num_query_per_req,
+                causal=self._group_causal,
+            )
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
 
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
@@ -455,16 +477,22 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            with phase_profile_stage(
+                "draft.graph_replay", last_hidden_states, flow="dspark", level="total"
+            ):
+                self.query_cudagraph_manager.run_fullgraph(batch_desc)
         else:
-            self._generate_draft(
-                num_reqs,
-                num_tokens_padded,
-                draft_attn_metadata,
-                draft_slot_mappings_by_layer,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-            )
+            with phase_profile_stage(
+                "draft.generate_total", last_hidden_states, flow="dspark", level="total"
+            ):
+                self._generate_draft(
+                    num_reqs,
+                    num_tokens_padded,
+                    draft_attn_metadata,
+                    draft_slot_mappings_by_layer,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                )
 
         return self.draft_tokens[:num_reqs]
 

@@ -2,10 +2,10 @@
 
 ## 目标与边界
 
-`vllm170` 从官方 `v0.27.1` 标签（`6e448d0ea9`）派生，目标部署为 5 张
-170HX 中 3 张运行 DeepSeek V4 Flash，另外 2 张保留给其他模型。由于卡间互联
-带宽有限，DSV4F 固定采用 `PP=3, TP=1`，不把 MoE expert 或 attention head 横跨
-显卡切分。
+`vllm170` 从官方 `v0.27.1` 标签（`6e448d0ea9`）派生。当前实机为 3 张
+CMP170HX（SM80、各 65 GB）和 1 张 3080 Ti；DSV4F 使用全部 3 张 CMP170HX。
+由于卡间互联带宽有限，DSV4F 固定采用 `PP=3, TP=1`，不把 MoE expert 或
+attention head 横跨显卡切分。
 
 本分支遵守以下原则：
 
@@ -120,6 +120,78 @@ Markov head，必须根据其独立量化元数据构造 head-specific config，
 
 后续同步官方主线时，先按功能目录 cherry-pick 或重写小补丁，不合并第三方大提交。
 
+### SM70 工作树的选择性吸收
+
+`deepseek-v4-cmp170hx` 的 SM70 kernel、TileLang launch 参数和 V100 wave 配置不进入
+本分支。算法与验收设施按 SM80 当前调用链重新实现，状态如下：
+
+| 设施 | 当前处理 | 准入判断 |
+| --- | --- | --- |
+| 部署长度 RoPE cache | cache extent 使用部署 `max_model_len`，YaRN 频率、original max position、mscale 和模型声明上限不变 | 已接入；bounded/full 有效前缀逐元素一致 |
+| q6 精确 top-k | 增加 opt-in 真实 logits 审计，同时识别 V2 runner 的 flattened q6 和 native q6 | 暂不改变默认 selector |
+| sparse-prefill gather | 按字节预算计算每批请求数，dummy/profile 与真实 forward 共用同一公式 | 已接入；默认临时预算 512 MiB |
+| streaming indexer | SM80 正确性原型只保留一个 K tile 和 top-k candidates，并返回 score/index | 未接 serving；等待 fused Triton selector/merge |
+| profiling/验收 | 固定 prompt/output hash、server token、DSpark counters、PP rank trace、三流程 CUDA Event 阶段记录和机器可读验收状态 | 已接入；CMP 上 CUDA activity 受 CUPTI 限制 |
+| Marlin MXFP4 MoE P0 | 分解 gate/route/align/W13/activation/W2/reduce，并仅对 `M>=1000` 使用实测 block-M 48 | 已接入 CMP170HX 启动器；Graph 5K TTFT 中位数改善 1.02% |
+| Marlin config/workspace P0 | W13/W2 分别扫描 thread shape 与 blocks/SM；FP32 reduce 改为 caller-owned modular workspace | auto shape 保留；临时分配峰值 14 MiB 降为 0，PP3 A/B/A 性能中性 |
+| Marlin W2 FP32 grouped-tail | 可选 FP32 routed 写回加 top-k6 FP32 tail 的隔离原型 | 60/60 零误差，但联合回退 3.23%-3.61% 且 routed workspace 翻倍；拒绝 serving 集成 |
+| PP3 5K prefill 调度 | 对照 2,048/4,096/8,192，并用 1,715 形成 `1667+1667+1666` 三个 target 微批 | 131K clean TTFT 中位数改善 4.08%；4,096 性能/容量拒绝，8,192 warmup OOM |
+| Attention P1 sparse MLA | caller output 消除临时 BF16 copy，CMP170HX 使用 K tile 32 | C4 kernel range 降 20.87%，Graph TTFT 改善 2.80%，峰值显存不增加 |
+| Attention P1 output projection | 缓存 BF16 `wo_b` 的隔离与 PP3 实验 | 虽降约 12.2%，但 PP0/PP1 各增加 960 MiB；拒绝并移除 serving 接入 |
+| C4 indexer Q/compressor | BF16 `wq_b` 与 state-save warp 扫描 | BF16 路径增加约 112 MiB/rank 且 E2E 未过门，已移除；compressor warp 保留默认 |
+| indexed/no-gather prefill | 源实现默认关闭且没有真实模型 microtest | 不复制；长上下文证据出现后重写 paged Triton 版本 |
+
+RoPE cache 的 key 包含部署 extent，避免相同 YaRN 配置的 full/bounded 实例误共享。
+`max_model_len=131072` 的 PP3 服务已完成实机加载和请求；精确前缀一致性由单元测试
+覆盖。当前 checkpoint 的 RoPE cache 为 FP32、宽度 64，因此从 1,048,576 缩到
+131,072 后由 256 MiB/rank 降至 32 MiB/rank，静态节省 224 MiB/rank。该优化只减少
+驻留 cache，不修改外部 position contract。
+
+q6 审计在 eager 模式下捕获了 PP3 三个 stage 各 8 个真实样本，共 24 个 layer 样本、
+144 个 logits 行；32K 请求对应的压缩长度为 6155–6157。严格按行隔离集合后，SM80
+persistent top-512 相对精确 radix selector 的 recall 均为 100%，没有漏选行。因此
+`VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT` 仅作为同步审计开关，精确 selector 不设为默认；
+更长 context 仍需继续采样，不能把本次结果外推到全部长度。
+
+streaming 原型在 CMP170HX 上使用 CUDA Events 测得以下隔离结果；所有行的数学
+top-k 集合和 score 都与 full logits 一致：
+
+| rows × K length | tile | 延迟比（stream/full） | 峰值分配比 |
+| --- | ---: | ---: | ---: |
+| 8 × 8192 | 1024 | 20.34x | 27.86% |
+| 8 × 32768 | 1024 | 75.44x | 7.25% |
+| 256 × 16384 | 1024 | 13.37x | 56.78% |
+| 256 × 16384 | 8192 | 1.72x | 121.37% |
+
+结果证明 `O(M×N)` logits 可以消除，但也证明“多次现有 logits kernel + selector +
+PyTorch candidate merge”不具备生产价值。下一版必须在一个 SM80 Triton 设计中融合
+tile 打分、local selector 与 candidate merge；在此之前不增加 serving 环境变量或
+CUDA Graph 路由，避免一个看似省显存但明显降速的实验路径进入服务。
+
+PP3 Torch profile 会为三个 stage 分别生成 trace/table，并由
+`profile_status.json` 检查 fixed-length workload 和 rank 完整性。详细模式在 warmup
+后单独开启 CUDA Event 记录，生成 `prefill`、`decode`、`dspark` 三份 JSONL/Markdown
+汇总：前两者必须覆盖 PP0–PP2，DSpark 的 draft 部分预期只在 PP2。请求先通过服务端
+tokenizer 校准，`usage.prompt_tokens` 必须精确等于目标长度。prefill 进一步记录每层
+total、attention、FFN/MoE、两段 mHC 和模型首尾阶段，并按 chunk、PP rank、layer 输出
+覆盖率与耗时。汇总对每一阶段取 critical PP rank，且禁止相加跨 rank 或嵌套范围。
+当前 CMP170HX 驱动返回
+`CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`，所以 operator trace 有效，但 CUDA kernel
+activity 缺失，验收器明确输出 `kernel_profile_accepted=false`；与此同时
+`phase_timing_accepted=true` 代表 CUDA Event 阶段计时完整。本机 kernel 延迟与峰值
+分配仍使用隔离 CUDA Events benchmark；PP3 trace 不对三个 stage 求和冒充请求 wall
+time。
+
+5K prefill 的 Marlin 分解显示，W13 与 W2 合计占 MoE 父范围约 85%，而
+activation、reduce、routing 和 alignment 均为低占比子项。三次重复的部署路径 A/B
+将 block-M 48 限定到 `M>=1000` 后，TTFT 中位数由 1619.252 ms 降到
+1602.793 ms；PP0/PP1/PP2 的 MoE 父范围分别改善 1.93%/4.08%/3.62%，decode
+仍走原 shape heuristic。实现、原始 run id、padding 利用率、回退方式和下一阶段
+首轮 block-M 研究见
+[`vllm170-dsv4-sm80-marlin-moe-profile-2026-08-14.md`](vllm170-dsv4-sm80-marlin-moe-profile-2026-08-14.md)。
+W13/W2 shape 表、caller-owned `c_tmp` 的 PP3 A/B/A 和融合研究见
+[`vllm170-dsv4-sm80-marlin-moe-config-workspace-2026-08-14.md`](vllm170-dsv4-sm80-marlin-moe-config-workspace-2026-08-14.md)。
+
 ### `dsv4-flash-a100`
 
 本地 `haosdent/vllm:dsv4-flash-a100` 是第三方分支，不是官方 vLLM 提交或官方
@@ -228,7 +300,7 @@ rate、RMSE 和最大相对误差。
 先以 Marlin 建立正确性基线，再切换实验 INT8 backend：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
+CUDA_VISIBLE_DEVICES=1,2,3 \
 VLLM_PP_LAYER_PARTITION=15,15,13 \
 vllm serve /models/deepseek-v4-flash \
   --pipeline-parallel-size 3 \
@@ -242,13 +314,13 @@ vllm serve /models/deepseek-v4-flash \
   --moe-backend marlin \
   --speculative-config '{
     "method":"dspark",
-    "num_speculative_tokens":5
+    "num_speculative_tokens":7
   }'
 ```
 
 DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再填写独立
-`model` 路径。`num_speculative_tokens=5` 与该 checkpoint 的 `dspark_block_size` 一致；
-更改 checkpoint 后必须重新核对，而不能机械沿用。
+`model` 路径。当前生产基线使用 `num_speculative_tokens=7`；5-token 仅用于形成 q6
+审计目标。更改 checkpoint 后必须重新核对 DSpark 配置，而不能机械沿用。
 
 只有 Marlin 基线通过后，才将 `--moe-backend marlin` 改为：
 
@@ -263,8 +335,8 @@ DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再
 
 ### 0. 硬件与构建门槛
 
-- 记录 5 张卡的 device name、compute capability、显存、PCIe 拓扑、P2P 能力和单向/
-  双向带宽；确认 170HX 对外报告 SM8x。
+- 记录 3 张 CMP170HX 和 1 张 3080 Ti 的 device name、compute capability、显存、
+  PCIe 拓扑、P2P 能力和单向/双向带宽；确认服务只选择三张 SM80 CMP170HX。
 - 用 `TORCH_CUDA_ARCH_LIST=8.0` 构建，确认 `_moe_C` 包含两个
   `dsv4_mxfp4_int8_sm80_*` op；检查 CUTLASS dynamic shared-memory 设置。
 - 先单卡运行 FP8 encoder/LUT、MQA logits、sparse attention 和 MXFP4 INT8 GEMM 的

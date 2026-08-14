@@ -15,6 +15,7 @@ import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
 
+import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe  # noqa
 from tests.kernels.moe.utils import (
     fused_moe,
@@ -33,13 +34,21 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    _marlin_moe_fp32_reduce_workspace_size,
+    _marlin_moe_max_sorted_tokens,
+    _select_marlin_moe_block_size,
+    _split_marlin_moe_workspace,
     batched_fused_marlin_moe,
     fused_marlin_moe,
+)
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_use_td_hw_supported,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
     marlin_permute_bias,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -904,6 +913,147 @@ class MarlinMoEWeightData:
             sort_indices=sort_indices,
             marlin_bias=marlin_bias,
         )
+
+
+def test_marlin_moe_block_size_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "32")
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "1000")
+
+    assert _select_marlin_moe_block_size(2000, 6, 256, None) == 32
+    assert _select_marlin_moe_block_size(1, 6, 256, None) == 8
+
+
+def test_marlin_moe_block_size_override_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "24")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        _select_marlin_moe_block_size(2000, 6, 256, None)
+
+
+def test_marlin_moe_fp32_reduce_workspace_layout() -> None:
+    m = 1667
+    topk = 6
+    num_experts = 256
+    block_size_m = 48
+    size_n = 4096
+    intermediate_cache13_size = m * topk * size_n
+    max_sorted_tokens = _marlin_moe_max_sorted_tokens(
+        m, topk, num_experts, block_size_m
+    )
+    fp32_size = _marlin_moe_fp32_reduce_workspace_size(
+        size_n,
+        max_sorted_tokens,
+        block_size_m,
+        num_sms=70,
+    )
+
+    assert max_sorted_tokens == m * topk + num_experts * (block_size_m - 1)
+    assert fp32_size == 70 * 4 * block_size_m * 256
+
+    workspace = torch.empty(
+        intermediate_cache13_size + fp32_size * 2,
+        dtype=torch.bfloat16,
+    )
+    intermediate_cache13, fp32_workspace = _split_marlin_moe_workspace(
+        workspace, intermediate_cache13_size
+    )
+
+    assert intermediate_cache13.numel() == intermediate_cache13_size
+    assert fp32_workspace.dtype == torch.float32
+    assert fp32_workspace.numel() == fp32_size
+    assert fp32_workspace.data_ptr() == (
+        workspace.data_ptr() + intermediate_cache13_size * workspace.element_size()
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_marlin_moe_fp32_routed_output_matches_bf16() -> None:
+    set_random_seed(7)
+    m, topk, num_experts = 16, 2, 8
+    intermediate_size = hidden_size = 256
+    block_size_m = 16
+    device = torch.device("cuda")
+
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    w2_data = MarlinMoEWeightData.make(
+        w=w2,
+        quant_type=scalar_types.float4_e2m1f,
+        group_size=32,
+    )
+    activation = torch.randn(
+        (m * topk, intermediate_size), device=device, dtype=torch.bfloat16
+    )
+    topk_ids = (
+        torch.arange(m * topk, device=device, dtype=torch.int32).view(m, topk)
+        % num_experts
+    )
+    topk_weights = torch.softmax(
+        torch.randn((m, topk), device=device, dtype=torch.float32), dim=1
+    )
+    sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, num_experts
+    )
+    marlin_workspace = marlin_make_workspace_new(device, 4)
+    fp32_reduce_workspace = torch.empty(
+        _marlin_moe_fp32_reduce_workspace_size(
+            hidden_size,
+            sorted_ids.numel(),
+            block_size_m,
+            device.index,
+        ),
+        device=device,
+        dtype=torch.float32,
+    )
+    routed_bf16 = torch.empty(
+        (m * topk, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    routed_scratch = torch.empty_like(routed_bf16)
+    routed_fp32 = torch.empty(
+        (m * topk, hidden_size), device=device, dtype=torch.float32
+    )
+
+    common = {
+        "input": activation,
+        "b_qweight": w2_data.qweight,
+        "b_bias": None,
+        "b_scales": w2_data.scales,
+        "a_scales": None,
+        "global_scale": None,
+        "b_qzeros": None,
+        "g_idx": None,
+        "perm": None,
+        "workspace": marlin_workspace,
+        "sorted_token_ids": sorted_ids,
+        "expert_ids": expert_ids,
+        "num_tokens_past_padded": num_tokens_post_padded,
+        "topk_weights": topk_weights,
+        "moe_block_size": block_size_m,
+        "top_k": 1,
+        "mul_topk_weights": True,
+        "b_q_type": scalar_types.float4_e2m1f,
+        "size_m": m * topk,
+        "size_n": hidden_size,
+        "size_k": intermediate_size,
+        "is_k_full": True,
+        "use_atomic_add": False,
+        "use_fp32_reduce": True,
+        "is_zp_float": False,
+        "fp32_reduce_workspace": fp32_reduce_workspace,
+    }
+    ops.moe_wna16_marlin_gemm(output=routed_bf16, **common)
+    ops.moe_wna16_marlin_gemm(
+        output=routed_scratch,
+        fp32_routed_output=routed_fp32,
+        **common,
+    )
+
+    torch.testing.assert_close(routed_fp32, routed_bf16.float(), rtol=0, atol=0)
 
 
 @pytest.mark.flaky(reruns=2)
