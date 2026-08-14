@@ -48,6 +48,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -152,7 +156,10 @@ class DSparkDeepseekV4Model(nn.Module):
 
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
-        return self.main_norm(self.main_proj(aux_hidden_states))
+        with phase_profile_stage("draft.hidden_combine.main_proj", aux_hidden_states):
+            main_x = self.main_proj(aux_hidden_states)
+        with phase_profile_stage("draft.hidden_combine.main_norm", main_x):
+            return self.main_norm(main_x)
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -178,14 +185,18 @@ class DSparkDeepseekV4Model(nn.Module):
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
-            kv = attn.kv_norm(kv)
-            if slot_mapping is None:
-                continue
-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            with phase_profile_layer(layer.prefix):
+                # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv
+                # projection (q_lora part discarded), then fused cache insert.
+                with phase_profile_stage("draft.context_kv.input_gemm", main_x):
+                    qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                    kv = qr_kv[..., attn.q_lora_rank :]
+                with phase_profile_stage("draft.context_kv.norm", kv):
+                    kv = attn.kv_norm(kv)
+                if slot_mapping is None:
+                    continue
+                with phase_profile_stage("draft.context_kv.insert", kv):
+                    _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(
         self,
@@ -194,7 +205,8 @@ class DSparkDeepseekV4Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
+            with phase_profile_stage("draft.model.embedding", input_ids):
+                inputs_embeds = self.embed_input_ids(input_ids)
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -205,7 +217,8 @@ class DSparkDeepseekV4Model(nn.Module):
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        with phase_profile_stage("draft.model.expand", inputs_embeds):
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -217,18 +230,22 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        with phase_profile_stage("draft.model.reconstruct", hidden_states):
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         # hc_head reduces the hc copies; return the PRE-norm head hidden
-        hidden_states = hc_head_fused_kernel_tilelang(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        with phase_profile_stage("draft.model.hc_head", hidden_states):
+            hidden_states = hc_head_fused_kernel_tilelang(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         return hidden_states
 
 
@@ -365,16 +382,21 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
-        return self.compute_logits(hidden_states)
+        with phase_profile_stage("draft.logits.norm", hidden_states):
+            hidden_states = self.model.norm(hidden_states)
+        with phase_profile_stage("draft.logits.lm_head", hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        with phase_profile_stage("draft.markov.embed", token_ids):
+            return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed, self.logits_processor)
+        with phase_profile_stage("draft.markov.projection", markov_embed):
+            return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     # --- Weight loading ----------------------------------------------------
 

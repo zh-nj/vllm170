@@ -39,6 +39,16 @@ _PROFILE_FLOWS = {
     ).split(",")
     if flow.strip()
 }
+_PROFILE_LAYERS = {
+    layer.strip()
+    for layer in os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS", "").split(",")
+    if layer.strip()
+}
+_PROFILE_STAGES = {
+    stage.strip()
+    for stage in os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES", "").split(",")
+    if stage.strip()
+}
 
 
 @dataclass(frozen=True)
@@ -54,10 +64,12 @@ class _ProfileContext(threading.local):
         self.step_id: int | None = None
         self.token_count: int | None = None
         self.execution: str | None = None
+        self.step_kind: str | None = None
         self.layer: str | None = None
         self.compress_ratio: int | None = None
         self.queue: list[_PendingEvent] = []
         self.next_step_id = 0
+        self.stage_depth = 0
 
 
 _CONTEXT = _ProfileContext()
@@ -186,23 +198,37 @@ def phase_profile_step(
     *,
     token_count: int | None = None,
     execution: str | None = None,
+    step_kind: str | None = None,
 ) -> Iterator[None]:
     """Attach flow metadata and flush all nested events at the step boundary."""
     if not phase_profile_enabled(flow) or _is_compiling_or_capturing():
         yield
         return
     context = _CONTEXT
-    previous = (context.flow, context.step_id, context.token_count, context.execution)
+    previous = (
+        context.flow,
+        context.step_id,
+        context.token_count,
+        context.execution,
+        context.step_kind,
+    )
     context.flow = flow
     context.step_id = context.next_step_id
     context.next_step_id += 1
     context.token_count = token_count
     context.execution = execution
+    context.step_kind = step_kind
     try:
         yield
     finally:
         flush_phase_profile()
-        context.flow, context.step_id, context.token_count, context.execution = previous
+        (
+            context.flow,
+            context.step_id,
+            context.token_count,
+            context.execution,
+            context.step_kind,
+        ) = previous
 
 
 @contextmanager
@@ -237,6 +263,15 @@ def phase_profile_stage(
     # naturally calls itself "decode". Keep those nested records in the outer
     # DSpark flow instead of contaminating target decode attribution.
     actual_flow = "dspark" if _CONTEXT.flow == "dspark" else flow or _CONTEXT.flow
+    if _PROFILE_STAGES and stage not in _PROFILE_STAGES:
+        return nullcontext()
+    current_layer = _CONTEXT.layer
+    if (
+        _PROFILE_LAYERS
+        and current_layer is not None
+        and current_layer.removesuffix(".attn") not in _PROFILE_LAYERS
+    ):
+        return nullcontext()
     if (
         actual_flow is None
         or not phase_profile_enabled(actual_flow)
@@ -249,6 +284,15 @@ def phase_profile_stage(
 
     @contextmanager
     def _scope() -> Iterator[None]:
+        context = _CONTEXT
+        previous_flow = context.flow
+        previous_step_kind = context.step_kind
+        context.flow = actual_flow
+        if context.step_kind is None and extra:
+            extra_step_kind = extra.get("dspark_kind")
+            if isinstance(extra_step_kind, str):
+                context.step_kind = extra_step_kind
+        context.stage_depth += 1
         record_scope = (
             torch.autograd.profiler.record_function(label)
             if _PROFILE_RECORD_FUNCTION
@@ -257,28 +301,34 @@ def phase_profile_stage(
         cpu_started_ns = time.perf_counter_ns()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        with record_scope:
-            start.record()
-            try:
-                yield
-            finally:
-                end.record()
-        row: dict[str, Any] = {
-            "flow": actual_flow,
-            "stage": stage,
-            "phase": label,
-            "level": level,
-            "step_id": _CONTEXT.step_id,
-            "token_count": _CONTEXT.token_count,
-            "execution": _CONTEXT.execution,
-            "layer": _CONTEXT.layer,
-            "compress_ratio": _CONTEXT.compress_ratio,
-            "cpu_elapsed_us": (time.perf_counter_ns() - cpu_started_ns) / 1000.0,
-        }
-        if extra:
-            row["extra"] = extra
-        _CONTEXT.queue.append(_PendingEvent(start, end, row))
-        if _CONTEXT.step_id is None:
+        try:
+            with record_scope:
+                start.record()
+                try:
+                    yield
+                finally:
+                    end.record()
+            row: dict[str, Any] = {
+                "flow": actual_flow,
+                "stage": stage,
+                "phase": label,
+                "level": level,
+                "step_id": context.step_id,
+                "token_count": context.token_count,
+                "execution": context.execution,
+                "step_kind": context.step_kind,
+                "layer": context.layer,
+                "compress_ratio": context.compress_ratio,
+                "cpu_elapsed_us": (time.perf_counter_ns() - cpu_started_ns) / 1000.0,
+            }
+            if extra:
+                row["extra"] = extra
+            context.queue.append(_PendingEvent(start, end, row))
+        finally:
+            context.stage_depth -= 1
+            context.flow = previous_flow
+            context.step_kind = previous_step_kind
+        if context.step_id is None and context.stage_depth == 0:
             flush_phase_profile()
 
     return _scope()
@@ -308,8 +358,25 @@ def profile_dspark_step(function: _F) -> _F:
             if kwargs.get("is_profile", False) or graph_mode.value == 0
             else "graph_or_eager"
         )
-        with phase_profile_step(
-            "dspark", token_count=input_batch.num_tokens, execution=execution
+        step_kind = classify_target_flow(input_batch.is_prefilling_np)
+        with (
+            phase_profile_step(
+                "dspark",
+                token_count=input_batch.num_tokens,
+                execution=execution,
+                step_kind=step_kind,
+            ),
+            phase_profile_stage(
+                "draft.propose_total",
+                input_batch.input_ids,
+                level="total",
+                extra={
+                    "dspark_kind": step_kind,
+                    "num_reqs": input_batch.num_reqs,
+                    "num_draft_tokens": input_batch.num_draft_tokens,
+                    "num_query_tokens": (input_batch.num_reqs * self.num_query_per_req),
+                },
+            ),
         ):
             return function(self, input_batch, *args, **kwargs)
 

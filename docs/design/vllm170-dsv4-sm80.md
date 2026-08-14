@@ -136,6 +136,8 @@ Markov head，必须根据其独立量化元数据构造 head-specific config，
 | Marlin config/workspace P0 | W13/W2 分别扫描 thread shape 与 blocks/SM；FP32 reduce 改为 caller-owned modular workspace | auto shape 保留；临时分配峰值 14 MiB 降为 0，PP3 A/B/A 性能中性 |
 | Marlin W2 FP32 grouped-tail | 可选 FP32 routed 写回加 top-k6 FP32 tail 的隔离原型 | 60/60 零误差，但联合回退 3.23%-3.61% 且 routed workspace 翻倍；拒绝 serving 集成 |
 | PP3 5K prefill 调度 | 对照 2,048/4,096/8,192，并用 1,715 形成 `1667+1667+1666` 三个 target 微批 | 131K clean TTFT 中位数改善 4.08%；4,096 性能/容量拒绝，8,192 warmup OOM |
+| Decode metadata P0 | SM8x SWA 与 C128 two-stage direct-ragged，构造期跳过未消费的 dense decode buffer | SWA/C128 的 32K A/B/A/B mean 改善 1.64%/1.49%；64K 稳定，逻辑常驻合计减少 60.3 MiB/rank |
+| DSpark 分解计量 | prefill/decode proposal 分类、PP3 依赖路径、draft metadata/context-KV/Markov/三层 detail | 32K/64K proposal 为 10.265/10.347 ms；P0 为 non-final prefill context-only、metadata 公共几何和 KV-only insert |
 | Attention P1 sparse MLA | caller output 消除临时 BF16 copy，CMP170HX 使用 K tile 32 | C4 kernel range 降 20.87%，Graph TTFT 改善 2.80%，峰值显存不增加 |
 | Attention P1 output projection | 缓存 BF16 `wo_b` 的隔离与 PP3 实验 | 虽降约 12.2%，但 PP0/PP1 各增加 960 MiB；拒绝并移除 serving 接入 |
 | C4 indexer Q/compressor | BF16 `wq_b` 与 state-save warp 扫描 | BF16 路径增加约 112 MiB/rank 且 E2E 未过门，已移除；compressor warp 保留默认 |
@@ -174,7 +176,11 @@ PP3 Torch profile 会为三个 stage 分别生成 trace/table，并由
 汇总：前两者必须覆盖 PP0–PP2，DSpark 的 draft 部分预期只在 PP2。请求先通过服务端
 tokenizer 校准，`usage.prompt_tokens` 必须精确等于目标长度。prefill 进一步记录每层
 total、attention、FFN/MoE、两段 mHC 和模型首尾阶段，并按 chunk、PP rank、layer 输出
-覆盖率与耗时。汇总对每一阶段取 critical PP rank，且禁止相加跨 rank 或嵌套范围。
+覆盖率与耗时。prefill 对每一阶段取 critical PP rank；单请求 decode 的 target model
+按对齐轮次串行累加 PP0/PP1/PP2，而 worker-local metadata 只取 critical rank。任一流程
+都禁止相加嵌套范围或把未对齐的跨 rank 工作量当作墙钟时间。DSpark 的 32K/64K
+proposal、metadata/context-KV 和 non-final prefill 优化队列见
+[`vllm170-dsv4-sm80-dspark-profile-2026-08-15.md`](vllm170-dsv4-sm80-dspark-profile-2026-08-15.md)。
 当前 CMP170HX 驱动返回
 `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`，所以 operator trace 有效，但 CUDA kernel
 activity 缺失，验收器明确输出 `kernel_profile_accepted=false`；与此同时

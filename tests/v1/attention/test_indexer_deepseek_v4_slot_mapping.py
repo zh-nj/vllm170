@@ -48,7 +48,10 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config = create_vllm_config(
+        model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        max_model_len=1024,
+    )
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
     block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(

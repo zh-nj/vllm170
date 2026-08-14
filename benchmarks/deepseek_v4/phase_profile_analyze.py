@@ -42,27 +42,60 @@ DETAIL_REQUIREMENTS = {
         "sparse_mla.attention",
     },
     "decode": {
+        "target.model_forward",
+        "target.attn_metadata.prepare_attn",
+        "target.attn_metadata.builders",
+        "layer.total",
+        "layer.attention",
+        "layer.ffn",
         "attention.input_gemm_overlap",
+        "attention.input_gemm.join",
+        "attention.qkv_insert",
+        "attention.qicm_join",
+        "attention.q_index_compress_mla",
+        "attention.output_projection",
         "indexer.paged_logits",
+        "indexer.query_cache_join",
         "indexer.topk",
+        "moe.fused_route_experts",
+        "moe.routed_experts",
+        "moe.shared_experts.compute",
+        "moe.shared_experts.join",
+        "moe.shared_experts.w13",
+        "moe.shared_experts.activation",
+        "moe.shared_experts.w2",
+        "moe.marlin.w13_gemm",
+        "moe.marlin.w2_gemm",
         "sparse_mla.attention",
     },
     "dspark": {
+        "target.sampling_total",
         "target.logits",
+        "target.rejection.verify_total",
+        "draft.propose_total",
+        "draft.context_kv",
+        "draft.metadata",
         "draft.backbone",
+        "draft.model.embedding",
+        "draft.model.hc_head",
+        "layer.total",
+        "layer.attention",
+        "layer.ffn",
         "draft.base_logits",
+        "draft.logits.lm_head",
         "draft.markov_bias",
+        "draft.markov.projection",
         "draft.markov_sample",
     },
 }
 
-PREFILL_LAYER_COMPONENTS = (
+LAYER_COMPONENTS = (
     "layer.mhc_attention_pre",
     "layer.attention",
     "layer.mhc_ffn_pre",
     "layer.ffn",
 )
-PREFILL_MODEL_COMPONENTS = (
+MODEL_COMPONENTS = (
     "layer.total",
     "model.embedding",
     "model.aux_reconstruct",
@@ -70,7 +103,7 @@ PREFILL_MODEL_COMPONENTS = (
     "model.hc_head",
     "model.final_norm",
 )
-PREFILL_MARLIN_ADDITIVE_COMPONENTS = (
+MARLIN_ADDITIVE_COMPONENTS = (
     "moe.router_gate",
     "moe.dispatch",
     "moe.router_select",
@@ -84,9 +117,14 @@ PREFILL_MARLIN_ADDITIVE_COMPONENTS = (
     "moe.modular.finalize",
     "moe.combine",
 )
-PREFILL_MARLIN_NESTED_RANGES = (
+MARLIN_NESTED_RANGES = (
     "moe.routed_experts",
     "moe.modular.kernel",
+    "moe.shared_experts.compute",
+    "moe.shared_experts.join",
+    "moe.shared_experts.w13",
+    "moe.shared_experts.activation",
+    "moe.shared_experts.w2",
 )
 
 
@@ -121,9 +159,17 @@ def _percentile(values: list[float], percentile: float) -> float:
 def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[tuple[str, int, str, str], list[float]] = defaultdict(list)
     cpu_grouped: dict[tuple[str, int, str, str], list[float]] = defaultdict(list)
-    step_grouped: dict[tuple[str, int, int, int | None, str, str], list[float]] = (
+    metadata_grouped: dict[tuple[str, int, int, str, str], list[float]] = defaultdict(
+        list
+    )
+    metadata_cpu_grouped: dict[tuple[str, int, int, str, str], list[float]] = (
         defaultdict(list)
     )
+    step_grouped: dict[
+        tuple[str, int, int, int | None, str | None, str, str], list[float]
+    ] = defaultdict(list)
+    kind_grouped: dict[tuple[str, str, int, str, str], list[float]] = defaultdict(list)
+    draft_step_grouped: dict[tuple[str, int, str, int], list[float]] = defaultdict(list)
     layer_grouped: dict[tuple[str, int, str, str, str], list[float]] = defaultdict(list)
     stages_by_flow: dict[str, set[str]] = defaultdict(set)
     executions_by_flow: dict[str, set[str]] = defaultdict(set)
@@ -145,11 +191,30 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         cpu_elapsed_us = row.get("cpu_elapsed_us")
         if isinstance(cpu_elapsed_us, (int, float)) and math.isfinite(cpu_elapsed_us):
             cpu_grouped[(flow, pp_rank, stage, level)].append(float(cpu_elapsed_us))
+        extra = row.get("extra")
+        step_kind = row.get("step_kind")
+        if step_kind is None and isinstance(extra, dict):
+            step_kind = extra.get("dspark_kind")
+        if not isinstance(step_kind, str):
+            step_kind = None
         step_id = row.get("step_id")
         if isinstance(step_id, int):
             step_grouped[
-                (flow, pp_rank, step_id, row.get("token_count"), stage, level)
+                (
+                    flow,
+                    pp_rank,
+                    step_id,
+                    row.get("token_count"),
+                    step_kind,
+                    stage,
+                    level,
+                )
             ].append(elapsed_us)
+        if step_kind is not None:
+            kind_grouped[(flow, step_kind, pp_rank, stage, level)].append(elapsed_us)
+        draft_step = extra.get("draft_step") if isinstance(extra, dict) else None
+        if isinstance(draft_step, int):
+            draft_step_grouped[(flow, pp_rank, stage, draft_step)].append(elapsed_us)
         layer = row.get("layer")
         if isinstance(layer, str) and layer:
             layer_grouped[(flow, pp_rank, layer, stage, level)].append(elapsed_us)
@@ -160,7 +225,16 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         stages_by_flow[flow].add(stage)
         if row.get("execution"):
             executions_by_flow[flow].add(row["execution"])
-        extra = row.get("extra")
+        kv_cache_group = (
+            extra.get("kv_cache_group") if isinstance(extra, dict) else None
+        )
+        if stage.startswith("target.attn_metadata") and isinstance(kv_cache_group, int):
+            metadata_key = (flow, pp_rank, kv_cache_group, stage, level)
+            metadata_grouped[metadata_key].append(elapsed_us)
+            if isinstance(cpu_elapsed_us, (int, float)) and math.isfinite(
+                cpu_elapsed_us
+            ):
+                metadata_cpu_grouped[metadata_key].append(float(cpu_elapsed_us))
         if stage.startswith("moe.marlin.") and isinstance(extra, dict):
             shape = tuple(
                 extra.get(key) for key in ("M", "K", "N", "E", "topk", "block_size_m")
@@ -230,6 +304,7 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             pp_rank,
             step_id,
             token_count,
+            step_kind,
             stage,
             level,
         ), values in sorted(step_grouped.items()):
@@ -241,11 +316,37 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "pp_rank": pp_rank,
                     "step_id": step_id,
                     "token_count": token_count,
+                    "step_kind": step_kind,
                     "stage": stage,
                     "level": level,
                     "count": len(values),
                     "total_us": total_us,
                     "mean_us": total_us / len(values),
+                }
+            )
+
+        kind_rows = []
+        for (
+            row_flow,
+            step_kind,
+            pp_rank,
+            stage,
+            level,
+        ), values in sorted(kind_grouped.items()):
+            if row_flow != flow:
+                continue
+            total_us = sum(values)
+            kind_rows.append(
+                {
+                    "step_kind": step_kind,
+                    "pp_rank": pp_rank,
+                    "stage": stage,
+                    "level": level,
+                    "count": len(values),
+                    "total_us": total_us,
+                    "mean_us": total_us / len(values),
+                    "p50_us": _percentile(values, 0.50),
+                    "p90_us": _percentile(values, 0.90),
                 }
             )
 
@@ -270,6 +371,29 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "compress_ratio": layer_compress_ratio.get(
                         (flow, pp_rank, layer.removesuffix(".attn"))
                     ),
+                }
+            )
+
+        draft_step_rows = []
+        for (
+            row_flow,
+            pp_rank,
+            stage,
+            draft_step,
+        ), values in sorted(draft_step_grouped.items()):
+            if row_flow != flow:
+                continue
+            total_us = sum(values)
+            draft_step_rows.append(
+                {
+                    "pp_rank": pp_rank,
+                    "stage": stage,
+                    "draft_step": draft_step,
+                    "count": len(values),
+                    "total_us": total_us,
+                    "mean_us": total_us / len(values),
+                    "p50_us": _percentile(values, 0.50),
+                    "p90_us": _percentile(values, 0.90),
                 }
             )
 
@@ -315,6 +439,68 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             )
 
+        compression_values: dict[tuple[int, str, str], list[float]] = defaultdict(list)
+        compression_layers: dict[int, set[tuple[int, str]]] = defaultdict(set)
+        for (row_flow, pp_rank, layer, stage, level), values in layer_grouped.items():
+            if row_flow != flow:
+                continue
+            canonical_layer = layer.removesuffix(".attn")
+            compress_ratio = layer_compress_ratio.get((flow, pp_rank, canonical_layer))
+            if compress_ratio is None:
+                continue
+            compression_values[(compress_ratio, stage, level)].extend(values)
+            compression_layers[compress_ratio].add((pp_rank, canonical_layer))
+
+        compression_family_rows = []
+        for (compress_ratio, stage, level), values in sorted(
+            compression_values.items()
+        ):
+            total_us = sum(values)
+            compression_family_rows.append(
+                {
+                    "compress_ratio": compress_ratio,
+                    "layer_count": len(compression_layers[compress_ratio]),
+                    "stage": stage,
+                    "level": level,
+                    "count": len(values),
+                    "total_us": total_us,
+                    "mean_us": total_us / len(values),
+                    "p50_us": _percentile(values, 0.50),
+                    "p90_us": _percentile(values, 0.90),
+                }
+            )
+
+        metadata_group_rows = []
+        for (
+            row_flow,
+            pp_rank,
+            kv_cache_group,
+            stage,
+            level,
+        ), values in sorted(metadata_grouped.items()):
+            if row_flow != flow:
+                continue
+            total_us = sum(values)
+            cpu_values = metadata_cpu_grouped.get(
+                (row_flow, pp_rank, kv_cache_group, stage, level), []
+            )
+            metadata_group_rows.append(
+                {
+                    "pp_rank": pp_rank,
+                    "kv_cache_group": kv_cache_group,
+                    "stage": stage,
+                    "level": level,
+                    "count": len(values),
+                    "total_us": total_us,
+                    "mean_us": total_us / len(values),
+                    "p50_us": _percentile(values, 0.50),
+                    "p90_us": _percentile(values, 0.90),
+                    "cpu_mean_us": (
+                        sum(cpu_values) / len(cpu_values) if cpu_values else None
+                    ),
+                }
+            )
+
         missing = sorted(DETAIL_REQUIREMENTS[flow] - stages_by_flow[flow])
         flows[flow] = {
             "record_count": sum(row["count"] for row in rows),
@@ -324,25 +510,54 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             "missing_detail_stages": missing,
             "by_rank_stage": rows,
             "by_step_rank_stage": step_rows,
+            "by_kind_rank_stage": kind_rows,
             "by_layer_stage": layer_rows,
+            "by_draft_step_stage": draft_step_rows,
+            "compression_family_stage": compression_family_rows,
+            "metadata_group_stage": metadata_group_rows,
             "marlin_shape_stage": marlin_shape_rows,
             "critical_stage_rank": stage_maxima,
         }
 
-    flows["prefill"]["module_coverage"] = _prefill_module_coverage(
-        flows["prefill"]["by_rank_stage"]
+    for flow in ("prefill", "decode"):
+        flows[flow]["module_coverage"] = _module_coverage(flows[flow]["by_rank_stage"])
+        flows[flow]["target_steps"] = _target_steps(flows[flow]["by_step_rank_stage"])
+        flows[flow]["marlin_moe"] = _marlin_moe(
+            flows[flow]["by_rank_stage"],
+            flows[flow]["marlin_shape_stage"],
+        )
+    flows["prefill"]["chunks"] = flows["prefill"]["target_steps"]
+    flows["decode"]["round_summary"] = _decode_round_summary(
+        flows["decode"]["target_steps"]
     )
-    flows["prefill"]["chunks"] = _prefill_chunks(flows["prefill"]["by_step_rank_stage"])
-    flows["prefill"]["marlin_moe"] = _prefill_marlin_moe(
-        flows["prefill"]["by_rank_stage"],
-        flows["prefill"]["marlin_shape_stage"],
+    flows["decode"]["serial_stage"] = _decode_serial_stages(
+        flows["decode"]["by_step_rank_stage"]
+    )
+    flows["dspark"]["proposal_shapes"] = _dspark_proposal_shapes(
+        flows["dspark"]["by_step_rank_stage"]
+    )
+    flows["dspark"]["draft_module_coverage"] = _draft_module_coverage(
+        flows["dspark"]["by_rank_stage"]
+    )
+    flows["dspark"]["marlin_moe"] = _marlin_moe(
+        flows["dspark"]["by_rank_stage"],
+        flows["dspark"]["marlin_shape_stage"],
+    )
+    flows["dspark"]["cycle_summary"] = _dspark_cycle_summary(
+        flows["decode"]["round_summary"],
+        flows["decode"]["by_rank_stage"],
+        flows["dspark"]["by_kind_rank_stage"],
+        flows["dspark"]["proposal_shapes"],
     )
 
     return {
         "schema_version": 1,
         "aggregation": {
             "within_rank": "sum repeated instances of the same stage",
-            "across_pp_ranks": "max rank per stage; PP ranks are never summed",
+            "across_pp_ranks": (
+                "prefill reports stage maxima; decode additionally sums aligned "
+                "serial PP model work within one target round"
+            ),
             "nested_ranges": (
                 "total, stage, and detail ranges overlap; do not sum levels"
             ),
@@ -351,7 +566,146 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _prefill_module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dspark_proposal_shapes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str | None, int | None], list[float]] = defaultdict(list)
+    for row in rows:
+        if row["stage"] == "draft.propose_total":
+            grouped[(row["step_kind"], row["token_count"])].append(row["total_us"])
+    result = []
+    for (step_kind, token_count), values in sorted(
+        grouped.items(),
+        key=lambda item: (
+            "" if item[0][0] is None else item[0][0],
+            -1 if item[0][1] is None else item[0][1],
+        ),
+    ):
+        result.append(
+            {
+                "step_kind": step_kind,
+                "token_count": token_count,
+                "count": len(values),
+                "mean_us": sum(values) / len(values),
+                "p50_us": _percentile(values, 0.50),
+                "p90_us": _percentile(values, 0.90),
+                "total_us": sum(values),
+            }
+        )
+    return result
+
+
+def _draft_module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_rank_stage = {(row["pp_rank"], row["stage"]): row["total_us"] for row in rows}
+    ranks = sorted(row["pp_rank"] for row in rows if row["stage"] == "draft.backbone")
+    model_stages = (
+        "draft.model.embedding",
+        "draft.model.expand",
+        "layer.total",
+        "draft.model.reconstruct",
+        "draft.model.hc_head",
+    )
+    result = []
+    for pp_rank in ranks:
+        model_total = by_rank_stage[(pp_rank, "draft.backbone")]
+        layer_total = by_rank_stage.get((pp_rank, "layer.total"), 0.0)
+        model_components = {
+            stage: by_rank_stage.get((pp_rank, stage), 0.0) for stage in model_stages
+        }
+        layer_components = {
+            stage: by_rank_stage.get((pp_rank, stage), 0.0)
+            for stage in LAYER_COMPONENTS
+        }
+        model_accounted = sum(model_components.values())
+        layer_accounted = sum(layer_components.values())
+        result.append(
+            {
+                "pp_rank": pp_rank,
+                "model_total_us": model_total,
+                "model_components_us": model_components,
+                "model_unattributed_us": max(0.0, model_total - model_accounted),
+                "model_coverage_pct": (
+                    100.0 * model_accounted / model_total if model_total else 0.0
+                ),
+                "layer_total_us": layer_total,
+                "layer_components_us": layer_components,
+                "layer_unattributed_us": max(0.0, layer_total - layer_accounted),
+                "layer_coverage_pct": (
+                    100.0 * layer_accounted / layer_total if layer_total else 0.0
+                ),
+            }
+        )
+    return result
+
+
+def _dspark_cycle_summary(
+    target_rounds: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    dspark_kind_rows: list[dict[str, Any]],
+    proposal_shapes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    target_round_count = sum(row["round_count"] for row in target_rounds)
+    target_prepare_by_rank: dict[int, float] = defaultdict(float)
+    for row in target_rows:
+        if row["stage"] in {"target.attn_metadata", "target.model_inputs"}:
+            target_prepare_by_rank[row["pp_rank"]] += row["total_us"]
+    if target_round_count:
+        target_prepare_by_rank = {
+            rank: total_us / target_round_count
+            for rank, total_us in target_prepare_by_rank.items()
+        }
+    target_prepare_work_sum_us = sum(target_prepare_by_rank.values())
+    target_prepare_critical_rank, target_prepare_critical_us = max(
+        target_prepare_by_rank.items(), key=lambda item: item[1], default=(None, 0.0)
+    )
+    dspark_decode = {
+        row["stage"]: row for row in dspark_kind_rows if row["step_kind"] == "decode"
+    }
+    target_sampling = dspark_decode.get("target.sampling_total")
+    draft_propose = dspark_decode.get("draft.propose_total")
+    proposal_tokens = {
+        row["token_count"] for row in proposal_shapes if row["step_kind"] == "decode"
+    }
+    result = []
+    for row in target_rounds:
+        token_count = row["token_count"]
+        if proposal_tokens and token_count not in proposal_tokens:
+            continue
+        sampling_us = 0.0 if target_sampling is None else target_sampling["mean_us"]
+        propose_us = 0.0 if draft_propose is None else draft_propose["mean_us"]
+        result.append(
+            {
+                "token_count": token_count,
+                "round_count": row["round_count"],
+                "target_prepare_critical_pp_rank": target_prepare_critical_rank,
+                "target_prepare_critical_mean_us": target_prepare_critical_us,
+                "target_prepare_work_sum_mean_us": target_prepare_work_sum_us,
+                "target_model_serial_mean_us": row["pipeline_mean_us"],
+                "target_model_slowest_rank_mean_us": row["critical_mean_us"],
+                "target_sampling_mean_us": sampling_us,
+                "draft_propose_mean_us": propose_us,
+                "measured_dependency_scope_mean_us": (
+                    target_prepare_critical_us
+                    + row["pipeline_mean_us"]
+                    + sampling_us
+                    + propose_us
+                ),
+                "cross_rank_work_sum_mean_us": (
+                    target_prepare_work_sum_us
+                    + row["pipeline_mean_us"]
+                    + sampling_us
+                    + propose_us
+                ),
+                "target_sampling_count": (
+                    0 if target_sampling is None else target_sampling["count"]
+                ),
+                "draft_propose_count": (
+                    0 if draft_propose is None else draft_propose["count"]
+                ),
+            }
+        )
+    return result
+
+
+def _module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_rank_stage = {(row["pp_rank"], row["stage"]): row["total_us"] for row in rows}
     ranks = sorted({row["pp_rank"] for row in rows})
     coverage = []
@@ -360,11 +714,11 @@ def _prefill_module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         layer_total = by_rank_stage.get((pp_rank, "layer.total"), 0.0)
         model_components = {
             stage: by_rank_stage.get((pp_rank, stage), 0.0)
-            for stage in PREFILL_MODEL_COMPONENTS
+            for stage in MODEL_COMPONENTS
         }
         layer_components = {
             stage: by_rank_stage.get((pp_rank, stage), 0.0)
-            for stage in PREFILL_LAYER_COMPONENTS
+            for stage in LAYER_COMPONENTS
         }
         model_accounted = sum(model_components.values())
         layer_accounted = sum(layer_components.values())
@@ -388,10 +742,10 @@ def _prefill_module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     return coverage
 
 
-def _prefill_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _target_steps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     model_rows_by_rank: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row["stage"] == "target.model_forward":
+        if row["stage"] in {"target.model_forward", "target.model_graph_replay"}:
             model_rows_by_rank[row["pp_rank"]].append(row)
     for rank_rows in model_rows_by_rank.values():
         rank_rows.sort(key=lambda row: row["step_id"])
@@ -419,12 +773,91 @@ def _prefill_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 },
                 "critical_pp_rank": critical_rank,
                 "critical_total_us": critical_row["total_us"],
+                "pipeline_total_us": sum(row["total_us"] for row in rank_rows.values()),
             }
         )
     return chunks
 
 
-def _prefill_marlin_moe(
+def _decode_round_summary(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[int | None, list[dict[str, Any]]] = defaultdict(list)
+    for step in steps:
+        grouped[step["token_count"]].append(step)
+
+    rows = []
+    for token_count, token_steps in sorted(
+        grouped.items(), key=lambda item: (-1 if item[0] is None else item[0])
+    ):
+        rank_values: dict[str, list[float]] = defaultdict(list)
+        critical_values = []
+        pipeline_values = []
+        critical_rank_counts: dict[str, int] = defaultdict(int)
+        for step in token_steps:
+            for pp_rank, elapsed_us in step["rank_total_us"].items():
+                rank_values[pp_rank].append(elapsed_us)
+            critical_values.append(step["critical_total_us"])
+            pipeline_values.append(step["pipeline_total_us"])
+            critical_rank_counts[str(step["critical_pp_rank"])] += 1
+        rows.append(
+            {
+                "token_count": token_count,
+                "round_count": len(token_steps),
+                "rank_latency_us": {
+                    pp_rank: {
+                        "mean_us": sum(values) / len(values),
+                        "p50_us": _percentile(values, 0.50),
+                        "p90_us": _percentile(values, 0.90),
+                    }
+                    for pp_rank, values in sorted(rank_values.items())
+                },
+                "critical_mean_us": sum(critical_values) / len(critical_values),
+                "critical_p50_us": _percentile(critical_values, 0.50),
+                "critical_p90_us": _percentile(critical_values, 0.90),
+                "critical_rank_counts": dict(sorted(critical_rank_counts.items())),
+                "pipeline_mean_us": sum(pipeline_values) / len(pipeline_values),
+                "pipeline_p50_us": _percentile(pipeline_values, 0.50),
+                "pipeline_p90_us": _percentile(pipeline_values, 0.90),
+            }
+        )
+    return rows
+
+
+def _decode_serial_stages(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    model_stages = {"target.model_forward", "target.model_graph_replay"}
+    model_rows_by_rank: dict[int, int] = defaultdict(int)
+    for row in rows:
+        if row["stage"] in model_stages:
+            model_rows_by_rank[row["pp_rank"]] += 1
+    target_round_count = max(model_rows_by_rank.values(), default=0)
+    model_total_us = sum(
+        row["total_us"] for row in rows if row["stage"] in model_stages
+    )
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["stage"], row["level"])].append(row)
+
+    result = []
+    for (stage, level), stage_rows in sorted(grouped.items()):
+        total_us = sum(row["total_us"] for row in stage_rows)
+        result.append(
+            {
+                "stage": stage,
+                "level": level,
+                "pp_ranks": sorted({row["pp_rank"] for row in stage_rows}),
+                "count": sum(row["count"] for row in stage_rows),
+                "total_us": total_us,
+                "per_target_round_us": (
+                    total_us / target_round_count if target_round_count else None
+                ),
+                "model_share_pct": (
+                    100.0 * total_us / model_total_us if model_total_us else None
+                ),
+            }
+        )
+    return result
+
+
+def _marlin_moe(
     rows: list[dict[str, Any]],
     shape_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -437,11 +870,11 @@ def _prefill_marlin_moe(
         parent_us = by_rank_stage[(pp_rank, "moe.fused_route_experts")]
         additive = {
             stage: by_rank_stage.get((pp_rank, stage), 0.0)
-            for stage in PREFILL_MARLIN_ADDITIVE_COMPONENTS
+            for stage in MARLIN_ADDITIVE_COMPONENTS
         }
         nested = {
             stage: by_rank_stage.get((pp_rank, stage), 0.0)
-            for stage in PREFILL_MARLIN_NESTED_RANGES
+            for stage in MARLIN_NESTED_RANGES
         }
         accounted_us = sum(additive.values())
         by_rank.append(
@@ -457,22 +890,37 @@ def _prefill_marlin_moe(
         )
     return {
         "parent_stage": "moe.fused_route_experts",
-        "additive_stages": list(PREFILL_MARLIN_ADDITIVE_COMPONENTS),
-        "nested_ranges": list(PREFILL_MARLIN_NESTED_RANGES),
+        "additive_stages": list(MARLIN_ADDITIVE_COMPONENTS),
+        "nested_ranges": list(MARLIN_NESTED_RANGES),
         "by_rank": by_rank,
         "by_shape_stage": shape_rows,
     }
 
 
 def render_flow_markdown(flow: str, summary: dict[str, Any]) -> str:
-    lines = [
-        f"# DeepSeek V4 {flow} phase profile",
-        "",
-        (
+    if flow == "decode":
+        rank_note = (
+            "Target rounds traverse PP ranks serially. The flat table reports the "
+            "largest rank only as a balance diagnostic; the serial section aligns "
+            "and sums model work by round. Nested levels must not be added."
+        )
+    elif flow == "dspark":
+        rank_note = (
+            "The target q8 verification traverses PP0/PP1/PP2 and remains in the "
+            "decode flow. Target sampling and the DSpark proposal then execute on "
+            "PP2. The cycle section combines only sibling top-level GPU scopes; "
+            "nested rows must not be added."
+        )
+    else:
+        rank_note = (
             "PP ranks overlap. Each row reports the rank with the largest total for "
             "that stage; totals from different ranks or nested levels must not be "
             "added."
-        ),
+        )
+    lines = [
+        f"# DeepSeek V4 {flow} phase profile",
+        "",
+        rank_note,
         "",
         f"Detail complete: `{str(summary['detail_complete']).lower()}`",
         "",
@@ -507,7 +955,533 @@ def render_flow_markdown(flow: str, summary: dict[str, Any]) -> str:
         )
     if flow == "prefill":
         lines.extend(_render_prefill_details(summary))
+    elif flow == "decode":
+        lines.extend(_render_decode_details(summary))
+    elif flow == "dspark":
+        lines.extend(_render_dspark_details(summary))
     return "\n".join(lines) + "\n"
+
+
+def _render_dspark_details(summary: dict[str, Any]) -> list[str]:
+    lines = [
+        "",
+        "## Steady-state DSpark cycle",
+        "",
+        (
+            "Target input and attention-metadata preparation can run concurrently "
+            "across PP workers, so the dependency-path estimate uses only its "
+            "critical rank. A target q8 verification for one request then traverses "
+            "PP0, PP1, and PP2 serially before PP2 sampling/rejection and proposal. "
+            "CPU scheduling, PP transport gaps, output copies, and profiler "
+            "synchronization remain outside this visible GPU scope."
+        ),
+        "",
+        (
+            "| Target tokens | Rounds | Prepare critical ms/rank | PP3 q8 serial ms | "
+            "Sampling ms | Draft proposal ms | Visible dependency scope ms | "
+            "Sampling/proposal events |"
+        ),
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary["cycle_summary"]:
+        lines.append(
+            f"| {row['token_count']} | {row['round_count']} | "
+            f"{row['target_prepare_critical_mean_us'] / 1000:.3f}/"
+            f"PP{row['target_prepare_critical_pp_rank']} | "
+            f"{row['target_model_serial_mean_us'] / 1000:.3f} | "
+            f"{row['target_sampling_mean_us'] / 1000:.3f} | "
+            f"{row['draft_propose_mean_us'] / 1000:.3f} | "
+            f"{row['measured_dependency_scope_mean_us'] / 1000:.3f} | "
+            f"{row['target_sampling_count']}/{row['draft_propose_count']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            (
+                "The cross-rank work sum below is an instrumentation/accounting "
+                "diagnostic, not wall time. It sums preparation on all workers even "
+                "though those worker-local ranges may overlap."
+            ),
+            "",
+            (
+                "| Target tokens | Prepare PP work sum ms | Slowest q8 rank ms | "
+                "Cross-rank work sum ms |"
+            ),
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for row in summary["cycle_summary"]:
+        lines.append(
+            f"| {row['token_count']} | "
+            f"{row['target_prepare_work_sum_mean_us'] / 1000:.3f} | "
+            f"{row['target_model_slowest_rank_mean_us'] / 1000:.3f} | "
+            f"{row['cross_rank_work_sum_mean_us'] / 1000:.3f} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Proposal classes",
+            "",
+            (
+                "Prefill rows are DSpark proposals invoked while target prompt chunks "
+                "are still being processed. Decode rows are steady speculative rounds."
+            ),
+            "",
+            (
+                "| Kind | Target input tokens | Calls | Mean ms | P50 ms | "
+                "P90 ms | Total ms |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in summary["proposal_shapes"]:
+        lines.append(
+            f"| {row['step_kind']} | {row['token_count']} | {row['count']} | "
+            f"{row['mean_us'] / 1000:.3f} | {row['p50_us'] / 1000:.3f} | "
+            f"{row['p90_us'] / 1000:.3f} | {row['total_us'] / 1000:.3f} |"
+        )
+
+    report_stages = {
+        "target.sampling_total",
+        "target.logits",
+        "target.sample",
+        "target.rejection",
+        "target.rejection.inputs",
+        "target.rejection.verify_total",
+        "target.rejection.apply_sampling_params",
+        "target.rejection.verify",
+        "target.rejection.counts",
+        "draft.propose_total",
+        "draft.hidden_prepare",
+        "draft.hidden_combine.main_proj",
+        "draft.hidden_combine.main_norm",
+        "draft.prepare_inputs",
+        "draft.context_kv",
+        "draft.context_kv.input_gemm",
+        "draft.context_kv.norm",
+        "draft.context_kv.insert",
+        "draft.dispatch",
+        "draft.metadata",
+        "draft.generate_total",
+        "draft.graph_replay",
+        "draft.backbone",
+        "draft.model.embedding",
+        "draft.model.expand",
+        "draft.model.reconstruct",
+        "draft.model.hc_head",
+        "draft.markov_total",
+        "draft.hidden_gather",
+        "draft.base_logits",
+        "draft.logits.norm",
+        "draft.logits.lm_head",
+        "draft.markov_bias",
+        "draft.markov.embed",
+        "draft.markov.projection",
+        "draft.markov_sample",
+    }
+    lines.extend(
+        [
+            "",
+            "## Proposal and sampling decomposition by kind",
+            "",
+            (
+                "Rows at total, stage, and detail levels overlap. Compare means "
+                "within one nesting level; do not sum children with their parents."
+            ),
+            "",
+            "| Kind | Stage | Level | PP | Calls | Mean us | P50 us | P90 us |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    kind_rows = [
+        row
+        for row in summary["by_kind_rank_stage"]
+        if row["stage"] in report_stages
+        or row["stage"].startswith("target.attn_metadata")
+    ]
+    for row in sorted(
+        kind_rows,
+        key=lambda item: (item["step_kind"], -item["mean_us"], item["stage"]),
+    ):
+        lines.append(
+            f"| {row['step_kind']} | `{row['stage']}` | {row['level']} | "
+            f"{row['pp_rank']} | {row['count']} | {row['mean_us']:.3f} | "
+            f"{row['p50_us']:.3f} | {row['p90_us']:.3f} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Sequential Markov positions",
+            "",
+            "| Draft position | Stage | Calls | Mean us | P50 us | P90 us |",
+            "|---:|---|---:|---:|---:|---:|",
+        ]
+    )
+    for row in summary["by_draft_step_stage"]:
+        if row["stage"] not in {"draft.markov_bias", "draft.markov_sample"}:
+            continue
+        lines.append(
+            f"| {row['draft_step']} | `{row['stage']}` | {row['count']} | "
+            f"{row['mean_us']:.3f} | {row['p50_us']:.3f} | "
+            f"{row['p90_us']:.3f} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Draft backbone coverage",
+            "",
+            (
+                "Draft model components are siblings within `draft.backbone`; "
+                "layer components are siblings within `layer.total`."
+            ),
+            "",
+            (
+                "| PP | Backbone ms | Layer totals ms | Backbone residual ms | "
+                "Backbone coverage | Layer residual ms | Layer coverage |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in summary["draft_module_coverage"]:
+        lines.append(
+            f"| {row['pp_rank']} | {row['model_total_us'] / 1000:.3f} | "
+            f"{row['layer_total_us'] / 1000:.3f} | "
+            f"{row['model_unattributed_us'] / 1000:.3f} | "
+            f"{row['model_coverage_pct']:.1f}% | "
+            f"{row['layer_unattributed_us'] / 1000:.3f} | "
+            f"{row['layer_coverage_pct']:.1f}% |"
+        )
+
+    layer_components = {
+        (row["pp_rank"], row["layer"], row["stage"]): row["mean_us"]
+        for row in summary["by_layer_stage"]
+    }
+    layer_rows = [
+        row for row in summary["by_layer_stage"] if row["stage"] == "layer.total"
+    ]
+    lines.extend(
+        [
+            "",
+            "## Per-draft-layer cost",
+            "",
+            (
+                "| Layer | PP | Calls | Total us | Attention us | FFN us | "
+                "mHC-attn us | mHC-FFN us |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in sorted(layer_rows, key=lambda item: item["layer"]):
+        key = (row["pp_rank"], row["layer"])
+        lines.append(
+            f"| `{row['layer']}` | {row['pp_rank']} | {row['count']} | "
+            f"{row['mean_us']:.3f} | "
+            f"{layer_components.get((*key, 'layer.attention'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.ffn'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.mhc_attention_pre'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.mhc_ffn_pre'), 0.0):.3f} |"
+        )
+
+    lines.extend(_render_marlin_moe(summary["marlin_moe"]))
+    return lines
+
+
+def _render_decode_details(summary: dict[str, Any]) -> list[str]:
+    lines = [
+        "",
+        "## Target verification rounds",
+        "",
+        (
+            "A production DSpark-7 target round carries up to eight tokens. "
+            "Its PP stages form a dependency chain, so the aligned PP model "
+            "ranges are additive; the slowest-stage column remains a balance "
+            "diagnostic."
+        ),
+        "",
+        (
+            "| Tokens | Rounds | PP0 mean/p50/p90 ms | PP1 mean/p50/p90 ms | "
+            "PP2 mean/p50/p90 ms | PP serial mean/p50/p90 ms | "
+            "Slowest mean/p50/p90 ms | Slowest ranks |"
+        ),
+        "|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in summary["round_summary"]:
+        rank_text = []
+        for pp_rank in ("0", "1", "2"):
+            latency = row["rank_latency_us"].get(pp_rank)
+            rank_text.append(
+                "-"
+                if latency is None
+                else (
+                    f"{latency['mean_us'] / 1000:.3f}/"
+                    f"{latency['p50_us'] / 1000:.3f}/"
+                    f"{latency['p90_us'] / 1000:.3f}"
+                )
+            )
+        critical_ranks = ", ".join(
+            f"PP{rank}:{count}" for rank, count in row["critical_rank_counts"].items()
+        )
+        lines.append(
+            f"| {row['token_count']} | {row['round_count']} | {rank_text[0]} | "
+            f"{rank_text[1]} | {rank_text[2]} | "
+            f"{row['pipeline_mean_us'] / 1000:.3f}/"
+            f"{row['pipeline_p50_us'] / 1000:.3f}/"
+            f"{row['pipeline_p90_us'] / 1000:.3f} | "
+            f"{row['critical_mean_us'] / 1000:.3f}/"
+            f"{row['critical_p50_us'] / 1000:.3f}/"
+            f"{row['critical_p90_us'] / 1000:.3f} | {critical_ranks} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Serial PP3 model-work decomposition",
+            "",
+            (
+                "The same stage is summed across PP ranks because a single decode "
+                "target pass traverses PP0, PP1, then PP2. Parent and child levels "
+                "still overlap and must not be added to each other."
+            ),
+            "",
+            (
+                "| Stage | Level | PP ranks | Events | Per target round ms | "
+                "PP3 model share |"
+            ),
+            "|---|---:|---|---:|---:|---:|",
+        ]
+    )
+    for row in sorted(
+        summary["serial_stage"], key=lambda item: item["total_us"], reverse=True
+    ):
+        per_round = row["per_target_round_us"]
+        share = row["model_share_pct"]
+        lines.append(
+            f"| `{row['stage']}` | {row['level']} | "
+            f"{','.join(str(rank) for rank in row['pp_ranks'])} | "
+            f"{row['count']} | "
+            f"{'-' if per_round is None else f'{per_round / 1000:.3f}'} | "
+            f"{'-' if share is None else f'{share:.1f}%'} |"
+        )
+
+    metadata_rows = [
+        row
+        for row in summary["by_rank_stage"]
+        if row["stage"].startswith("target.attn_metadata")
+    ]
+    lines.extend(
+        [
+            "",
+            "## Attention metadata decomposition",
+            "",
+            (
+                "Builder rows are nested under `prepare_attn`; common/group rows "
+                "and builder rows must not be added to their parents."
+            ),
+            "",
+            "| PP rank | Stage | Count | Mean us | P50 us | P90 us | CPU mean us |",
+            "|---:|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in sorted(metadata_rows, key=lambda item: item["total_us"], reverse=True):
+        cpu_mean = row["cpu_mean_us"]
+        lines.append(
+            f"| {row['pp_rank']} | `{row['stage']}` | {row['count']} | "
+            f"{row['mean_us']:.3f} | {row['p50_us']:.3f} | "
+            f"{row['p90_us']:.3f} | "
+            f"{'-' if cpu_mean is None else f'{cpu_mean:.3f}'} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "### KV cache group parent breakdown",
+            "",
+            (
+                "The group id comes from the runtime KV-cache layout. A builder "
+                "type can appear more than once when different groups need separate "
+                "persistent graph buffers."
+            ),
+            "",
+            (
+                "| PP rank | KV group | Stage | Count | Mean us | P50 us | "
+                "P90 us | CPU mean us |"
+            ),
+            "|---:|---:|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in sorted(
+        summary["metadata_group_stage"],
+        key=lambda item: item["total_us"],
+        reverse=True,
+    ):
+        cpu_mean = row["cpu_mean_us"]
+        lines.append(
+            f"| {row['pp_rank']} | {row['kv_cache_group']} | "
+            f"`{row['stage']}` | {row['count']} | {row['mean_us']:.3f} | "
+            f"{row['p50_us']:.3f} | {row['p90_us']:.3f} | "
+            f"{'-' if cpu_mean is None else f'{cpu_mean:.3f}'} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Model and layer coverage",
+            "",
+            (
+                "Sibling layer modules are additive. Model-level and layer-level "
+                "rows are separate nesting levels."
+            ),
+            "",
+            (
+                "| PP rank | Model ms | Layer totals ms | Model residual ms | "
+                "Model coverage | Layer residual ms | Layer coverage |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in summary["module_coverage"]:
+        lines.append(
+            f"| {row['pp_rank']} | {row['model_total_us'] / 1000:.3f} | "
+            f"{row['layer_total_us'] / 1000:.3f} | "
+            f"{row['model_unattributed_us'] / 1000:.3f} | "
+            f"{row['model_coverage_pct']:.1f}% | "
+            f"{row['layer_unattributed_us'] / 1000:.3f} | "
+            f"{row['layer_coverage_pct']:.1f}% |"
+        )
+
+    family_rows = {
+        (row["compress_ratio"], row["stage"]): row
+        for row in summary["compression_family_stage"]
+    }
+    lines.extend(
+        [
+            "",
+            "## Compression-family layer modules",
+            "",
+            (
+                "Means are per layer per target round across PP ranks. They rank "
+                "work, but are not PP wall time."
+            ),
+            "",
+            (
+                "| C-ratio | Layers | Layer total us | Attention us | FFN us | "
+                "mHC-attn us | mHC-FFN us |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for compress_ratio in sorted(
+        {row["compress_ratio"] for row in summary["compression_family_stage"]}
+    ):
+        total = family_rows.get((compress_ratio, "layer.total"))
+        if total is None:
+            continue
+
+        def family_mean(stage: str, ratio: int = compress_ratio) -> float:
+            row = family_rows.get((ratio, stage))
+            return 0.0 if row is None else row["mean_us"]
+
+        lines.append(
+            f"| {compress_ratio} | {total['layer_count']} | "
+            f"{total['mean_us']:.3f} | "
+            f"{family_mean('layer.attention'):.3f} | "
+            f"{family_mean('layer.ffn'):.3f} | "
+            f"{family_mean('layer.mhc_attention_pre'):.3f} | "
+            f"{family_mean('layer.mhc_ffn_pre'):.3f} |"
+        )
+
+    attention_stages = (
+        "layer.attention",
+        "attention.input_gemm_overlap",
+        "attention.input_gemm.qr_kv",
+        "attention.input_gemm.mla_compressor_score",
+        "attention.input_gemm.indexer_weights",
+        "attention.input_gemm.indexer_compressor_score",
+        "attention.input_gemm.join",
+        "attention.qkv_rmsnorm",
+        "attention.q_index_compress_mla",
+        "attention.qkv_insert",
+        "attention.indexer_branch",
+        "attention.mla_compressor_branch",
+        "attention.qicm_join",
+        "indexer.query_prepare",
+        "indexer.compress_cache",
+        "indexer.query_cache_join",
+        "indexer.select",
+        "indexer.paged_logits",
+        "indexer.topk",
+        "attention.sparse_mla",
+        "sparse_mla.topk_metadata",
+        "sparse_mla.attention",
+        "compressor.save_partial_states",
+        "compressor.compress_norm_rope_store",
+        "attention.output_projection",
+        "attention.output_projection.inv_rope_wo_a",
+        "attention.output_projection.wo_b",
+    )
+    lines.extend(
+        [
+            "",
+            "## Attention and indexer by compression family",
+            "",
+            (
+                "Rows include different nesting levels. In particular, indexer "
+                "query/cache ranges overlap, and detail rows must not be summed "
+                "with their parents."
+            ),
+            "",
+            "| C-ratio | Stage | Count | Mean us | P50 us | P90 us |",
+            "|---:|---|---:|---:|---:|---:|",
+        ]
+    )
+    for compress_ratio in sorted(
+        {row["compress_ratio"] for row in summary["compression_family_stage"]}
+    ):
+        for stage in attention_stages:
+            row = family_rows.get((compress_ratio, stage))
+            if row is None:
+                continue
+            lines.append(
+                f"| {compress_ratio} | `{stage}` | {row['count']} | "
+                f"{row['mean_us']:.3f} | {row['p50_us']:.3f} | "
+                f"{row['p90_us']:.3f} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Per-layer decode cost",
+            "",
+            (
+                "| Layer | C-ratio | PP rank | Samples | Layer mean us | "
+                "Attention us | FFN us | mHC-attn us | mHC-FFN us |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    layer_rows = [
+        row for row in summary["by_layer_stage"] if row["stage"] == "layer.total"
+    ]
+    layer_components = {
+        (row["pp_rank"], row["layer"], row["stage"]): row["mean_us"]
+        for row in summary["by_layer_stage"]
+    }
+    for row in sorted(layer_rows, key=lambda item: item["mean_us"], reverse=True):
+        key = (row["pp_rank"], row["layer"])
+        lines.append(
+            f"| `{row['layer']}` | {row['compress_ratio']} | {row['pp_rank']} | "
+            f"{row['count']} | {row['mean_us']:.3f} | "
+            f"{layer_components.get((*key, 'layer.attention'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.ffn'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.mhc_attention_pre'), 0.0):.3f} | "
+            f"{layer_components.get((*key, 'layer.mhc_ffn_pre'), 0.0):.3f} |"
+        )
+    lines.extend(_render_marlin_moe(summary["marlin_moe"]))
+    return lines
 
 
 def _render_prefill_details(summary: dict[str, Any]) -> list[str]:
@@ -605,7 +1579,8 @@ def _render_marlin_moe(summary: dict[str, Any]) -> list[str]:
         (
             "Additive stages are siblings on the current CUDA stream. The "
             "routed-experts and modular-kernel ranges are nested diagnostics and are "
-            "excluded from the sum."
+            "excluded from the sum. The parent remainder contains nested work and "
+            "cross-stream overlap; it is not an unknown-kernel total."
         ),
         "",
         "| PP rank | Stage | Total ms | Parent share |",
@@ -623,8 +1598,14 @@ def _render_marlin_moe(summary: dict[str, Any]) -> list[str]:
                 f"| {rank_row['pp_rank']} | `{stage}` | "
                 f"{total_us / 1000:.3f} | {share:.1f}% |"
             )
+        for stage, total_us in rank_row["nested_ranges_us"].items():
+            share = 100.0 * total_us / parent_us if parent_us else 0.0
+            lines.append(
+                f"| {rank_row['pp_rank']} | `{stage}` (overlap diagnostic) | "
+                f"{total_us / 1000:.3f} | {share:.1f}% |"
+            )
         lines.append(
-            f"| {rank_row['pp_rank']} | `unattributed` | "
+            f"| {rank_row['pp_rank']} | `parent remainder (nested/overlap)` | "
             f"{rank_row['residual_us'] / 1000:.3f} | "
             f"{max(0.0, 100.0 - rank_row['coverage_pct']):.1f}% |"
         )

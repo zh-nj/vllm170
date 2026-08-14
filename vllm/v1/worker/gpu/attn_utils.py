@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -545,46 +546,57 @@ def build_attn_metadata(
         group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
             "is_prefilling", is_prefilling
         )
-        common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-            positions=positions,
-            is_prefilling=group_is_prefilling,
-            mm_req_doc_ranges=mm_req_doc_ranges,
-            rswa_prefix_lens=rswa_prefix_lens,
-            **common_attn_metadata_extra_kwargs,
-        )
+        with optional_phase_profile_stage(
+            "target.attn_metadata.common",
+            query_start_loc_gpu,
+            extra={"kv_cache_group": i},
+        ):
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                max_seq_len=max_seq_len,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=max_query_len,
+                block_table_tensor=block_table,
+                slot_mapping=slot_mapping,
+                causal=group_causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+                positions=positions,
+                is_prefilling=group_is_prefilling,
+                mm_req_doc_ranges=mm_req_doc_ranges,
+                rswa_prefix_lens=rswa_prefix_lens,
+                **common_attn_metadata_extra_kwargs,
+            )
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata
-                )
-            else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
+            builder_name = type(attn_metadata_builder).__name__
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.builder.{builder_name}",
+                query_start_loc_gpu,
+                extra={"kv_cache_group": i},
+            ):
+                if for_cudagraph_capture:
+                    metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                        common_attn_metadata
                     )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+                else:
+                    attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_attn_kwargs(
+                            attn_metadata_builder,
+                            num_reqs,
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    metadata = attn_metadata_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        **attn_metadata_extra_kwargs,
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

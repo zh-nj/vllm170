@@ -12,6 +12,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_direct_swa_ragged_controls_dense_decode_buffer(monkeypatch) -> None:
+    from vllm.models.deepseek_v4.amd.rocm import (
+        DeepseekV4ROCMAiterMLASparseMetadataBuilder,
+        DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+    )
+
+    builder = object.__new__(DeepseekV4ROCMAiterSparseSWAMetadataBuilder)
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "0")
+    assert builder._requires_dense_decode_swa_indices()
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1")
+    assert not builder._requires_dense_decode_swa_indices()
+
+    c128_builder = object.__new__(DeepseekV4ROCMAiterMLASparseMetadataBuilder)
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "0")
+    assert c128_builder._requires_dense_c128a_decode_indices()
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1")
+    assert not c128_builder._requires_dense_c128a_decode_indices()
+
+
 @torch.inference_mode()
 def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
@@ -59,3 +80,174 @@ def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
     torch.testing.assert_close(direct, copied, atol=0, rtol=0)
     torch.testing.assert_close(tuned, copied, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(tuned).all()
+
+
+@pytest.mark.parametrize("non_causal", [False, True])
+@torch.inference_mode()
+def test_direct_swa_ragged_matches_dense_pack(non_causal: bool) -> None:
+    from vllm.models.deepseek_v4.amd.rocm import (
+        build_swa_ragged_indices_direct,
+    )
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        _compute_dspark_noncausal_swa_indices_kernel,
+        _compute_swa_indices_and_lens_kernel,
+    )
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        build_ragged_indices_from_dense,
+    )
+
+    num_tokens = 5
+    window_size = 8
+    index_width = 16 if non_causal else window_size
+    block_size = 64
+    query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([70, 4], dtype=torch.int32, device="cuda")
+    token_to_req = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32, device="cuda")
+    is_valid = torch.tensor([1, 1, 0, 1, 1], dtype=torch.bool, device="cuda")
+    block_table = torch.tensor([[5, 7], [11, -1]], dtype=torch.int32, device="cuda")
+
+    dense = torch.full(
+        (num_tokens, 1, index_width), -99, dtype=torch.int32, device="cuda"
+    )
+    reference_lens = torch.full((num_tokens,), -99, dtype=torch.int32, device="cuda")
+    if non_causal:
+        _compute_dspark_noncausal_swa_indices_kernel[(num_tokens,)](
+            dense,
+            dense.stride(0),
+            reference_lens,
+            window_size,
+            index_width,
+            query_start_loc,
+            seq_lens,
+            token_to_req,
+            is_valid,
+            block_table,
+            block_table.stride(0),
+            block_size,
+            token_offset=0,
+            TRITON_BLOCK_SIZE=16,
+        )
+    else:
+        _compute_swa_indices_and_lens_kernel[(num_tokens,)](
+            dense,
+            dense.stride(0),
+            reference_lens,
+            window_size,
+            query_start_loc,
+            seq_lens,
+            token_to_req,
+            is_valid,
+            block_table,
+            block_table.stride(0),
+            block_size,
+            token_offset=0,
+            TRITON_BLOCK_SIZE=16,
+        )
+    reference_indices, reference_indptr = build_ragged_indices_from_dense(
+        dense.reshape(num_tokens, -1), reference_lens
+    )
+
+    direct_lens = torch.full_like(reference_lens, -77)
+    direct_indices_buffer = torch.full(
+        (num_tokens * index_width,), -77, dtype=torch.int32, device="cuda"
+    )
+    direct_indptr_buffer = torch.full(
+        (num_tokens + 1,), -77, dtype=torch.int32, device="cuda"
+    )
+    direct_indices, direct_indptr = build_swa_ragged_indices_direct(
+        num_decode_tokens=num_tokens,
+        window_size=window_size,
+        index_width=index_width,
+        non_causal=non_causal,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        token_to_req_indices=token_to_req,
+        is_valid_token=is_valid,
+        block_table=block_table,
+        block_size=block_size,
+        swa_lens=direct_lens,
+        ragged_indices_buffer=direct_indices_buffer,
+        ragged_indptr_buffer=direct_indptr_buffer,
+    )
+
+    torch.testing.assert_close(direct_lens, reference_lens)
+    torch.testing.assert_close(direct_indptr, reference_indptr)
+    nnz = int(reference_indptr[-1].item())
+    torch.testing.assert_close(direct_indices[:nnz], reference_indices[:nnz])
+    assert direct_indices.data_ptr() == direct_indices_buffer.data_ptr()
+    assert direct_indptr.data_ptr() == direct_indptr_buffer.data_ptr()
+
+
+@torch.inference_mode()
+def test_direct_c128_ragged_matches_dense_pack() -> None:
+    from vllm.models.deepseek_v4.amd.rocm import (
+        build_c128_decode_ragged_direct,
+    )
+    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        build_ragged_indices_from_dense,
+    )
+
+    num_tokens = 4
+    compress_ratio = 128
+    active_width = 8
+    max_width = 8
+    block_size = 2
+    positions = torch.tensor([127, 255, 383, 639], device="cuda")
+    token_to_req = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor(
+        [[10, 11, 12], [20, 21, 22]], dtype=torch.int32, device="cuda"
+    )
+    slot_mapping = torch.tensor([0, -1, 0, 0], dtype=torch.int64, device="cuda")
+
+    dense_buffer = torch.full(
+        (num_tokens, max_width), -99, dtype=torch.int32, device="cuda"
+    )
+    reference_lens_buffer = torch.full(
+        (num_tokens,), -99, dtype=torch.int32, device="cuda"
+    )
+    prefill_buffer = torch.empty_like(dense_buffer)
+    dense, reference_lens, _ = build_c128a_topk_metadata(
+        positions,
+        compress_ratio,
+        num_tokens,
+        token_to_req,
+        block_table,
+        block_size,
+        slot_mapping,
+        dense_buffer,
+        reference_lens_buffer,
+        prefill_buffer,
+        max_compressed_tokens=active_width,
+    )
+    reference_indices, reference_indptr = build_ragged_indices_from_dense(
+        dense, reference_lens
+    )
+
+    direct_lens_buffer = torch.full_like(reference_lens_buffer, -77)
+    direct_indices_buffer = torch.full(
+        (num_tokens * max_width,), -77, dtype=torch.int32, device="cuda"
+    )
+    direct_indptr_buffer = torch.full(
+        (num_tokens + 1,), -77, dtype=torch.int32, device="cuda"
+    )
+    direct_indices, direct_indptr, direct_lens = build_c128_decode_ragged_direct(
+        positions=positions,
+        token_to_req_indices=token_to_req,
+        block_table=block_table,
+        block_size=block_size,
+        slot_mapping=slot_mapping,
+        compress_ratio=compress_ratio,
+        active_topk_width=active_width,
+        max_topk_width=max_width,
+        decode_lens_buffer=direct_lens_buffer,
+        ragged_indices_buffer=direct_indices_buffer,
+        ragged_indptr_buffer=direct_indptr_buffer,
+    )
+
+    torch.testing.assert_close(direct_lens, reference_lens)
+    torch.testing.assert_close(direct_indptr, reference_indptr)
+    nnz = int(reference_indptr[-1].item())
+    torch.testing.assert_close(direct_indices[:nnz], reference_indices[:nnz])
+    assert direct_indices.data_ptr() == direct_indices_buffer.data_ptr()
+    assert direct_indptr.data_ptr() == direct_indptr_buffer.data_ptr()

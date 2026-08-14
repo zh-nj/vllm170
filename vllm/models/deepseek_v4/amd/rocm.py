@@ -22,8 +22,10 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
     DeepseekV4FlashMLAMetadataBuilder,
+    build_c128a_topk_metadata,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
@@ -33,6 +35,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -295,6 +298,119 @@ def compute_global_topk_ragged_indices_and_indptr(
     return global_topk_ragged, topk_indptr, topk_lens
 
 
+@triton.jit
+def _build_c128_decode_ragged_indptr_kernel(
+    decode_lens_ptr,
+    ragged_indptr_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    compress_ratio,
+    max_compressed_tokens,
+    NUM_TOKENS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    token_idx = tl.arange(0, BLOCK_ROWS)
+    in_bounds = token_idx < NUM_TOKENS
+    position = tl.load(positions_ptr + token_idx, mask=in_bounds, other=0)
+    is_valid = tl.load(slot_mapping_ptr + token_idx, mask=in_bounds, other=-1) >= 0
+    num_compressed = tl.minimum(
+        (position + 1) // compress_ratio,
+        max_compressed_tokens,
+    )
+    decode_len = tl.where(in_bounds & is_valid, num_compressed, 0).to(tl.int32)
+    tl.store(decode_lens_ptr + token_idx, decode_len, mask=in_bounds)
+    inclusive = tl.cumsum(decode_len, axis=0)
+    tl.store(ragged_indptr_ptr, 0)
+    tl.store(ragged_indptr_ptr + token_idx + 1, inclusive, mask=in_bounds)
+
+
+@triton.jit
+def _build_c128_decode_ragged_indices_kernel(
+    ragged_indices_ptr,
+    ragged_indptr_ptr,
+    decode_lens_ptr,
+    token_to_req_indices_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    ACTIVE_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    decode_len = tl.load(decode_lens_ptr + token_idx)
+    if block_idx * BLOCK_SIZE >= decode_len:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    out_start = tl.load(ragged_indptr_ptr + token_idx)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = (offsets < decode_len) & (offsets < ACTIVE_WIDTH)
+    block_indices = offsets // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask,
+        other=-1,
+    )
+    slot_ids = block_numbers * block_size + offsets % block_size
+    tl.store(ragged_indices_ptr + out_start + offsets, slot_ids, mask=mask)
+
+
+def build_c128_decode_ragged_direct(
+    *,
+    positions: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    slot_mapping: torch.Tensor,
+    compress_ratio: int,
+    active_topk_width: int,
+    max_topk_width: int,
+    decode_lens_buffer: torch.Tensor,
+    ragged_indices_buffer: torch.Tensor,
+    ragged_indptr_buffer: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build C128 decode metadata directly in graph-stable ragged buffers."""
+    num_tokens = positions.shape[0]
+    assert num_tokens > 0
+    assert active_topk_width <= max_topk_width
+    assert decode_lens_buffer.numel() >= num_tokens
+    assert ragged_indptr_buffer.numel() >= num_tokens + 1
+    assert ragged_indices_buffer.numel() >= num_tokens * max_topk_width
+
+    decode_lens = decode_lens_buffer[:num_tokens]
+    ragged_indptr = ragged_indptr_buffer[: num_tokens + 1]
+    block_rows = triton.next_power_of_2(num_tokens)
+    _build_c128_decode_ragged_indptr_kernel[(1,)](
+        decode_lens,
+        ragged_indptr,
+        positions,
+        slot_mapping,
+        compress_ratio,
+        active_topk_width,
+        NUM_TOKENS=num_tokens,
+        BLOCK_ROWS=block_rows,
+    )
+
+    max_entries = max(num_tokens * max_topk_width, 1)
+    ragged_indices = ragged_indices_buffer[:max_entries]
+    block = 256
+    _build_c128_decode_ragged_indices_kernel[
+        (num_tokens, triton.cdiv(active_topk_width, block))
+    ](
+        ragged_indices,
+        ragged_indptr,
+        decode_lens,
+        token_to_req_indices,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        ACTIVE_WIDTH=active_topk_width,
+        BLOCK_SIZE=block,
+    )
+    return ragged_indices, ragged_indptr, decode_lens
+
+
 def _copy_ragged_to_graph_buffers(
     ragged_indices: torch.Tensor,
     ragged_indptr: torch.Tensor,
@@ -319,6 +435,168 @@ def _copy_ragged_to_graph_buffers(
     return ragged_out, indptr_out
 
 
+@triton.jit
+def _build_swa_ragged_indptr_kernel(
+    swa_lens_ptr,
+    ragged_indptr_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    window_size,
+    NUM_TOKENS: tl.constexpr,
+    NON_CAUSAL: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    token_idx = tl.arange(0, BLOCK_ROWS)
+    in_bounds = token_idx < NUM_TOKENS
+    is_valid = tl.load(is_valid_token_ptr + token_idx, mask=in_bounds, other=0)
+    req_idx = tl.load(
+        token_to_req_indices_ptr + token_idx,
+        mask=in_bounds & is_valid,
+        other=0,
+    )
+    query_start = tl.load(
+        query_start_loc_ptr + req_idx,
+        mask=in_bounds & is_valid,
+        other=0,
+    )
+    query_end = tl.load(
+        query_start_loc_ptr + req_idx + 1,
+        mask=in_bounds & is_valid,
+        other=0,
+    )
+    seq_len = tl.load(
+        seq_lens_ptr + req_idx,
+        mask=in_bounds & is_valid,
+        other=0,
+    )
+    query_len = query_end - query_start
+    prefix_len = seq_len - query_len
+    if NON_CAUSAL:
+        start_pos = tl.maximum(prefix_len - window_size, 0)
+        end_pos = seq_len
+    else:
+        pos = prefix_len + token_idx - query_start
+        start_pos = tl.maximum(pos - window_size + 1, 0)
+        end_pos = pos + 1
+    swa_len = tl.where(in_bounds & is_valid, end_pos - start_pos, 0).to(tl.int32)
+    tl.store(swa_lens_ptr + token_idx, swa_len, mask=in_bounds)
+    inclusive = tl.cumsum(swa_len, axis=0)
+    tl.store(ragged_indptr_ptr, 0)
+    tl.store(ragged_indptr_ptr + token_idx + 1, inclusive, mask=in_bounds)
+
+
+@triton.jit
+def _build_swa_ragged_indices_kernel(
+    ragged_indices_ptr,
+    ragged_indptr_ptr,
+    swa_lens_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    window_size,
+    block_size,
+    INDEX_WIDTH: tl.constexpr,
+    NON_CAUSAL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    is_valid = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+    if NON_CAUSAL:
+        start_pos = tl.maximum(prefix_len - window_size, 0)
+    else:
+        pos = prefix_len + token_idx - query_start
+        start_pos = tl.maximum(pos - window_size + 1, 0)
+
+    swa_len = tl.load(swa_lens_ptr + token_idx)
+    out_start = tl.load(ragged_indptr_ptr + token_idx)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = (offsets < swa_len) & (offsets < INDEX_WIDTH)
+    pos_offset = start_pos + offsets
+    block_indices = pos_offset // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask,
+        other=-1,
+    )
+    slot_ids = block_numbers * block_size + pos_offset % block_size
+    tl.store(ragged_indices_ptr + out_start + offsets, slot_ids, mask=mask)
+
+
+def build_swa_ragged_indices_direct(
+    *,
+    num_decode_tokens: int,
+    window_size: int,
+    index_width: int,
+    non_causal: bool,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    swa_lens: torch.Tensor,
+    ragged_indices_buffer: torch.Tensor,
+    ragged_indptr_buffer: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build decode SWA ragged metadata directly in graph-stable buffers."""
+    assert 0 < num_decode_tokens <= swa_lens.numel()
+    assert ragged_indptr_buffer.numel() >= num_decode_tokens + 1
+    assert ragged_indices_buffer.numel() >= num_decode_tokens * index_width
+
+    ragged_indptr = ragged_indptr_buffer[: num_decode_tokens + 1]
+    block_rows = triton.next_power_of_2(num_decode_tokens)
+    _build_swa_ragged_indptr_kernel[(1,)](
+        swa_lens,
+        ragged_indptr,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        window_size,
+        NUM_TOKENS=num_decode_tokens,
+        NON_CAUSAL=non_causal,
+        BLOCK_ROWS=block_rows,
+    )
+
+    max_entries = max(num_decode_tokens * index_width, 1)
+    ragged_indices = ragged_indices_buffer[:max_entries]
+    block = 256
+    _build_swa_ragged_indices_kernel[
+        (num_decode_tokens, triton.cdiv(index_width, block))
+    ](
+        ragged_indices,
+        ragged_indptr,
+        swa_lens,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_table.stride(0),
+        window_size,
+        block_size,
+        INDEX_WIDTH=index_width,
+        NON_CAUSAL=non_causal,
+        BLOCK_SIZE=block,
+    )
+    return ragged_indices, ragged_indptr
+
+
 @dataclass
 class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
     """ROCm-specific DeepSeek V4 metadata carrying ragged decode topk."""
@@ -334,10 +612,20 @@ class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuilder):
+    def _requires_dense_c128a_decode_indices(self) -> bool:
+        return not (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128
+            and current_platform.is_device_capability_family(80)
+        )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._use_direct_ragged_c128 = not self._requires_dense_c128a_decode_indices()
         self.c128a_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
         self.c128a_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
+        self._direct_c128a_decode_ragged: tuple[torch.Tensor, torch.Tensor] | None = (
+            None
+        )
         if self.compress_ratio == 128:
             max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
             self.c128a_decode_topk_ragged_indices_buffer = torch.empty(
@@ -351,12 +639,82 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
                 device=self.device,
             )
 
+    def _build_c128a_metadata(
+        self,
+        cm: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        if not self._use_direct_ragged_c128:
+            return super()._build_c128a_metadata(cm, req_id_per_token)
+
+        (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(
+                cm,
+                decode_threshold=self.reorder_batch_threshold or 1,
+            )
+        )
+        num_total = num_decode_tokens + num_prefill_tokens
+        if num_total == 0:
+            return {}
+
+        assert cm.positions is not None
+        active_topk_width = self._get_c128a_active_topk_width(cm.max_seq_len)
+        block_size = self.kv_cache_spec.block_size // self.compress_ratio
+        result: dict[str, torch.Tensor | None] = {}
+
+        if num_decode_tokens > 0:
+            assert self.c128a_decode_topk_ragged_indices_buffer is not None
+            assert self.c128a_decode_topk_ragged_indptr_buffer is not None
+            with optional_phase_profile_stage(
+                "target.attn_metadata.mla.c128.direct_ragged",
+                cm.slot_mapping,
+            ):
+                ragged_indices, ragged_indptr, decode_lens = (
+                    build_c128_decode_ragged_direct(
+                        positions=cm.positions[:num_decode_tokens],
+                        token_to_req_indices=req_id_per_token[:num_decode_tokens],
+                        block_table=cm.block_table_tensor[:num_decodes],
+                        block_size=block_size,
+                        slot_mapping=cm.slot_mapping[:num_decode_tokens],
+                        compress_ratio=self.compress_ratio,
+                        active_topk_width=active_topk_width,
+                        max_topk_width=self.c128a_max_compressed,
+                        decode_lens_buffer=self.c128a_decode_lens_buffer,
+                        ragged_indices_buffer=(
+                            self.c128a_decode_topk_ragged_indices_buffer
+                        ),
+                        ragged_indptr_buffer=(
+                            self.c128a_decode_topk_ragged_indptr_buffer
+                        ),
+                    )
+                )
+            self._direct_c128a_decode_ragged = ragged_indices, ragged_indptr
+            result["c128a_decode_topk_lens"] = decode_lens
+
+        if num_prefill_tokens > 0:
+            _, _, prefill_local = build_c128a_topk_metadata(
+                cm.positions[num_decode_tokens:num_total],
+                self.compress_ratio,
+                0,
+                req_id_per_token[num_decode_tokens:num_total],
+                cm.block_table_tensor,
+                block_size,
+                cm.slot_mapping[num_decode_tokens:num_total],
+                self.c128a_global_decode_buffer,
+                self.c128a_decode_lens_buffer,
+                self.c128a_prefill_buffer,
+                max_compressed_tokens=active_topk_width,
+            )
+            result["c128a_prefill_topk_indices"] = prefill_local
+        return result
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV4ROCMAiterMLASparseMetadata:
+        self._direct_c128a_decode_ragged = None
         base = super().build(
             common_prefix_len=common_prefix_len,
             common_attn_metadata=common_attn_metadata,
@@ -367,21 +725,29 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
         ragged_indptr = None
         dense_decode = base.c128a_global_decode_topk_indices
         decode_lens = base.c128a_decode_topk_lens
-        if dense_decode is not None and decode_lens is not None:
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                dense_decode.reshape(dense_decode.shape[0], -1),
-                decode_lens,
-            )
+        if self._direct_c128a_decode_ragged is not None:
+            ragged_indices, ragged_indptr = self._direct_c128a_decode_ragged
+        elif dense_decode is not None and decode_lens is not None:
+            with optional_phase_profile_stage(
+                "target.attn_metadata.mla.c128.ragged_pack", dense_decode
+            ):
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    dense_decode.reshape(dense_decode.shape[0], -1),
+                    decode_lens,
+                )
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.c128a_decode_topk_ragged_indices_buffer,
-                self.c128a_decode_topk_ragged_indptr_buffer,
-                dense_decode.shape[0],
-                self.c128a_max_compressed,
-            )
+            with optional_phase_profile_stage(
+                "target.attn_metadata.mla.c128.ragged_copy", dense_decode
+            ):
+                ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
+                    ragged_indices,
+                    ragged_indptr,
+                    self.c128a_decode_topk_ragged_indices_buffer,
+                    self.c128a_decode_topk_ragged_indptr_buffer,
+                    dense_decode.shape[0],
+                    self.c128a_max_compressed,
+                )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
             **vars(base),
@@ -391,8 +757,15 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
 
 
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    def _requires_dense_decode_swa_indices(self) -> bool:
+        return not (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA
+            and current_platform.is_device_capability_family(80)
+        )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._use_direct_ragged_swa = not self._requires_dense_decode_swa_indices()
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         # The non-causal (DSpark draft) path widens each token's SWA index list
         # to ``noncausal_index_width`` (>= window_size), so size the persistent
@@ -408,6 +781,51 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
+        self._direct_decode_swa_ragged: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _build_decode_swa_indices(
+        self,
+        *,
+        num_decode_tokens: int,
+        non_causal: bool,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        is_valid_token: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._use_direct_ragged_swa:
+            return super()._build_decode_swa_indices(
+                num_decode_tokens=num_decode_tokens,
+                non_causal=non_causal,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                token_to_req_indices=token_to_req_indices,
+                is_valid_token=is_valid_token,
+                block_table=block_table,
+            )
+
+        mode = "noncausal" if non_causal else "causal"
+        index_width = self.noncausal_index_width if non_causal else self.window_size
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.direct_ragged", query_start_loc
+        ):
+            self._direct_decode_swa_ragged = build_swa_ragged_indices_direct(
+                num_decode_tokens=num_decode_tokens,
+                window_size=self.window_size,
+                index_width=index_width,
+                non_causal=non_causal,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                token_to_req_indices=token_to_req_indices,
+                is_valid_token=is_valid_token,
+                block_table=block_table,
+                block_size=self.block_size,
+                swa_lens=self.decode_swa_lens,
+                ragged_indices_buffer=self.decode_swa_ragged_indices_buffer,
+                ragged_indptr_buffer=self.decode_swa_ragged_indptr_buffer,
+            )
+        return self.decode_swa_indices[:, :, :0]
 
     def build(
         self,
@@ -415,6 +833,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV4ROCMAiterSparseSWAMetadata:
+        self._direct_decode_swa_ragged = None
         base = super().build(
             common_prefix_len=common_prefix_len,
             common_attn_metadata=common_attn_metadata,
@@ -423,25 +842,36 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
 
         ragged_indices = None
         ragged_indptr = None
-        if (
+        if self._direct_decode_swa_ragged is not None:
+            ragged_indices, ragged_indptr = self._direct_decode_swa_ragged
+        elif (
             base.num_decode_tokens > 0
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
-                base.decode_swa_lens,
-            )
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.decode_swa_ragged_indices_buffer,
-                self.decode_swa_ragged_indptr_buffer,
-                base.num_decode_tokens,
-                # Actual dense width for this build: window_size (causal) or
-                # noncausal_index_width (DSpark non-causal draft).
-                base.decode_swa_indices.shape[-1],
-            )
+            mode = "noncausal" if not common_attn_metadata.causal else "causal"
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.swa.{mode}.ragged_pack",
+                base.decode_swa_indices,
+            ):
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
+                    base.decode_swa_lens,
+                )
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.swa.{mode}.ragged_copy",
+                base.decode_swa_indices,
+            ):
+                ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
+                    ragged_indices,
+                    ragged_indptr,
+                    self.decode_swa_ragged_indices_buffer,
+                    self.decode_swa_ragged_indptr_buffer,
+                    base.num_decode_tokens,
+                    # Actual dense width for this build: window_size (causal) or
+                    # noncausal_index_width (DSpark non-causal draft).
+                    base.decode_swa_indices.shape[-1],
+                )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
             **vars(base),

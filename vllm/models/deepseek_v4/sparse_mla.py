@@ -10,6 +10,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
@@ -180,8 +181,13 @@ class DeepseekV4FlashMLAMetadataBuilder(
             # into adjacent rows (present in both decode and prefill branches of
             # _build_c128a_topk_metadata_kernel).
             self.c128a_max_compressed = c128a_max_compressed
+            decode_width = (
+                c128a_max_compressed
+                if self._requires_dense_c128a_decode_indices()
+                else 0
+            )
             self.c128a_global_decode_buffer = torch.empty(
-                (max_num_batched_tokens, c128a_max_compressed),
+                (max_num_batched_tokens, decode_width),
                 dtype=torch.int32,
                 device=device,
             )
@@ -194,6 +200,18 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 device=device,
             )
 
+    def _requires_dense_c128a_decode_indices(self) -> bool:
+        return True
+
+    def _get_c128a_active_topk_width(self, max_seq_len: int) -> int:
+        return min(
+            max(
+                triton.next_power_of_2(max(max_seq_len // self.compress_ratio, 1)),
+                _C128A_TOPK_ALIGNMENT,
+            ),
+            self.c128a_max_compressed,
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -201,23 +219,33 @@ class DeepseekV4FlashMLAMetadataBuilder(
         fast_build: bool = False,
     ) -> DeepseekV4FlashMLAMetadata:
         cm = common_attn_metadata
-        req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
+        ratio = f"c{self.compress_ratio}"
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.mla.{ratio}.token_map", cm.slot_mapping
+        ):
+            req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
-            slot_mapping = get_compressed_slot_mapping(
-                cm.num_actual_tokens,
-                cm.query_start_loc,
-                cm.seq_lens,
-                cm.block_table_tensor.clamp_(min=0),
-                int(self.kv_cache_spec.storage_block_size),
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-            )
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.mla.{ratio}.slot_mapping", cm.slot_mapping
+            ):
+                slot_mapping = get_compressed_slot_mapping(
+                    cm.num_actual_tokens,
+                    cm.query_start_loc,
+                    cm.seq_lens,
+                    cm.block_table_tensor.clamp_(min=0),
+                    int(self.kv_cache_spec.storage_block_size),
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.compress_ratio == 128:
-            c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
+            with optional_phase_profile_stage(
+                "target.attn_metadata.mla.c128.c128", cm.slot_mapping
+            ):
+                c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
 
         return DeepseekV4FlashMLAMetadata(
             num_reqs=cm.num_reqs,
@@ -261,13 +289,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
-        active_topk_width = min(
-            max(
-                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
-                _C128A_TOPK_ALIGNMENT,
-            ),
-            self.c128a_max_compressed,
-        )
+        active_topk_width = self._get_c128a_active_topk_width(cm.max_seq_len)
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],

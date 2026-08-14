@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = False
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
+    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = False
+    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
@@ -73,6 +75,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION: bool = True
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS: str = "prefill,decode,dspark"
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS: str = ""
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES: str = ""
     VLLM_MARLIN_MOE_BLOCK_SIZE: int = 0
     VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M: int = 0
     VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE: bool = True
@@ -1085,6 +1089,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
     ),
+    "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "0"))
+    ),
     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
         os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
     ),
@@ -1120,6 +1130,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS", ""
+    ),
+    "VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES", ""
     ),
     # Force Marlin MoE token alignment block size for hardware-specific A/B.
     # Zero keeps the shape heuristic.

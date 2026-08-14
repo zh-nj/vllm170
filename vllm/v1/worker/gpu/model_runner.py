@@ -1166,47 +1166,63 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         is_dspark = getattr(self.speculator, "_speculator_name", None) == "DSpark"
+        dspark_kind = classify_target_flow(input_batch.is_prefilling_np)
+        profile_extra = {
+            "dspark_kind": dspark_kind,
+            "token_count": input_batch.num_tokens,
+            "num_reqs": input_batch.num_reqs,
+            "num_draft_tokens": input_batch.num_draft_tokens,
+        }
         with phase_profile_stage(
-            "target.logits",
+            "target.sampling_total",
             sample_hidden_states,
             flow="dspark" if is_dspark else None,
-            level="stage",
+            level="total",
+            extra=profile_extra,
         ):
-            logits = self.model.compute_logits(sample_hidden_states)
-        if grammar_output is not None:
-            # Apply grammar bitmask to the logits in-place.
-            assert self.structured_outputs_worker is not None
-            self.structured_outputs_worker.apply_grammar_bitmask(
-                logits,
-                input_batch,
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask,
-            )
-
-        sample_stage = (
-            "target.sample"
-            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None
-            else "target.rejection"
-        )
-        with phase_profile_stage(
-            sample_stage,
-            logits,
-            flow="dspark" if is_dspark else None,
-            level="stage",
-        ):
-            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
-                assert self.sampler is not None
-                sampler_output = self.sampler(logits, input_batch)
-            else:
-                # Rejection sampling for spec decoding.
-                assert self.rejection_sampler is not None
-                assert self.speculator is not None
-                sampler_output = self.rejection_sampler(
+            with phase_profile_stage(
+                "target.logits",
+                sample_hidden_states,
+                flow="dspark" if is_dspark else None,
+                level="stage",
+                extra=profile_extra,
+            ):
+                logits = self.model.compute_logits(sample_hidden_states)
+            if grammar_output is not None:
+                # Apply grammar bitmask to the logits in-place.
+                assert self.structured_outputs_worker is not None
+                self.structured_outputs_worker.apply_grammar_bitmask(
                     logits,
                     input_batch,
-                    # Draft logits are needed for probabilistic rejection sampling.
-                    self.speculator.draft_logits,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
                 )
+
+            sample_stage = (
+                "target.sample"
+                if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None
+                else "target.rejection"
+            )
+            with phase_profile_stage(
+                sample_stage,
+                logits,
+                flow="dspark" if is_dspark else None,
+                level="stage",
+                extra=profile_extra,
+            ):
+                if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+                    assert self.sampler is not None
+                    sampler_output = self.sampler(logits, input_batch)
+                else:
+                    # Rejection sampling for spec decoding.
+                    assert self.rejection_sampler is not None
+                    assert self.speculator is not None
+                    sampler_output = self.rejection_sampler(
+                        logits,
+                        input_batch,
+                        # Draft logits are needed for probabilistic rejection sampling.
+                        self.speculator.draft_logits,
+                    )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
@@ -1353,24 +1369,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_mappings_by_layer = None
             if not (dummy_run and skip_attn_for_dummy_run):
                 assert slot_mappings is not None
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
+                with phase_profile_stage(
+                    "target.attn_metadata.layer_slots",
+                    input_batch.input_ids,
+                    level="detail",
+                ):
+                    slot_mappings_by_layer = build_slot_mappings_by_layer(
+                        slot_mappings, self.kv_cache_config
+                    )
                 assert block_tables is not None
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    batch_desc.cg_mode,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    # FULL replay reads capture-time metadata buffers. Re-stage them
-                    # from the zeroed dummy block tables instead of retaining state
-                    # indices from the previous real batch.
-                    for_capture=(
-                        dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
-                    ),
-                )
+                with phase_profile_stage(
+                    "target.attn_metadata.prepare_attn",
+                    input_batch.input_ids,
+                    level="detail",
+                ):
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        batch_desc.cg_mode,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        # FULL replay reads capture-time metadata buffers. Re-stage
+                        # them from the zeroed dummy block tables instead of retaining
+                        # state indices from the previous real batch.
+                        for_capture=(
+                            dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
+                        ),
+                    )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

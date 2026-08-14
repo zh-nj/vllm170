@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -138,30 +139,38 @@ class RejectionSampler:
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        processed_logits = self.sampler.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            pos,
-            draft_sampled,
-            expanded_local_pos,
-        )
-        sampled, num_sampled = rejection_sample(
+        with optional_phase_profile_stage(
+            "target.rejection.apply_sampling_params", logits
+        ):
+            processed_logits = self.sampler.apply_sampling_params(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                pos,
+                draft_sampled,
+                expanded_local_pos,
+            )
+        with optional_phase_profile_stage(
+            "target.rejection.verify",
             processed_logits,
-            draft_logits,
-            draft_sampled,
-            cu_num_logits,
-            pos,
-            idx_mapping,
-            expanded_idx_mapping,
-            expanded_local_pos,
-            self.sampler.sampling_states.temperature.gpu,
-            self.sampler.sampling_states.seeds.gpu,
-            self.num_speculative_steps,
-            self.synthetic_conditional_rates,
-            use_fp64=self.sampler.use_fp64_gumbel,
-            use_block_verification=self.use_block_verification,
-        )
+            extra={"has_draft_logits": draft_logits is not None},
+        ):
+            sampled, num_sampled = rejection_sample(
+                processed_logits,
+                draft_logits,
+                draft_sampled,
+                cu_num_logits,
+                pos,
+                idx_mapping,
+                expanded_idx_mapping,
+                expanded_local_pos,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                self.num_speculative_steps,
+                self.synthetic_conditional_rates,
+                use_fp64=self.sampler.use_fp64_gumbel,
+                use_block_verification=self.use_block_verification,
+            )
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -239,30 +248,41 @@ class RejectionSampler:
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
-        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
-        pos = input_batch.positions[input_batch.logits_indices]
+        with optional_phase_profile_stage("target.rejection.inputs", logits):
+            draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+            pos = input_batch.positions[input_batch.logits_indices]
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
         max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+        with optional_phase_profile_stage(
+            "target.rejection.verify_total",
             logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            max_chunk_logits,
-            max_num_logprobs,
-        )
+            extra={
+                "num_logits": logits.shape[0],
+                "vocab_size": logits.shape[1],
+                "has_draft_logits": draft_logits is not None,
+            },
+        ):
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                max_chunk_logits,
+                max_num_logprobs,
+            )
 
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
-            num_sampled,
-            input_batch.seq_lens,
-            input_batch.cu_num_logits,
-            input_batch.idx_mapping,
-            self.sampler.req_states.prefill_len.gpu,
-        )
+        with optional_phase_profile_stage("target.rejection.counts", num_sampled):
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.sampler.req_states.prefill_len.gpu,
+            )
 
         return SamplerOutput(
             sampled_token_ids=sampled,

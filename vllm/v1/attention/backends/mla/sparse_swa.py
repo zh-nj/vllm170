@@ -13,6 +13,7 @@ from vllm.model_executor.warmup.jit_warmup import (
 )
 from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
@@ -449,10 +450,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        decode_swa_index_width = (
+            self.window_size if self._requires_dense_decode_swa_indices() else 0
+        )
         self.decode_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            decode_swa_index_width,
             dtype=torch.int32,
             device=self.device,
         )
@@ -495,6 +499,69 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
 
+    def _requires_dense_decode_swa_indices(self) -> bool:
+        return True
+
+    def _build_decode_swa_indices(
+        self,
+        *,
+        num_decode_tokens: int,
+        non_causal: bool,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        is_valid_token: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        if non_causal:
+            assert self.is_dspark, (
+                "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                "speculation mode, but causal=False was set without DSpark."
+            )
+            if self.decode_swa_indices_noncausal is None:
+                self.decode_swa_indices_noncausal = torch.zeros(
+                    self._max_tokens,
+                    1,
+                    self.noncausal_index_width,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            decode_swa_indices = self.decode_swa_indices_noncausal
+            _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
+                decode_swa_indices,
+                decode_swa_indices.stride(0),
+                self.decode_swa_lens,
+                self.window_size,
+                self.noncausal_index_width,
+                query_start_loc,
+                seq_lens,
+                token_to_req_indices,
+                is_valid_token,
+                block_table,
+                block_table.stride(0),
+                self.block_size,
+                token_offset=0,
+                TRITON_BLOCK_SIZE=1024,
+            )
+            return decode_swa_indices
+
+        _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+            self.decode_swa_indices,
+            self.decode_swa_indices.stride(0),
+            self.decode_swa_lens,
+            self.window_size,
+            query_start_loc,
+            seq_lens,
+            token_to_req_indices,
+            is_valid_token,
+            block_table,
+            block_table.stride(0),
+            self.block_size,
+            token_offset=0,
+            TRITON_BLOCK_SIZE=1024,
+        )
+        return self.decode_swa_indices
+
     def build(
         self,
         common_prefix_len: int,
@@ -515,6 +582,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        non_causal = not common_attn_metadata.causal
+        mode = "noncausal" if non_causal else "causal"
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
@@ -525,101 +594,81 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.token_map", slot_mapping
+        ):
+            token_to_req_indices = common_attn_metadata.token_to_req_indices(
+                self.token_to_req_indices
+            )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.validity", slot_mapping
+        ):
+            is_valid_token.copy_(slot_mapping >= 0)
 
-        non_causal = not common_attn_metadata.causal
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
-            if non_causal:
-                assert self.is_dspark, (
-                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
-                    "speculation mode, but causal=False was set without DSpark."
-                )
-                if self.decode_swa_indices_noncausal is None:
-                    self.decode_swa_indices_noncausal = torch.zeros(
-                        self._max_tokens,
-                        1,
-                        self.noncausal_index_width,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                decode_swa_indices = self.decode_swa_indices_noncausal
-                _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
-                    decode_swa_indices.stride(0),
-                    self.decode_swa_lens,
-                    self.window_size,
-                    self.noncausal_index_width,
-                    query_start_loc,
-                    seq_lens,
-                    token_to_req_indices,
-                    is_valid_token,
-                    block_table,
-                    block_table.stride(0),
-                    self.block_size,
-                    token_offset=0,
-                    TRITON_BLOCK_SIZE=1024,
-                )
-            else:
-                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
-                    decode_swa_indices.stride(0),
-                    self.decode_swa_lens,
-                    self.window_size,
-                    query_start_loc,
-                    seq_lens,
-                    token_to_req_indices,
-                    is_valid_token,
-                    block_table,
-                    block_table.stride(0),
-                    self.block_size,
-                    token_offset=0,
-                    TRITON_BLOCK_SIZE=1024,
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.swa.{mode}.decode_indices", slot_mapping
+            ):
+                self.decode_swa_lens[num_decode_tokens:] = 0
+                decode_swa_indices = self._build_decode_swa_indices(
+                    num_decode_tokens=num_decode_tokens,
+                    non_causal=non_causal,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    token_to_req_indices=token_to_req_indices,
+                    is_valid_token=is_valid_token,
+                    block_table=block_table,
                 )
 
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
         if num_prefill_tokens > 0:
-            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
-            prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
-            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                prefill_swa_indices,
-                prefill_swa_indices.stride(0),
-                prefill_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                token_offset=num_decode_tokens,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            with optional_phase_profile_stage(
+                f"target.attn_metadata.swa.{mode}.prefill_indices", slot_mapping
+            ):
+                prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+                prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
+                _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+                    prefill_swa_indices,
+                    prefill_swa_indices.stride(0),
+                    prefill_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    token_offset=num_decode_tokens,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
-        deepseek_v4_fields = self._build_deepseek_v4_metadata(
-            num_decodes,
-            num_prefills,
-            seq_lens,
-            seq_lens_cpu,
-            query_start_loc,
-            query_start_loc_cpu,
-        )
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.prefill_common", slot_mapping
+        ):
+            deepseek_v4_fields = self._build_deepseek_v4_metadata(
+                num_decodes,
+                num_prefills,
+                seq_lens,
+                seq_lens_cpu,
+                query_start_loc,
+                query_start_loc_cpu,
+            )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
         # per present DeepseekV4 layer type; the first flash_mla_with_kvcache call of
         # each type triggers the planner and all same-type layers reuse the
         # resulting plan for the rest of the step.
-        tile_sched = self.build_tile_scheduler(num_decode_tokens)
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.tile_scheduler", slot_mapping
+        ):
+            tile_sched = self.build_tile_scheduler(num_decode_tokens)
 
         return DeepseekSparseSWAMetadata(
             seq_lens=seq_lens,

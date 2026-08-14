@@ -144,9 +144,12 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        with phase_profile_stage("moe.shared_experts.w13", x):
+            gate_up, _ = self.gate_up_proj(x)
+        with phase_profile_stage("moe.shared_experts.activation", gate_up):
+            x = self.act_fn(gate_up)
+        with phase_profile_stage("moe.shared_experts.w2", x):
+            x, _ = self.down_proj(x)
         return x
 
 

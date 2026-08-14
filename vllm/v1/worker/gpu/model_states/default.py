@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -147,17 +148,21 @@ class DefaultModelState(ModelState):
             # For piecewise cudagraphs and eager, use unpadded sizes.
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
-        query_start_loc_cpu = torch.from_numpy(
-            input_batch.query_start_loc_np[: num_reqs + 1]
-        )
-        query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
-        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
-        if for_capture:
-            # Capture with worst-case max_seq_len so the graph is valid at any replay.
-            max_seq_len = self.max_model_len
-        else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        with optional_phase_profile_stage(
+            "target.attn_metadata.scalar_inputs", input_batch.input_ids
+        ):
+            query_start_loc_cpu = torch.from_numpy(
+                input_batch.query_start_loc_np[: num_reqs + 1]
+            )
+            query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
+            max_query_len = input_batch.num_scheduled_tokens.max().item()
+            seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+            if for_capture:
+                # Capture with worst-case max_seq_len so the graph is valid at any
+                # replay.
+                max_seq_len = self.max_model_len
+            else:
+                max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
         req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
         if (
             self.supports_mm_inputs
@@ -169,24 +174,27 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
-        attn_metadata = build_attn_metadata(
-            attn_groups=attn_groups,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=input_batch.seq_lens,
-            max_seq_len=max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=kv_cache_config,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            positions=input_batch.positions,
-            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
-            mm_req_doc_ranges=req_doc_ranges,
-            for_cudagraph_capture=for_capture,
-            rswa_prefix_lens=input_batch.prompt_lens,
-        )
+        with optional_phase_profile_stage(
+            "target.attn_metadata.builders", input_batch.input_ids
+        ):
+            attn_metadata = build_attn_metadata(
+                attn_groups=attn_groups,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                max_query_len=max_query_len,
+                seq_lens=input_batch.seq_lens,
+                max_seq_len=max_seq_len,
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                kv_cache_config=kv_cache_config,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+                positions=input_batch.positions,
+                is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+                mm_req_doc_ranges=req_doc_ranges,
+                for_cudagraph_capture=for_capture,
+                rswa_prefix_lens=input_batch.prompt_lens,
+            )
         return attn_metadata

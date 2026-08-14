@@ -59,6 +59,12 @@ Torch profiler，也不插入 phase CUDA-event synchronize。分模块归因另�
 1.32 GB 虽可通过 admission，仍在同一 compressor warmup OOM。因此当前显存
 区间内不存在已验证可启动的 8,192 配置。
 
+SWA direct-ragged 后续又在构造期消除了两个 causal dense decode buffer，8192
+配置的逻辑常驻分配再减少 256 MiB/rank。复测
+`profiles/deepseek_v4/20260814T145153Z` 仍在 PP2 的同一
+`compress_norm_rope_store_triton` warmup OOM，峰值为
+60718/59424/64384 MiB；因此原拒绝结论不变。
+
 ## 131K 部署长度门禁
 
 最终推广重新使用启动器的 131,072 max model length 和每 rank 1.6 GB KV，唯一

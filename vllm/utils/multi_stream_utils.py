@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
+
 
 class AuxStreamType(Enum):
     Attention = 1
@@ -23,6 +25,8 @@ def maybe_execute_in_parallel(
     event0: torch.cuda.Event,
     event1: torch.cuda.Event,
     aux_stream: torch.cuda.Stream | None = None,
+    *,
+    profile_join: tuple[str, torch.Tensor] | None = None,
 ) -> tuple[Any, Any]:
     """Run two functions potentially in parallel on separate CUDA streams.
 
@@ -42,6 +46,8 @@ def maybe_execute_in_parallel(
         aux_stream: The second CUDA stream for fn1.
             Multi-stream is disabled when aux_stream is None or a breakable
             CUDA graph capture is active.
+        profile_join: Optional phase-profile stage and reference tensor for the
+            exposed default-stream wait on ``fn1``.
 
     Returns:
         Tuple of (fn0_result, fn1_result).
@@ -59,7 +65,11 @@ def maybe_execute_in_parallel(
             event0.wait()
             result1 = fn1()
             event1.record()
-        event1.wait()
+        if profile_join is None:
+            event1.wait()
+        else:
+            with optional_phase_profile_stage(*profile_join):
+                event1.wait()
     else:
         result0 = fn0()
         result1 = fn1()
@@ -73,6 +83,8 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    *,
+    profile_join: tuple[str, torch.Tensor] | None = None,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -100,6 +112,8 @@ def execute_in_parallel(
             so callers that pass aux_streams must also pass enable=True
             (typically gated by an env var) to actually overlap. When False,
             execution falls back to sequential on the current stream.
+        profile_join: Optional phase-profile stage and reference tensor for the
+            exposed default-stream wait on the auxiliary functions.
 
     Returns:
         Tuple of (default_result, aux_results) where aux_results[i] is the
@@ -130,7 +144,12 @@ def execute_in_parallel(
 
     default_result = default_fn()
 
-    for ev in pending:
-        ev.wait()
+    if profile_join is None:
+        for ev in pending:
+            ev.wait()
+    else:
+        with optional_phase_profile_stage(*profile_join):
+            for ev in pending:
+                ev.wait()
 
     return default_result, aux_results

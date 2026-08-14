@@ -445,11 +445,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                with phase_profile_stage(
+                    "attention.input_gemm.mla_compressor_score", hidden_states
+                ):
+                    return torch.mm(
+                        hidden_states,
+                        compressor.fused_wkv_wgate.weight.T,
+                        out_dtype=torch.float32,
+                    )
 
             aux_fns[0] = compressor_kv_score
 
@@ -457,22 +460,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                # ReplicatedLinear returns (output, bias); bias is None.
-                weights, _ = indexer.weights_proj(hidden_states)
-                return weights
+                with phase_profile_stage(
+                    "attention.input_gemm.indexer_weights", hidden_states
+                ):
+                    # ReplicatedLinear returns (output, bias); bias is None.
+                    weights, _ = indexer.weights_proj(hidden_states)
+                    return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                with phase_profile_stage(
+                    "attention.input_gemm.indexer_compressor_score", hidden_states
+                ):
+                    return torch.mm(
+                        hidden_states,
+                        indexer.compressor.fused_wkv_wgate.weight.T,
+                        out_dtype=torch.float32,
+                    )
 
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
-            return self._fused_wqa_wkv_gemm(hidden_states)
+            with phase_profile_stage("attention.input_gemm.qr_kv", hidden_states):
+                return self._fused_wqa_wkv_gemm(hidden_states)
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
@@ -482,6 +492,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_streams,
             enable=hidden_states.shape[0]
             <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            profile_join=("attention.input_gemm.join", hidden_states),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -513,9 +524,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
+                with phase_profile_stage("attention.qkv_insert", qr):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                    q = self._fused_qnorm_rope_kv_insert(
+                        q, kv, positions, attn_metadata
+                    )
+                    return q
+
+            def indexer_branch() -> torch.Tensor:
+                with phase_profile_stage("attention.indexer_branch", hidden_states):
+                    return indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    )
+
+            def mla_compressor_branch() -> None:
+                with phase_profile_stage(
+                    "attention.mla_compressor_branch", hidden_states
+                ):
+                    return compressor(kv_score, positions, self.rotary_emb)
 
             # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
@@ -524,20 +555,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
-                    ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    indexer_branch,
+                    mla_compressor_branch,
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=aux_streams is not None,
+                profile_join=("attention.qicm_join", hidden_states),
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -547,21 +572,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
+                with phase_profile_stage("attention.qkv_insert", qr):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                    q = self._fused_qnorm_rope_kv_insert(
+                        q, kv, positions, attn_metadata
+                    )
+                    return q
+
+            def mla_compressor_branch() -> None:
+                with phase_profile_stage(
+                    "attention.mla_compressor_branch", hidden_states
+                ):
+                    return compressor(kv_score, positions, self.rotary_emb)
 
             q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
+                mla_compressor_branch,
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                profile_join=("attention.qicm_join", hidden_states),
             )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            with phase_profile_stage("attention.qkv_insert", qr):
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # MLA attention writes into the pre-allocated `out` buffer.
         with phase_profile_stage("attention.sparse_mla", q):
@@ -924,6 +960,7 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            profile_join=("indexer.query_cache_join", qr),
         )
         with phase_profile_stage("indexer.select", q_quant):
             return self.indexer_op(hidden_states, q_quant, k, weights)

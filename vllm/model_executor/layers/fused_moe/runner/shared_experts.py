@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.torch_utils import (
     aux_stream,
     current_stream,
@@ -135,9 +136,17 @@ class SharedExperts(torch.nn.Module):
         # TODO: assert that maybe_sync_shared_experts_stream has been called.
 
         # Run shared experts in parallel on a separate stream.
-        with torch.cuda.stream(self._stream):
+        with (
+            torch.cuda.stream(self._stream),
+            optional_phase_profile_stage(
+                "moe.shared_experts.compute", shared_experts_input
+            ),
+        ):
             output = self._layer(shared_experts_input)
-        current_stream().wait_stream(self._stream)
+        with optional_phase_profile_stage(
+            "moe.shared_experts.join", shared_experts_input
+        ):
+            current_stream().wait_stream(self._stream)
 
         return output
 
@@ -169,6 +178,9 @@ class SharedExperts(torch.nn.Module):
                 shared_experts_input
             )
         else:
-            self._output[self._output_idx] = self._layer(shared_experts_input)
+            with optional_phase_profile_stage(
+                "moe.shared_experts.compute", shared_experts_input
+            ):
+                self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None

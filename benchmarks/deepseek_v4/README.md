@@ -83,7 +83,10 @@ the following nested stages can be timed rather than hidden inside graph replay:
   workspace, token alignment, W13, activation, W2, weighted reduce, finalize,
   and combine, including actual padded-row utilization by DSV4 shape;
 - decode: target stages, paged indexer logits, exact/persistent top-k,
-  top-k metadata, sparse MLA, and output projection;
+  top-k metadata, sparse MLA, output projection, C1/C4/C128 layer families,
+  routed Marlin experts, and the overlapped shared-expert W13/activation/W2
+  branch plus its exposed join tail; attention metadata is also decomposed by
+  KV-cache group and by SWA dense/ragged and MLA slot/C128 sub-stage;
 - DSpark: target logits and rejection, hidden/input preparation, context-KV,
   draft backbone, base logits, and every Markov bias/sample step.
 
@@ -91,6 +94,42 @@ This detailed run is diagnostic and must not be quoted as production decode
 throughput. Use `DSV4_PROFILE_EXECUTION=graph` for the deployed CUDA Graph path;
 that mode reports graph replay and eager boundary totals but intentionally does
 not claim unavailable graph-internal subdivisions.
+
+For a lower-perturbation layer study, set
+`VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS=model.layers.16`. Model-level and
+metadata stages remain enabled, while layer-scoped CUDA events are limited to
+the listed canonical layers (an `.attn` suffix is matched automatically).
+`VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION=0` additionally disables Torch
+range annotations while retaining the phase CUDA Events.
+
+For a production-shaped DSpark boundary run, an exact stage whitelist avoids
+inserting events throughout the captured draft and target graphs:
+
+```bash
+VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES=\
+target.attn_metadata,target.model_inputs,target.model_graph_replay,\
+target.sampling_total,target.logits,target.rejection,target.sample,\
+draft.propose_total,draft.hidden_prepare,draft.prepare_inputs,\
+draft.context_kv,draft.dispatch,draft.metadata,draft.graph_replay \
+DSV4_PROFILE_EXECUTION=graph \
+DSV4_PROFILE_CONTEXT=32000 \
+DSV4_PROFILE_REPEATS=1 \
+benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh
+```
+
+The DSpark report separates intermediate prefill proposals from steady decode
+proposals. Its dependency-path table uses the critical worker for target input
+and metadata preparation, but sums aligned PP0/PP1/PP2 target model ranges for
+one q8 verification. It also emits a cross-rank work sum explicitly marked as
+non-wall-time accounting.
+
+The CMP170HX launcher enables
+`VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA=1` and
+`VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128=1`. On SM8x these build causal/non-causal
+SWA and C128 decode metadata directly in graph-stable ragged buffers, avoiding
+the dense-to-ragged pack, final copy, and unused persistent dense decode buffers.
+Each switch can be set to `0` for an independent rollback; other device families
+retain the original builders.
 
 Use `DSV4_PROFILE_EXECUTION=benchmark` for an endpoint-level comparison without
 Torch profiler or CUDA-event synchronization. The harness still records exact
@@ -102,18 +141,31 @@ documented in
 The script writes per-worker traces, profiler tables, a server log,
 `result.jsonl`, raw `phase_trace/*.jsonl`, `phase_summary.json`, one Markdown
 summary for each of prefill/decode/DSpark, and `profile_status.json` under
-`profiles/deepseek_v4/<UTC timestamp>/`. With PP3, stages overlap: report each
-stage/device separately and use the critical stage for wall-time attribution.
-Never add times from all three ranks as though they were sequential. Nested
-`total`, `module`, `stage`, and `detail` ranges also overlap and must not be
-added across levels. The prefill report additionally aligns chunks by ordinal,
-reports model/layer coverage, gives per-layer attention/FFN/mHC totals, and
-ranks the Marlin sub-stages. Repeated workloads are all checked fail-closed
-and aggregated in the same phase report.
+`profiles/deepseek_v4/<UTC timestamp>/`. Prefill chunks can overlap across PP
+stages, so its report retains per-stage critical-rank attribution. A single
+autoregressive target verification round instead traverses PP0, PP1, then PP2;
+the decode report aligns those model ranges by round and reports their serial
+sum alongside the slowest-stage balance diagnostic. Do not sum arbitrary
+maxima or unaligned stages across ranks. Nested `total`, `module`, `stage`, and
+`detail` ranges also overlap and must not be added across levels. Both prefill
+and decode reports give model/layer coverage, per-layer attention/FFN/mHC
+totals, and Marlin sub-stages. Decode additionally groups work by compression
+ratio and separates the shared-expert auxiliary stream from its main-stream
+join tail. Repeated workloads are all checked fail-closed and aggregated in
+the same phase report.
 
 The accepted CMP170HX Marlin P0 decomposition, block-M A/B and next optimization
 queue are documented in
 `docs/design/vllm170-dsv4-sm80-marlin-moe-profile-2026-08-14.md`.
+
+The 32K DSpark-7 decode hierarchy, Graph/eager boundary, C4 and shared-expert
+analysis, and memory-bounded optimization queue are documented in
+`docs/design/vllm170-dsv4-sm80-decode-profile-2026-08-14.md`.
+
+The DSpark-specific 32K/64K proposal split, draft metadata/context-KV detail,
+non-final prefill analysis, and zero-large-residency optimization queue are
+documented in
+`docs/design/vllm170-dsv4-sm80-dspark-profile-2026-08-15.md`.
 
 The follow-up W13/W2 execution-config sweep, caller-owned FP32 reduce workspace
 A/B/A, and fusion feasibility study are documented in

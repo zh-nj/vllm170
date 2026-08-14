@@ -305,7 +305,21 @@ def build_result(
         "sparse_prefill_block_k": int(
             os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
         ),
+        "direct_ragged_swa": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
+        ),
+        "direct_ragged_c128": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
+        ),
         "profiler_enabled": not args.skip_profiler,
+        "phase_profile_flows": os.getenv(
+            "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
+        ),
+        "phase_profile_layers": os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS", ""),
+        "phase_profile_stages": os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES", ""),
+        "phase_profile_record_function": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION", "1"))
+        ),
         **workload,
     }
     if metrics is not None:

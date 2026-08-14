@@ -59,6 +59,30 @@ def test_analyzer_reports_cpu_scope_separately_from_cuda_events() -> None:
     assert stage["cpu_total_us"] == 25
 
 
+def test_analyzer_preserves_attention_metadata_kv_cache_groups() -> None:
+    records = []
+    for kv_cache_group, elapsed_us in ((1, 30), (2, 50)):
+        record = _row(
+            "decode",
+            "target.attn_metadata.builder.DeepseekSparseSWAMetadataBuilder",
+            0,
+            elapsed_us,
+        )
+        record["cpu_elapsed_us"] = elapsed_us + 5
+        record["extra"] = {"kv_cache_group": kv_cache_group}
+        records.append(record)
+
+    rows = phase_profile_analyze.analyze_phase_records(records)["flows"]["decode"][
+        "metadata_group_stage"
+    ]
+
+    assert [(row["kv_cache_group"], row["mean_us"]) for row in rows] == [
+        (1, 30),
+        (2, 50),
+    ]
+    assert [row["cpu_mean_us"] for row in rows] == [35, 55]
+
+
 def test_analyzer_requires_distinct_prefill_decode_and_dspark_details() -> None:
     records: list[dict[str, Any]] = []
     for flow, stages in phase_profile_analyze.DETAIL_REQUIREMENTS.items():
@@ -159,3 +183,141 @@ def test_prefill_reports_additive_marlin_breakdown_and_shapes() -> None:
     )
     assert align["mean_tokens_post_padded"] == 15360
     assert align["useful_token_pct"] == 78.125
+
+
+def test_decode_reports_rounds_module_coverage_and_compression_families() -> None:
+    records = []
+    for pp_rank, model_us in ((0, 100), (1, 110), (2, 90)):
+        model = _row("decode", "target.model_forward", pp_rank, model_us)
+        model.update(step_id=7, token_count=8, level="total")
+        records.append(model)
+        for stage, elapsed_us in (
+            ("layer.total", 80),
+            ("layer.mhc_attention_pre", 10),
+            ("layer.attention", 30),
+            ("layer.mhc_ffn_pre", 10),
+            ("layer.ffn", 25),
+        ):
+            row = _row("decode", stage, pp_rank, elapsed_us)
+            row.update(
+                step_id=7,
+                token_count=8,
+                layer=f"model.layers.{pp_rank}",
+                compress_ratio=4,
+            )
+            records.append(row)
+
+    summary = phase_profile_analyze.analyze_phase_records(records)["flows"]["decode"]
+
+    assert summary["target_steps"][0]["critical_pp_rank"] == 1
+    assert summary["target_steps"][0]["token_count"] == 8
+    assert summary["target_steps"][0]["pipeline_total_us"] == 300
+    assert summary["module_coverage"][1]["model_unattributed_us"] == 30
+    model = next(
+        row for row in summary["serial_stage"] if row["stage"] == "target.model_forward"
+    )
+    assert model["per_target_round_us"] == 300
+    layer = next(
+        row for row in summary["serial_stage"] if row["stage"] == "layer.total"
+    )
+    assert layer["model_share_pct"] == 80
+    family = next(
+        row
+        for row in summary["compression_family_stage"]
+        if row["compress_ratio"] == 4 and row["stage"] == "layer.attention"
+    )
+    assert family["layer_count"] == 3
+    assert family["count"] == 3
+    assert family["mean_us"] == 30
+
+
+def test_decode_marlin_breakdown_uses_decode_records() -> None:
+    records = [_row("decode", "moe.fused_route_experts", 0, 100)]
+    records.extend(
+        _row("decode", stage, 0, elapsed_us)
+        for stage, elapsed_us in (
+            ("moe.router_gate", 5),
+            ("moe.router_select", 7),
+            ("moe.marlin.align", 8),
+            ("moe.marlin.w13_gemm", 40),
+            ("moe.marlin.activation", 4),
+            ("moe.marlin.w2_gemm", 25),
+            ("moe.marlin.reduce", 3),
+        )
+    )
+
+    marlin = phase_profile_analyze.analyze_phase_records(records)["flows"]["decode"][
+        "marlin_moe"
+    ]
+
+    assert marlin["by_rank"][0]["accounted_us"] == 92
+    assert marlin["by_rank"][0]["residual_us"] == 8
+
+
+def test_decode_round_summary_accepts_graph_replay_totals() -> None:
+    records = []
+    for step_id in (1, 2):
+        for pp_rank, elapsed_us in enumerate((10, 20, 30)):
+            row = _row("decode", "target.model_graph_replay", pp_rank, elapsed_us)
+            row.update(step_id=step_id, token_count=8, level="total")
+            records.append(row)
+
+    summary = phase_profile_analyze.analyze_phase_records(records)["flows"]["decode"]
+
+    assert summary["target_steps"][0]["pipeline_total_us"] == 60
+    assert summary["round_summary"][0]["pipeline_mean_us"] == 60
+    replay = next(
+        row
+        for row in summary["serial_stage"]
+        if row["stage"] == "target.model_graph_replay"
+    )
+    assert replay["pp_ranks"] == [0, 1, 2]
+
+
+def test_dspark_separates_prefill_proposals_and_builds_cycle_floor() -> None:
+    records = []
+    for pp_rank, model_us in enumerate((10, 20, 30)):
+        model = _row("decode", "target.model_graph_replay", pp_rank, model_us)
+        model.update(step_id=pp_rank, token_count=8, level="total")
+        records.append(model)
+        records.append(_row("decode", "target.attn_metadata", pp_rank, 2))
+        records.append(_row("decode", "target.model_inputs", pp_rank, 1))
+
+    sampling = _row("dspark", "target.sampling_total", 2, 5)
+    sampling["extra"] = {"dspark_kind": "decode"}
+    records.append(sampling)
+
+    for step_id, step_kind, token_count, elapsed_us in (
+        (10, "prefill", 1667, 40),
+        (11, "prefill", 327, 35),
+        (12, "decode", 8, 10),
+    ):
+        proposal = _row("dspark", "draft.propose_total", 2, elapsed_us)
+        proposal.update(
+            step_id=step_id,
+            step_kind=step_kind,
+            token_count=token_count,
+            level="total",
+        )
+        records.append(proposal)
+
+    summary = phase_profile_analyze.analyze_phase_records(records)["flows"]["dspark"]
+
+    assert [
+        (row["step_kind"], row["token_count"], row["mean_us"])
+        for row in summary["proposal_shapes"]
+    ] == [
+        ("decode", 8, 10),
+        ("prefill", 327, 35),
+        ("prefill", 1667, 40),
+    ]
+    cycle = summary["cycle_summary"][0]
+    assert cycle["target_model_serial_mean_us"] == 60
+    assert cycle["target_model_slowest_rank_mean_us"] == 30
+    assert cycle["target_prepare_critical_pp_rank"] == 0
+    assert cycle["target_prepare_critical_mean_us"] == 3
+    assert cycle["target_prepare_work_sum_mean_us"] == 9
+    assert cycle["target_sampling_mean_us"] == 5
+    assert cycle["draft_propose_mean_us"] == 10
+    assert cycle["measured_dependency_scope_mean_us"] == 78
+    assert cycle["cross_rank_work_sum_mean_us"] == 84
