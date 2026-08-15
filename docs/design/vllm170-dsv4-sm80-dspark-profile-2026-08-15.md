@@ -232,7 +232,7 @@ DSpark proposal 当前在每个 target prompt chunk 后都运行。32K 为 19 x 
 | --- | --- | --- | --- |
 | P0-A | non-final prefill context-only | token/hash/KV parity；TTFT A/B/A | 不新增持久 buffer |
 | P0-B | 两组 draft metadata 公共几何复用 | metadata CUDA Event 与 32K/64K ms/round | 复用现有 Graph buffer |
-| P0-C | KV-only projection + fused insert | 三层 context KV 逐元素一致 | 仅 caller-owned 小 scratch |
+| P0-C | KV-only RoPE + quant + paged insert | cache 字节一致；32K/64K Graph A/B | 不新增 workspace |
 | P1-A | target logits/rejection Graph 化 | greedy/probabilistic acceptance parity | 固定 B1/q8 buffer |
 | P1-B | acceptance/宽度扫描 | 同 prompt/seed 策略下 tok/s 与质量 | 计入 Graph 宽度成本 |
 | P2 | M=7 Marlin/Markov/draft layer | 整个 draft graph replay A/B | 不缓存 BF16 大权重 |
@@ -240,3 +240,59 @@ DSpark proposal 当前在每个 target prompt chunk 后都运行。32K 为 19 x 
 优化报告同时记录 `ms/round`、accepted length、tok/s、prompt/output hash、PP rank、
 context 和峰值显存。任何只改善受扰动 eager 子范围、但不能改善 profiler-off Graph
 端点的方案都不进入默认配置。
+
+## P0 实机结论
+
+三项 P0 均先通过局部正确性和 Graph 烟测，再以关闭 profiler 的生产形态决定是否晋升。
+P0-A 与 P0-B 已完整撤回，P0-C 仅晋升 context KV 插入子项；`wqa_wkv` 中被丢弃的
+Q 投影也完成了独立原型，但因显存交换比不足而撤回。
+
+| 原型 | 局部结果 | 生产 A/B | 决定 |
+| --- | --- | --- | --- |
+| P0-A non-final context-only | 32K 跳过 19 次无消费者的 metadata/graph，Event scope 少约 63.1 ms | A/B/A 的 TTFT 为 5.816/5.821/5.841 s，B 没有可复现收益 | 撤回 |
+| P0-B metadata geometry 复用 | metadata 初测约 91.9 -> 62.2 us | 修正 Graph capture/replay 指针拓扑后，B 的 35.001 ms/round 位于 A1 34.782 与 A2 35.521 之间 | 撤回 |
+| P0-C KV-only insert | cache 逐字节一致；prefill insert 274.31 -> 16.76 us/层，decode insert 11.86 -> 8.53 us/层 | 512-token B/A/B：38.275/40.348/38.741 ms/round；64K 均值 36.872 ms/round | 晋升 |
+
+P0-B 首版曾因 capture 时为两个 metadata group 分配独立 buffer、replay 时却共享第一组
+指针，导致 acceptance 降至约 0--2.4%。修正为 capture/replay 使用完全相同的指针所有权
+后 acceptance 恢复。以后任何 Graph metadata 复用都必须把“捕获与重放的指针拓扑一致”
+列为独立正确性门。
+
+P0-C 新增专用 CUDA op，只执行 KV RoPE、UE8M0 FP8 量化和 paged cache 写入。旧路径
+为 context token 创建 `[M,64,512]` BF16 dummy Q，并生成同形状的无用 Q 输出；新路径
+不申请 caller workspace，也不增加持久显存。CMP170HX 独立计量中，含 dummy Q 分配的
+旧路径与新路径在 M=7 时为 69.51/16.90 us，在 M=1667 时为 316.19/17.18 us。
+复现命令为
+`CUDA_VISIBLE_DEVICES=1 .venv/bin/python benchmarks/kernels/deepseek_v4_kv_only_insert.py`。
+
+关键证据目录：
+
+- Graph candidate/baseline：`20260814T234835Z` / `20260814T235326Z`；
+- 32K 64-token A/B/A：`20260814T235640Z` / `20260814T235943Z` /
+  `20260815T000245Z`，短样本结果落在噪声区；
+- 32K 512-token B/A/B：`20260815T000553Z` / `20260815T000828Z` /
+  `20260815T001120Z`，两侧候选合并 38.508 ms/round，相对基线快 4.56%；
+- 64K candidate：`20260815T001422Z`，三次 TTFT 均值 11.793 s，峰值显存与既有
+  cache 预算一致，无额外常驻分配。
+
+CMP170HX 启动脚本默认打开
+`VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT=1`；全局环境默认仍为 0，可在启动时显式设为
+0 回滚。该路由只覆盖 `fp8_ds_mla` 的 `uint8` cache，BF16 和 per-tensor FP8 路径保持
+原实现。
+
+KV-only projection 也完成了隔离原型，但没有晋升。由于完整 WQA|WKV 已重排为 Marlin
+packed 布局，无法安全做输出列零复制切片；原型为三个 draft layer 各保留一份独立 FP8
+WKV。`20260815T002603Z` 的 audit 证明独立投影与融合投影的 KV 切片 BF16 逐元素完全
+一致。相同 stage whitelist 的 candidate/baseline 为 `20260815T002910Z` /
+`20260815T003159Z`：
+
+- prefill input GEMM 为 97.72/209.05 us/层，context-KV 为 459.01/790.48 us，
+  proposal 为 4.695/5.025 ms；
+- decode input GEMM 为 17.04/15.48 us/层，context-KV 为 120.02/115.26 us，
+  proposal 为 2.867/2.844 ms；
+- PP2 workload 峰值由 63,112 增至 63,128 MiB。
+
+只在大 M 使用独立 WKV 可避开 decode 退化，但 32K 的 TTFT Event scope 上限约为
+20 x 0.330 ms = 6.6 ms，且这部分与 target prefill 流水重叠。该收益不足以交换 16 MiB
+常驻显存，因此原型代码已撤回。若以后 Marlin 提供 packed-N 子视图或单份权重的 shard
+GEMM，再重新评估零常驻增量实现。

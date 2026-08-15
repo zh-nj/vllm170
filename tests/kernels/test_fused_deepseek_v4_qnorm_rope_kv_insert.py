@@ -139,6 +139,10 @@ def _full_cache_bf16_op_available() -> bool:
     )
 
 
+def _kv_only_op_available() -> bool:
+    return hasattr(torch.ops._C, "deepseek_v4_kv_rope_quant_insert")
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not _op_available(),
     reason="CUDA not available or fused DeepseekV4 op not built in",
@@ -382,6 +386,58 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     _assert_kv_cache_parity(
         k_cache_fused, k_cache_ref, num_tokens, num_blocks, block_size
     )
+
+
+@pytest.mark.skipif(
+    not _kv_only_op_available(),
+    reason="KV-only DeepseekV4 op not built in",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64, 2048])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("pad", [0, 3])
+def test_kv_only_insert_matches_fused_q_kv_path(
+    num_tokens: int, block_size: int, pad: int
+):
+    torch.manual_seed(11)
+    device = "cuda"
+    full_num_tokens = num_tokens + pad
+    kv = torch.randn(full_num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(full_num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    if num_tokens > 1:
+        slot_mapping[num_tokens // 2] = -1
+
+    cache_ref = torch.zeros(
+        num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    q_dummy = torch.zeros(
+        full_num_tokens, 1, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    _call_fused(
+        q_dummy,
+        64,
+        kv,
+        cache_ref,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        1e-6,
+        block_size,
+    )
+
+    cache_actual = torch.zeros_like(cache_ref)
+    torch.ops._C.deepseek_v4_kv_rope_quant_insert(
+        kv,
+        cache_actual,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        block_size,
+    )
+
+    torch.testing.assert_close(cache_actual, cache_ref, rtol=0, atol=0)
 
 
 # ── Test 2b: DP padding (slot_mapping shorter than q/kv) ─────────────────────

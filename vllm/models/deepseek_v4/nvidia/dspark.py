@@ -266,6 +266,18 @@ def _insert_context_kv(
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
+    if cache_dtype == torch.uint8 and envs.VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT:
+        swa_2d = swa_cache.view(swa_cache.shape[0], -1)
+        torch.ops._C.deepseek_v4_kv_rope_quant_insert(
+            kv,
+            swa_2d,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            block_size,
+        )
+        return
+
     dummy_q = torch.zeros(
         (n_ctx, attn.n_local_heads, attn.head_dim),
         dtype=kv.dtype,

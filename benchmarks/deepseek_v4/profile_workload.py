@@ -311,6 +311,9 @@ def build_result(
         "direct_ragged_c128": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
         ),
+        "dspark_kv_only_insert": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "0"))
+        ),
         "profiler_enabled": not args.skip_profiler,
         "phase_profile_flows": os.getenv(
             "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"

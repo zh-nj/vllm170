@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = False
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = False
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
@@ -1109,6 +1110,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "0"))
     ),
     "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN", "0")
