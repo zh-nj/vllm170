@@ -170,6 +170,7 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        self.spec_token_ids_step_id: int | None = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

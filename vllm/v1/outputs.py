@@ -255,6 +255,17 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class DraftTokenIds:
+    # [num_reqs]
+    req_ids: list[str]
+    # num_reqs x num_draft_tokens
+    draft_token_ids: list[list[int]]
+    # V2 binds drafts to the scheduler step that produced them. V1 leaves this
+    # unset and uses the legacy synchronous handoff.
+    producer_step_id: int | None = None
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -270,7 +281,6 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
-    # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
     logprobs: LogprobsLists | None = None
@@ -307,6 +317,10 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # V2 only. Per-batch drafts are returned with their producer output so
+    # concurrent batches cannot overwrite one shared handoff buffer.
+    draft_token_ids: DraftTokenIds | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,
@@ -332,14 +346,6 @@ class AsyncModelRunnerOutput(ABC):
         This method should only be called once per AsyncModelRunnerOutput.
         """
         pass
-
-
-@dataclass
-class DraftTokenIds:
-    # [num_reqs]
-    req_ids: list[str]
-    # num_reqs x num_draft_tokens
-    draft_token_ids: list[list[int]]
 
 
 def make_empty_encoder_model_runner_output(

@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_REUSE_RECV_BUFFER: bool = False
+    VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -878,6 +880,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Receive PP activations directly into the V2 runner's stable input arena.
+    # This stays opt-in until the target topology passes real-hardware A/B.
+    "VLLM_PP_REUSE_RECV_BUFFER": lambda: bool(
+        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER", "0"))
+    ),
+    # Validate that PP receive-buffer reuse stays on the worker's main CUDA stream.
+    "VLLM_PP_REUSE_RECV_BUFFER_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER_DEBUG", "0"))
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

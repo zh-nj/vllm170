@@ -23,6 +23,8 @@ The defaults are the measured three-card configuration:
   batches retain the upstream shape heuristic.
 - sparse-prefill caller output with K tile 32 and no additional persistent
   attention weights.
+- direct PP activation receives into the V2 runner's persistent arena; the last
+  stage also reuses that arena for DSpark auxiliary-hidden packing.
 
 Do not add `--enforce-eager`: it disables the CUDA Graph decode path and causes
 an order-of-magnitude regression on this machine. The launcher defaults to
@@ -47,6 +49,13 @@ The sparse-prefill gather workspace has a byte budget rather than assuming
 that four maximum-length requests always fit. The default is 512 MiB; override
 it with `VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB`. Setting it to zero restores
 the legacy four-request limit.
+
+The CMP170HX launcher enables `VLLM_PP_REUSE_RECV_BUFFER=1`. Set it to `0` to
+restore allocating PP receives and DSpark's dedicated hidden-state buffer.
+`VLLM_PP_REUSE_RECV_BUFFER_DEBUG=1` additionally validates generation and CUDA
+stream ownership; it is intended for validation runs rather than production.
+The library-wide default stays disabled because TP>1 and other PP topologies
+have not passed this machine's real-hardware gate.
 
 The promoted sparse kernel switches are
 `VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT=1` and

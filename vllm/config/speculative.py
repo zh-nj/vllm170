@@ -52,8 +52,7 @@ def verify_dspark_pp_layout(
     ) or getattr(draft_hf_config, "target_layer_ids", None)
     if not target_layer_ids:
         raise ValueError(
-            "DSpark+PP requires explicit dspark_target_layer_ids or "
-            "target_layer_ids."
+            "DSpark+PP requires explicit dspark_target_layer_ids or target_layer_ids."
         )
 
     num_hidden_layers = target_model_config.hf_config.num_hidden_layers
@@ -1111,16 +1110,22 @@ class SpeculativeConfig:
                     )
                 )
 
+                draft_pipeline_parallel_size = (
+                    1
+                    if self.method == "dspark"
+                    else self.target_parallel_config.pipeline_parallel_size
+                )
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        draft_pipeline_parallel_size,
                     )
                 )
                 if self.method == "dspark":
                     # The DSpark draft is instantiated only on the target's last
                     # pipeline rank and runs there as a complete model. It must not
                     # inherit the target model's pipeline partitioning.
-                    self.draft_parallel_config.pipeline_parallel_size = 1
                     verify_dspark_pp_layout(
                         self.target_model_config,
                         self.draft_model_config,
@@ -1300,13 +1305,19 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+        This is mostly a copy of the target parallel config, with independently
+        selected tensor and pipeline parallel sizes.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if pipeline_parallel_size is None
+                else pipeline_parallel_size
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,

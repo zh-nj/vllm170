@@ -100,6 +100,24 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _merge_engine_core_outputs(
+    dst: dict[int, EngineCoreOutputs], src: dict[int, EngineCoreOutputs]
+) -> None:
+    for client_index, out in src.items():
+        cur = dst.get(client_index)
+        if cur is None:
+            dst[client_index] = out
+            continue
+        cur.outputs.extend(out.outputs)
+        if out.finished_requests:
+            if cur.finished_requests:
+                cur.finished_requests |= out.finished_requests
+            else:
+                cur.finished_requests = out.finished_requests
+        if out.scheduler_stats is not None:
+            cur.scheduler_stats = out.scheduler_stats
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -167,6 +185,7 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
@@ -609,6 +628,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if model_output.draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(model_output.draft_token_ids)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -617,10 +638,40 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        if (
+            self.check_for_draft_tokens
+            and not self.use_v2_model_runner
+            and not self.async_scheduling
+            and model_executed
+        ):
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _pop_and_process_batch(
+        self,
+        batch_queue: (
+            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]
+        ),
+    ) -> dict[int, EngineCoreOutputs]:
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        if model_output.draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(model_output.draft_token_ids)
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        return engine_core_outputs
 
     def step_with_batch_queue(
         self,
@@ -693,35 +744,31 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
-
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        engine_core_outputs = self._pop_and_process_batch(batch_queue)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
+            while batch_queue and self.scheduler.has_structured_output_in_flight(
+                deferred_scheduler_output
+            ):
+                _merge_engine_core_outputs(
+                    engine_core_outputs,
+                    self._pop_and_process_batch(batch_queue),
+                )
+            assert not self.scheduler.has_structured_output_in_flight(
+                deferred_scheduler_output
+            )
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
             if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is not None:
+                draft_token_ids = (
+                    None
+                    if self.use_v2_model_runner
+                    else self.model_executor.take_draft_token_ids()
+                )
+                if self.use_v2_model_runner or draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to
                     # filter out the invalid spec tokens, which will be padded
                     # with -1 and skipped by the grammar bitmask computation.

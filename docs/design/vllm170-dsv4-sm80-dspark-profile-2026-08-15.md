@@ -20,7 +20,8 @@ DSpark 内部优化顺序为：
    Graph 固定地址，禁止增加按上下文增长的大块常驻 buffer。
 3. P0：context-KV。增加 KV-only 投影，消除被丢弃的 Q，并融合
    KV norm、RoPE、FP8 insert，复用 caller-owned 小型 scratch。
-4. P1：target logits/rejection 的 Graph 化与融合，以及严格的 acceptance 审计。
+4. P1：target logits/rejection。独立 Graph 已完成原型和实机审计，但收益不足且增加
+   PP2 常驻显存，已撤回；后续只研究不增加 Graph pool 的 verify/counts kernel 融合。
 5. P2：draft graph 内三层 backbone、Markov 和 M=7 Marlin。整个 replay 当前只有
    约 2.7 ms，必须先做隔离上限评估，不能依据 eager 细粒度值直接重写 kernel。
 
@@ -162,7 +163,7 @@ detail run 的三层合计如下：
 
 ## Target logits 与 rejection
 
-低 stage 32K/64K 的 target sampling parent 分别为 2.411/2.371 ms，其中 logits 为
+早期低 stage 32K/64K 的 target sampling parent 分别为 2.411/2.371 ms，其中 logits 为
 0.826/0.813 ms，rejection 为 1.366/1.331 ms。eager detail 将 rejection 继续拆为：
 
 | rejection 子范围 | mean |
@@ -173,9 +174,37 @@ detail run 的三层合计如下：
 | apply sampling params | 0.097 ms |
 | input views | 0.015 ms |
 
-这些范围小于 metadata/context-KV，先不引入 BF16 atomic 或放宽数学语义。后续只研究
-Graph 捕获 target logits/rejection，或在保持 greedy/probabilistic rejection 完全一致的
-前提下融合 verify 与 counts。
+这些数值是在同一 parent 内打开多层嵌套 CUDA Event 后得到的，不能作为 Graph 化的
+收益上限。P1 原型把固定 `B1/q8` 的 LM head、greedy one-hot rejection 和 counts 放进
+独立 CUDA Graph，直接读取 target FULL Graph 的持久 hidden 输出、target input buffers
+以及 DSpark 持久 request index；grammar、logprobs、非 7-token、非 B1 和需要 logits
+processing 的请求全部回退 eager。原型不复制大 logits，也不改变 seed/position 语义。
+
+连续 18 个真实 q8 round 做了 Graph/eager 同轮双算：target logits 最大逐元素差均为 0，
+`num_sampled` 和所有有效 sampled token 为 18/18 完全一致，覆盖接受 1、2、8 token 的
+情况。随后使用完全相同的 phase whitelist 重测，发现早期 2.411 ms 主要是嵌套 Event
+扰动：
+
+| P1-A 指标 | eager | target sampling Graph | 变化 |
+| --- | ---: | ---: | ---: |
+| 32K target sampling mean | 690.688 us | 672.313 us | -18.375 us / -2.66% |
+| 32K profiler-off ms/round，3 x 128 tokens | 36.720 ms | 36.624 ms | -0.096 ms / -0.26% |
+| 32K profiler-off decode tok/s | 97.643 | 97.575 | -0.07% |
+| accepted length mean | 3.641 | 3.631 | 轨迹漂移范围内 |
+| PP2 workload peak | 63,112 MiB | 63,132 MiB | +20 MiB |
+
+phase 对照为
+`profiles/deepseek_v4/p1-target-sampling-phase/20260815T011240Z`（eager）和
+`20260815T010440Z`（Graph）；生产对照为
+`profiles/deepseek_v4/p1-target-sampling-repeat/20260815T010734Z`（eager）和
+`20260815T010958Z`（Graph）；连续 parity 审计为
+`profiles/deepseek_v4/p1-target-sampling-audit/20260815T010119Z`。
+
+该方案只减少约 18 us/round，端点结果落在噪声内，却占用额外 20 MiB PP2 显存，因此
+不满足容量优先的晋级门，运行时代码和开关已撤回。后续若继续此 P1，应直接融合
+rejection verify 与 accepted/rejected counts，复用现有输出和 scratch；禁止 BF16 atomic、
+禁止为 Graph 单独保留 logits，并继续要求 greedy/probabilistic 的有效 token 与接受数
+逐轮一致。
 
 ## Draft graph 内部诊断
 
@@ -233,7 +262,7 @@ DSpark proposal 当前在每个 target prompt chunk 后都运行。32K 为 19 x 
 | P0-A | non-final prefill context-only | token/hash/KV parity；TTFT A/B/A | 不新增持久 buffer |
 | P0-B | 两组 draft metadata 公共几何复用 | metadata CUDA Event 与 32K/64K ms/round | 复用现有 Graph buffer |
 | P0-C | KV-only RoPE + quant + paged insert | cache 字节一致；32K/64K Graph A/B | 不新增 workspace |
-| P1-A | target logits/rejection Graph 化 | greedy/probabilistic acceptance parity | 固定 B1/q8 buffer |
+| P1-A | target logits/rejection Graph 化（已撤回） | 18-round parity 通过；端点无有效收益 | 实测 +20 MiB PP2，不接受 |
 | P1-B | acceptance/宽度扫描 | 同 prompt/seed 策略下 tok/s 与质量 | 计入 Graph 宽度成本 |
 | P2 | M=7 Marlin/Markov/draft layer | 整个 draft graph replay A/B | 不缓存 BF16 大权重 |
 

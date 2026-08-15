@@ -4,7 +4,10 @@
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.pp_utils import pad_sampled_tokens
+from vllm.v1.worker.gpu.pp_utils import (
+    _snapshot_draft_tokens_for_pp,
+    pad_sampled_tokens,
+)
 
 
 def test_pad_sampled_tokens_matches_fixed_collective_width():
@@ -27,3 +30,13 @@ def test_pad_sampled_tokens_rejects_collective_count_mismatch():
 
     with pytest.raises(ValueError, match="exceeds PP buffer width"):
         pad_sampled_tokens(sampled, 1)
+
+
+def test_snapshot_draft_tokens_for_pp_owns_storage():
+    draft_tokens = torch.tensor([[11, 12, 13]], dtype=torch.int64)
+
+    snapshot = _snapshot_draft_tokens_for_pp(draft_tokens)
+    draft_tokens.fill_(-1)
+
+    assert snapshot.tolist() == [[11, 12, 13]]
+    assert snapshot.data_ptr() != draft_tokens.data_ptr()

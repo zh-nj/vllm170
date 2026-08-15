@@ -120,13 +120,15 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def update_draft_token_ids_in_output(
-        self, draft_token_ids: "DraftTokenIds", scheduler_output: "SchedulerOutput"
+        self,
+        draft_token_ids: "DraftTokenIds | None",
+        scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Update scheduler output with newly generated draft token ids, applying
-        structured output grammar validation if needed.
+        """Update scheduler output with matched and grammar-valid draft ids.
 
         Args:
-            draft_token_ids: The input draft token ids for each request.
+            draft_token_ids: Legacy V1 drafts, or None to consume V2
+                batch-bound drafts already ingested from model outputs.
             scheduler_output: Update the given scheduler_output
                 with the corresponding draft token ids.
         """
@@ -194,6 +196,12 @@ class SchedulerInterface(ABC):
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
+
+    def has_structured_output_in_flight(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Return whether a scheduled grammar still waits on older output."""
+        return False
 
     @property
     @abstractmethod

@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 import torch
@@ -12,6 +13,98 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+class PPRecvBufferState(Enum):
+    FREE = "free"
+    RECEIVING = "receiving"
+    MODEL = "model"
+    DSPARK = "dspark"
+
+
+class PPRecvBufferGuard:
+    """Tracks enqueue-time ownership of a reused PP receive buffer."""
+
+    def __init__(self) -> None:
+        self._state = PPRecvBufferState.FREE
+        self._generation = 0
+        self._owner_stream: object | None = None
+
+    @property
+    def state(self) -> PPRecvBufferState:
+        return self._state
+
+    @property
+    def is_stream_tracked(self) -> bool:
+        return self._owner_stream is not None
+
+    def begin_receive(self, stream: object | None = None) -> int:
+        if self._owner_stream is not None:
+            raise RuntimeError(
+                "Cannot start a receive while the PP receive buffer still has "
+                f"owner stream {self._owner_stream}."
+            )
+        self._transition(
+            PPRecvBufferState.FREE,
+            PPRecvBufferState.RECEIVING,
+            "start a receive",
+        )
+        self._generation += 1
+        self._owner_stream = stream
+        return self._generation
+
+    def finish_receive(self, generation: int, stream: object | None = None) -> None:
+        if generation != self._generation:
+            raise RuntimeError(
+                "Stale PP receive completion for buffer generation "
+                f"{generation}; current generation is {self._generation}."
+            )
+        self._assert_stream(stream, "finish a receive")
+        self._transition(
+            PPRecvBufferState.RECEIVING,
+            PPRecvBufferState.MODEL,
+            "finish a receive",
+        )
+
+    def begin_dspark(self, stream: object | None = None) -> None:
+        self._assert_stream(stream, "start DSpark")
+        self._transition(
+            PPRecvBufferState.MODEL,
+            PPRecvBufferState.DSPARK,
+            "start DSpark",
+        )
+
+    def release(self, stream: object | None = None) -> None:
+        self._assert_stream(stream, "release the buffer")
+        if self._state not in (
+            PPRecvBufferState.MODEL,
+            PPRecvBufferState.DSPARK,
+        ):
+            raise RuntimeError(
+                f"Cannot release PP receive buffer while it is {self._state.value}."
+            )
+        self._state = PPRecvBufferState.FREE
+        self._owner_stream = None
+
+    def _assert_stream(self, stream: object | None, action: str) -> None:
+        if self._owner_stream is not None and stream != self._owner_stream:
+            raise RuntimeError(
+                f"Cannot {action} on CUDA stream {stream}; PP receive buffer "
+                f"is owned by stream {self._owner_stream}."
+            )
+
+    def _transition(
+        self,
+        expected: PPRecvBufferState,
+        new: PPRecvBufferState,
+        action: str,
+    ) -> None:
+        if self._state is not expected:
+            raise RuntimeError(
+                f"Cannot {action} while PP receive buffer is {self._state.value}; "
+                f"expected {expected.value}."
+            )
+        self._state = new
 
 
 @dataclass
@@ -67,6 +160,14 @@ def pad_sampled_tokens(
     )
     padded[:, :width] = sampled_token_ids
     return padded
+
+
+def _snapshot_draft_tokens_for_pp(draft_tokens: torch.Tensor) -> torch.Tensor:
+    return draft_tokens.to(
+        dtype=torch.int64,
+        memory_format=torch.contiguous_format,
+        copy=True,
+    )
 
 
 class PPHandler:
@@ -260,7 +361,7 @@ class PPHandler:
                 "DSpark draft-token shape must be "
                 f"[num_reqs, {expected_width}], got {tuple(draft_tokens.shape)}"
             )
-        draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        draft_tokens = _snapshot_draft_tokens_for_pp(draft_tokens)
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(

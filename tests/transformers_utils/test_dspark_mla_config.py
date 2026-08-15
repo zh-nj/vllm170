@@ -174,7 +174,20 @@ def test_dspark_pp_accepts_aux_layers_on_last_partition():
     )
     parallel = SimpleNamespace(pipeline_parallel_size=3)
 
-    verify_dspark_pp_layout(target, draft, parallel)
+    verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]
+
+
+def test_draft_parallel_config_recomputes_world_size():
+    target = ParallelConfig(
+        pipeline_parallel_size=3,
+        distributed_executor_backend="external_launcher",
+    )
+
+    draft = SpeculativeConfig.create_draft_parallel_config(target, 1, 1)
+
+    assert draft.pipeline_parallel_size == 1
+    assert draft.tensor_parallel_size == 1
+    assert draft.world_size == 1
 
 
 def test_dspark_pp_rejects_aux_layers_on_remote_partition():
@@ -185,7 +198,7 @@ def test_dspark_pp_rejects_aux_layers_on_remote_partition():
     parallel = SimpleNamespace(pipeline_parallel_size=3)
 
     with pytest.raises(ValueError, match="outside its layer partition"):
-        verify_dspark_pp_layout(target, draft, parallel)
+        verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]
 
 
 def test_dspark_pp_respects_manual_layer_partition(monkeypatch):
@@ -197,4 +210,4 @@ def test_dspark_pp_respects_manual_layer_partition(monkeypatch):
     parallel = SimpleNamespace(pipeline_parallel_size=3)
 
     with pytest.raises(ValueError, match=r"partition \[30, 43\)"):
-        verify_dspark_pp_layout(target, draft, parallel)
+        verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]

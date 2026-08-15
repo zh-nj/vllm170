@@ -39,7 +39,7 @@ class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
-        self.hidden_states = torch.zeros(
+        self.hidden_states: torch.Tensor | None = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
 
@@ -303,6 +303,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             query_start_loc_np=query_start_loc_np,
         )
 
+    def _prepare_context_hidden_states(
+        self,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_target_tokens: int,
+    ) -> torch.Tensor:
+        if aux_hidden_states:
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
+        else:
+            hidden_states = last_hidden_states
+
+        assert self.hidden_states is not None
+        context_hidden_states = self.hidden_states[:num_target_tokens]
+        context_hidden_states.copy_(hidden_states[:num_target_tokens])
+        return context_hidden_states
+
     @torch.inference_mode()
     @profile_dspark_step
     def propose(
@@ -347,14 +365,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         with phase_profile_stage(
             "draft.hidden_prepare", last_hidden_states, flow="dspark", level="stage"
         ):
-            if aux_hidden_states:
-                hidden_states = self.model.combine_hidden_states(
-                    torch.cat(aux_hidden_states, dim=-1)
-                )
-            else:
-                hidden_states = last_hidden_states
-            self.hidden_states[:num_target_tokens].copy_(
-                hidden_states[:num_target_tokens]
+            context_hidden_states = self._prepare_context_hidden_states(
+                last_hidden_states, aux_hidden_states, num_target_tokens
             )
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -362,7 +374,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                context_hidden_states,
                 self.context_positions[:num_target_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -428,10 +440,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         with phase_profile_stage(
-            "draft.context_kv", self.hidden_states, flow="dspark", level="stage"
+            "draft.context_kv", context_hidden_states, flow="dspark", level="stage"
         ):
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                context_hidden_states,
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )

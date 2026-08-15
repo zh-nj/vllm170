@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -184,6 +185,7 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
         hidden_states=None,
         aux_hidden_states=None,
         finished_req_ids=set(),
+        scheduler_step_id=0,
         num_tokens_across_dp=None,
     )
     runner.req_states = SimpleNamespace()
@@ -202,3 +204,14 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+def test_v2_execute_model_rejects_second_batch_before_sampling():
+    runner = _make_runner()
+    runner.execute_model_state = object()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"sample_tokens\(\) must be called after execute_model\(\)",
+    ):
+        runner.execute_model(SimpleNamespace(), dummy_run=False)
