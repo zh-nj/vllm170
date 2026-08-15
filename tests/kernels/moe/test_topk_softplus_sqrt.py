@@ -11,7 +11,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
-from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
+    can_use_dsv4_topk,
+    dsv4_topk,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -232,6 +235,21 @@ def test_dsv4_fast_topk(
         atol=2e-5,
         rtol=2e-5,
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="The DeepSeek V4 fast path is CUDA-only.",
+)
+def test_dsv4_fast_topk_runtime_gate(monkeypatch):
+    gating_output = torch.empty((1, 256), dtype=torch.float32, device="cuda")
+    correction_bias = torch.empty(256, dtype=torch.float32, device="cuda")
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER", "0")
+    assert not can_use_dsv4_topk(gating_output, correction_bias, 6, True, torch.int32)
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER", "1")
+    assert can_use_dsv4_topk(gating_output, correction_bias, 6, True, torch.int32)
 
 
 @pytest.mark.skipif(

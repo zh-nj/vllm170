@@ -220,6 +220,27 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
   --output /tmp/compressor-save.jsonl
 ```
 
+## Mainline DeepSeek-V4 performance audit
+
+The per-PR route audit, CMP170HX router and mHC measurements, and the async
+DSpark empty-C128 gap are documented in
+`docs/design/vllm170-dsv4-mainline-performance-audit-2026-08-15.md`.
+Reproduce the isolated mainline fusion comparison with:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  .venv/bin/python benchmarks/kernels/deepseek_v4_mainline_fusions.py \
+  --component all --m 1 8 64 1667 \
+  --warmup 3 --iterations 20 --samples 5 \
+  --output /tmp/dsv4-mainline-fusions.jsonl
+```
+
+The production default keeps the specialized DeepSeek-V4 router. Set
+`VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER=0` only for a controlled generic-router
+A/B; the switch is not a promoted deployment setting. Mainline's host-side
+empty-C128 skip cannot safely use optimistic sequence lengths in async DSpark.
+It remains a GPU-side exact-boundary optimization target.
+
 The harness watches both the workload and server processes. If model loading
 fails, it exits immediately with the server log instead of waiting for the
 health-check timeout.

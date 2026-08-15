@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -20,7 +21,8 @@ def can_use_dsv4_topk(
     indices_dtype: torch.dtype,
 ) -> bool:
     return (
-        current_platform.is_cuda()
+        envs.VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER
+        and current_platform.is_cuda()
         and gating_output.dtype == torch.float32
         and gating_output.ndim == 2
         and gating_output.shape[1] in (256, 384)
