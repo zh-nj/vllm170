@@ -82,6 +82,119 @@ def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
     assert torch.isfinite(tuned).all()
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("num_queries", [1, 2, 4, 8])
+def test_sparse_decode_split_and_caller_output_match(
+    monkeypatch, num_queries: int
+) -> None:
+    from vllm.models.deepseek_v4.common.ops import quantize_and_insert_k_cache
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+        rocm_sparse_attn_decode,
+    )
+    from vllm.v1.worker import workspace
+
+    num_heads, head_dim = 64, 512
+    block_size, main_len, extra_len = 256, 128, 64
+    num_rows = 1024
+    torch.manual_seed(23)
+    q = torch.randn(
+        num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+
+    def make_cache() -> torch.Tensor:
+        cache = torch.zeros(4, block_size, 584, dtype=torch.uint8, device="cuda")
+        values = torch.randn(num_rows, head_dim, dtype=torch.bfloat16, device="cuda")
+        slots = torch.arange(num_rows, dtype=torch.int64, device="cuda")
+        quantize_and_insert_k_cache(values, cache, slots, block_size)
+        return cache
+
+    main_cache = make_cache()
+    extra_cache = make_cache()
+    main_indices = torch.arange(
+        num_queries * main_len, dtype=torch.int32, device="cuda"
+    ).remainder_(num_rows)
+    main_indptr = torch.arange(
+        0,
+        (num_queries + 1) * main_len,
+        main_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    extra_indices = torch.arange(
+        num_queries * extra_len, dtype=torch.int32, device="cuda"
+    ).remainder_(num_rows)
+    extra_indptr = torch.arange(
+        0,
+        (num_queries + 1) * extra_len,
+        extra_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    sink = torch.randn(num_heads, dtype=torch.float32, device="cuda")
+    scale = head_dim**-0.5
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "0")
+    reference = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=sink,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+    )
+
+    manager = workspace.WorkspaceManager(torch.device("cuda"))
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1")
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "1")
+    output = torch.full_like(q, float("nan"))
+    swa_indices = torch.zeros(num_queries, 1, 1, dtype=torch.int32, device="cuda")
+    main_lens = torch.full((num_queries,), main_len, dtype=torch.int32, device="cuda")
+    extra_lens = torch.full((num_queries,), extra_len, dtype=torch.int32, device="cuda")
+
+    def candidate() -> None:
+        rocm_sparse_attn_decode(
+            q=q,
+            kv_cache=extra_cache,
+            swa_k_cache=main_cache,
+            swa_only=False,
+            topk_indices=None,
+            topk_lens=extra_lens,
+            swa_indices=swa_indices,
+            swa_lens=main_lens,
+            swa_ragged_indices=main_indices,
+            swa_ragged_indptr=main_indptr,
+            topk_ragged_indices=extra_indices,
+            topk_ragged_indptr=extra_indptr,
+            attn_sink=sink,
+            scale=scale,
+            head_dim=head_dim,
+            nope_head_dim=448,
+            rope_head_dim=64,
+            output=output,
+        )
+
+    candidate()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(output).all()
+    manager.lock()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidate()
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("non_causal", [False, True])
 @torch.inference_mode()
 def test_direct_swa_ragged_matches_dense_pack(non_causal: bool) -> None:

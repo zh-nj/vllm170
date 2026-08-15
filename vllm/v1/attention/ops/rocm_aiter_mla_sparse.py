@@ -2044,6 +2044,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -2105,14 +2106,25 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     block_h = 16
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    if output is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert output.shape == q.shape
+        assert output.dtype == torch.bfloat16 and output.device == q.device
+        assert output.stride(-1) == 1
+        out = output
     heads_blocks = triton.cdiv(num_heads, block_h)
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
     fp8_lut = get_e4m3fn_bf16_lut(q.device)
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    use_sm80_split = (
+        envs.VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+    )
+    if not (_ON_GFX942 or _ON_GFX950 or use_sm80_split):
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2150,7 +2162,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         )
         return out
 
-    block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
+    block_k = 32
     # Average per-query segment lengths, read sync-free from the ragged index
     # sizes, let the split heuristic avoid over-splitting
     # main_indices/extra_indices are flat [nnz] int32.
@@ -2161,17 +2173,31 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
     )
 
-    part_m = torch.empty(
-        (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+    part_shapes = (
+        ((num_queries, num_splits, num_heads), torch.float32),
+        ((num_queries, num_splits, num_heads), torch.float32),
+        ((num_queries, num_splits, num_heads, comb_dim), torch.float32),
     )
-    part_l = torch.empty_like(part_m)
-    part_acc = torch.empty(
-        (num_queries, num_splits, num_heads, comb_dim),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if use_sm80_split:
+        part_m, part_l, part_acc = current_workspace_manager().get_simultaneous(
+            *part_shapes
+        )
+        if num_queries == 1:
+            partial_block_h, block_k, partial_num_warps = 8, 16, 4
+            reduce_block_h, reduce_num_warps = 1, 8
+        else:
+            partial_block_h, partial_num_warps = 16, 8
+            reduce_block_h = 2 if num_queries >= 8 else 1
+            reduce_num_warps = 4
+    else:
+        part_m = torch.empty(part_shapes[0][0], dtype=torch.float32, device=q.device)
+        part_l = torch.empty(part_shapes[1][0], dtype=torch.float32, device=q.device)
+        part_acc = torch.empty(part_shapes[2][0], dtype=torch.float32, device=q.device)
+        partial_block_h, partial_num_warps = 16, 4
+        reduce_block_h, reduce_num_warps = 1, 4
 
-    _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](
+    partial_heads_blocks = triton.cdiv(num_heads, partial_block_h)
+    _sparse_attn_decode_partial_kernel[(num_queries, num_splits, partial_heads_blocks)](
         q,
         main_cache,
         main_indices,
@@ -2208,14 +2234,15 @@ def _rocm_sparse_attn_decode_ragged_triton(
         # wrong FNUZ/OCP scale ratio (~1.87×).
         IS_FNUZ_MAIN=is_fnuz,
         IS_FNUZ_EXTRA=False,
-        BLOCK_H=block_h,
+        BLOCK_H=partial_block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
         NUM_STAGES=1,
-        num_warps=4,
+        num_warps=partial_num_warps,
     )
 
-    _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
+    reduce_heads_blocks = triton.cdiv(num_heads, reduce_block_h)
+    _sparse_attn_decode_reduce_kernel[(num_queries, reduce_heads_blocks)](
         part_m,
         part_l,
         part_acc,
@@ -2231,10 +2258,10 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_heads,
         HAS_ATTN_SINK=has_attn_sink,
         COMB_DIM=comb_dim,
-        BLOCK_H=1,
+        BLOCK_H=reduce_block_h,
         NUM_SPLITS=num_splits,
         SPLITS_PAD=triton.next_power_of_2(num_splits),
-        num_warps=4,
+        num_warps=reduce_num_warps,
     )
     return out
 
@@ -2255,6 +2282,7 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -2290,6 +2318,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        output=output,
     )
 
 
@@ -2396,6 +2425,9 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
+    caller_output = (
+        output if envs.VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT else None
+    )
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,
@@ -2412,5 +2444,7 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        output=caller_output,
     )
-    output.copy_(attn_out.to(output.dtype))
+    if caller_output is None:
+        output.copy_(attn_out.to(output.dtype))

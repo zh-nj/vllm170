@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = False
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
+    VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT: bool = False
+    VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT: bool = False
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = False
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = False
@@ -1090,6 +1092,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Hardware-specific sparse prefill K tile. Zero retains the backend default.
     "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "0"))
     ),
     "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "0"))

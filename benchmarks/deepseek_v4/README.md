@@ -55,6 +55,14 @@ path and backend tile. BF16 `wo_b` and indexer `wq_b` caches were measured but
 removed from serving because they add 960 MiB to PP0/PP1 or about 112 MiB per
 rank. Persistent attention memory is reserved for long-context capacity.
 
+The CMP170HX launcher also enables the SM80 sparse-decode split path and direct
+caller output with `VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT=1` and
+`VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT=1`. The split count adapts to the
+query count and indexed history length; its FP32 partials reuse the existing
+workspace and require about 2.01 MiB at the measured q1/q8 production shapes.
+Set either switch to `0` for an independent rollback. Other GPU families keep
+their existing backend route, and the library-wide defaults remain disabled.
+
 ## PP3 phase profile
 
 The canonical profile runs a same-context warmup, then opens one measurement
@@ -211,6 +219,10 @@ isolated sparse and FP8-linear sweeps with:
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
   benchmarks/kernels/deepseek_v4_sparse_mla_prefill.py \
   --output /tmp/sparse-mla.jsonl
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/kernels/deepseek_v4_sparse_mla_decode.py \
+  --queries 8 --main-len 128 --extra-len 512 --splits 2 \
+  --output /tmp/sparse-mla-decode.jsonl
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
   benchmarks/kernels/deepseek_v4_output_projection.py \
   --m 1 6 64 256 1000 1666 1667 2000 \

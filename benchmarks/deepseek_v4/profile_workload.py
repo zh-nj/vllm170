@@ -305,6 +305,12 @@ def build_result(
         "sparse_prefill_block_k": int(
             os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
         ),
+        "sparse_decode_caller_output": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "0"))
+        ),
+        "sparse_decode_split": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "0"))
+        ),
         "direct_ragged_swa": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
         ),

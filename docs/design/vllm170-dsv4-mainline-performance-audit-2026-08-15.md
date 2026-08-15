@@ -19,11 +19,11 @@ cherry-pick，而是核对每项优化在当前 PP3/SM80/异步 DSpark 路线中
 - 已生效并应保留：短上下文跳过 indexer、eager workspace 复用、adaptive
   top-k width、紧凑 KV packing、mHC broadcast、fused top-k bias。
 - 已由本分支等价或更适合 SM80 的实现覆盖：caller-owned sparse prefill
-  output、adaptive split decode、one-head reducer、ROCm sparse prefill 中的
-  `num_warps=4`、预取与小 `BLOCK_K` 思路。
+  output、重新实测后晋升的 SM80 adaptive split decode/caller output、ROCm
+  sparse prefill 中的 `num_warps=4`、预取与小 `BLOCK_K` 思路。
 - 已进入代码但当前拓扑不生效：sequence parallel、FlashInfer q-head
   unpadding、MXFP4 indexer cache，以及异步 DSpark 下的 CPU-side empty-C128
-  skip。
+  skip。empty-C128 的 GPU 融合原型已经完成实机否决，不进入运行时代码。
 - 不应直接迁移：ROCm/XPU 专用 kernel 和 DSpark 模型实现。只吸收算法结构，
   不能把 gfx942/gfx950/XPU launch 配置搬到 SM80。
 
@@ -32,7 +32,7 @@ cherry-pick，而是核对每项优化在当前 PP3/SM80/异步 DSpark 路线中
 | PR | 主线优化 | 当前状态 | CMP170HX 决策 |
 | --- | --- | --- | --- |
 | #46789 | sequence parallel | 代码已在树中；只在 PP=1、EP、TP>1 且满足 MegaMoE/DP 条件时启用 | PP3/TP1 不生效；不为当前拓扑改路由 |
-| #48957 | 跳过没有 C128 边界的 compressor launch | eager 同步路径可用；异步 DSpark 会清空精确 CPU start，因此当前 decode 不生效 | P0 研究 GPU 精确边界门控；禁止使用乐观 CPU 长度替代 |
+| #48957 | 跳过没有 C128 边界的 compressor launch | eager 同步路径可用；异步 DSpark 会清空精确 CPU start，因此当前 decode 不生效 | GPU q8 融合原型在 FULL Graph 端点退化 1.74%，已撤回；保留现状 |
 | #49486 | candidate 数不超过 top-k 时跳过 Q/router/top-k | 已生效；C4 `topk=512` 时覆盖原始上下文不超过 2048 的 chunk | 保留；5K prefill 仅首 chunk 命中，不是长上下文 steady-state 解法 |
 | #49236 | eager scratch/workspace 复用 | `DeepseekV4EagerScratchPool` 已覆盖 Q、indexer、global top-k、compressor scratch | 保留；后续扩展必须复用/overlay，不能增加长期大 buffer |
 | #50298 | FlashMLA combined-indices caller output | 当前不是 FlashMLA；本分支 sparse prefill 已有 caller-output 等价路径 | 不迁移 FlashMLA 代码；继续维护现有 SM80 Triton 路径 |
@@ -45,16 +45,17 @@ cherry-pick，而是核对每项优化在当前 PP3/SM80/异步 DSpark 路线中
 | #48137 | 去除首层 repeat/copy 的 mHC broadcast | 当前 NVIDIA SM80 路径已生效 | CMP170HX micro 1.24x–3.22x，保留 |
 | #47718 | ROCm HCA prefill 两阶段 compressor | 当前 `_prefer_two_stage_compressor()` 只允许 ROCm | 算法候选；只有 profiler 证明 compressor 重回 P0 才写 SM80 原型 |
 | #48519 | ROCm sparse prefill 优化 | SM80 后端已吸收 warps=4、预取、小 BLOCK_K 等同类策略 | 不复制 ROCm kernel；继续基于本分支 C4/C128 A/B |
-| #48788 | gfx950 sparse decode reducer occupancy | 当前 SM80 custom decode 已有 one-head reducer | 视为算法已重实现；用 CMP shape 扫描，不复制 gfx950 参数 |
-| #46275 | gfx942 split sparse decode | 当前 SM80 custom decode 已有 adaptive split | 视为算法已重实现；保留短/长上下文分界 A/B |
+| #48788 | gfx950 sparse decode reducer occupancy | 原有 partial/reducer 只对 gfx942/gfx950 开放；SM80 实际走未 split fallback | 已在 CMP 上重扫 reducer `BLOCK_H/warps`，以 SM80 shape 表重实现 |
+| #46275 | gfx942 split sparse decode | 原有 adaptive split 未覆盖 SM80 | 已复用算法和 cost model、重扫 launch shape；PP3 32K `ms/round` 改善 9.34% |
 | #47419 | AMD DSpark | 平台移植代码，不是 NVIDIA kernel 优化 | 不吸收实现；仅对照 DSpark 阶段契约和 acceptance 计量 |
 | #47677 | XPU DSpark | 平台移植代码，含 XPU HCHead/MHCPost | 不吸收实现；仅核对 aux hidden-state 和 proposal 接口 |
 
-## P0：异步 DSpark 下的 empty-C128 gap
+## P0 已验证：异步 DSpark 下的 empty-C128 不晋升
 
 主线 #48957 依赖 `CommonAttentionMetadata._num_computed_tokens_cpu` 得到每个
 请求的精确起点，然后在本 chunk 不跨越 128-token 边界时跳过
-`save_partial_states` 和 `compress_norm_rope_store`。
+`compress_norm_rope_store`。它仍然先执行 `save_partial_states`；早期审计中“两个
+kernel 都跳过”的表述不准确，本轮已按原始提交 `37e370fe9` 校正。
 
 当前异步推测解码中，GPU tensor 才是 authoritative state，runner 会把
 `_num_computed_tokens_cpu` 设为 `None`。因此 `_get_c128_boundary()` 返回
@@ -63,14 +64,75 @@ cherry-pick，而是核对每项优化在当前 PP3/SM80/异步 DSpark 路线中
 140 次调用，说明 decode 没有得到该收益。
 
 不能改用 `seq_lens_cpu_upper_bound`：异步 rejection 后它是乐观上界，
-`mod 128` 边界不保持单调，误跳过会漏写 C128 cache。安全的下一步是：
+`mod 128` 边界不保持单调，误跳过会漏写 C128 cache。本轮实现了一个实验性
+Triton 原型：仅在 Ampere、FULL Graph、C128、`max_query_len<=8` 时，每个请求用
+一个 program 串行写入本轮 partial states，再直接读取 GPU `positions` 判断是否压缩。
+它不做 host sync，也不申请 workspace。
 
-1. 在 GPU authoritative token state 上计算每行是否跨 C128 边界；
-2. 将有效行 compact 后只 launch 有效工作，或把边界 predicate 融入现有
-   save/compress kernel；
-3. Graph capture 固定 workspace，不做 host sync，不增加常驻大 buffer；
-4. 用真实 32K DSpark-7 对照 cache、tokens、acceptance、ms/round 和每层 launch
-   count，再决定是否推广。
+局部正确性覆盖单请求、多请求、命中/不命中边界；state 和 KV cache 均逐字节
+一致。进一步把两个版本各自捕获为 CUDA Graph，从 32K 起连续重放 64 个 q8 round、
+共 512 token，每轮 state/cache 都逐字节一致。
+
+但生产形态否决了这个结构。下表为 CMP170HX 单层 micro，`speedup = baseline / fused`：
+
+| q | 边界 | eager baseline/fused | eager speedup | Graph baseline/fused | Graph speedup |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 否 | 89.364/54.129 us | 1.651x | 5.448/4.116 us | 1.323x |
+| 1 | 是 | 223.160/182.333 us | 1.224x | 176.722/181.504 us | 0.974x |
+| 8 | 否 | 84.285/50.381 us | 1.673x | 4.731/6.472 us | 0.731x |
+| 8 | 是 | 190.720/186.163 us | 1.024x | 187.771/185.457 us | 1.012x |
+
+eager 的 1.67x 来自减少 Python/driver launch 间隙，不能外推到生产 FULL Graph。
+真实 target 是 q8；Graph 已消除大部分 host launch 成本，而融合 kernel 串行写 8 行
+partial state，空边界时反而慢 1.74 us/层。
+
+32K、512 输出 token、3 repeats 的 PP3 A/B/A 只改变该原型开关：
+
+| 路线 | ms/round mean | accepted length mean | TTFT mean | PP0/PP1/PP2 workload peak |
+| --- | ---: | ---: | ---: | ---: |
+| baseline A1 | 39.266 ms | 6.035 | 5.854 s | 58272/57360/63044 MiB |
+| fused B | 39.754 ms | 4.691 | 5.821 s | 58272/57360/63044 MiB |
+| baseline A2 | 38.885 ms | 5.885 | 5.842 s | 58272/57360/63044 MiB |
+
+B 相对 A1/A2 合并均值 39.076 ms 退化 1.74%。accepted length 的差异不能单独
+证明语义回归，但逐轮 cache parity 已排除原型的确定性字节漂移；性能退化本身已足以
+否决。实验 kernel、路由、环境开关和测试均已撤回，不保留死代码。
+
+原始产物：
+
+- `profiles/deepseek_v4/p0-c128-fused-decode/baseline-a1/20260815T135823Z`
+- `profiles/deepseek_v4/p0-c128-fused-decode/candidate-b/20260815T140213Z`
+- `profiles/deepseek_v4/p0-c128-fused-decode/baseline-a2/20260815T140457Z`
+
+## P1 已晋升：SM80 adaptive split sparse decode
+
+审计校正了一个关键现状：当前文件中虽然已有 adaptive split cost model、partial
+kernel 和 reducer，但运行路由只允许 gfx942/gfx950。CMP170HX/SM80 一直进入单
+kernel、未 split fallback，不能视作“已经生效”。本轮保留算法结构，在 SM80 上
+重新扫描 q1/q2/q4/q8 的 partial `BLOCK_H/BLOCK_K/warps` 和 reducer
+`BLOCK_H/warps`，并把约 2.01 MiB FP32 partials overlay 到既有 workspace。
+
+固定 CUDA Graph micro 中，SWA128+C4 top-512 的 q1/q2/q4/q8 split 组合相对
+fallback 分别为 7.30x、6.46x、4.28x、3.09x；q8 C128 与 SWA-only 分别为
+2.97x、2.42x。最大绝对误差不超过 2.44e-4。让 reducer 直接写 caller output
+进一步省 1.74-2.16 us/层，不增加常驻显存。
+
+32K、512 输出 token、3 repeats 的组合候选为 35.525 ms/round；A1/A2 六次
+基线均值为 39.184 ms/round，改善 9.34%。split-only 也改善 7.16%。候选的
+PP0/PP1/PP2 工作负载峰值为 58274/57360/63036 MiB，对比基线
+58272/57360/63044 MiB，仅 PP0 可见约 2 MiB workspace 增量。正确性覆盖
+q1/q2/q4/q8、锁定 workspace 和 CUDA Graph replay。
+
+CMP170HX 启动器已默认启用：
+
+```text
+VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT=1
+VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT=1
+```
+
+库级默认和其他架构路由不变，两个开关均可独立回滚。完整 shape 表、A/B/A、
+产物和测量限制见
+`docs/design/vllm170-dsv4-sm80-sparse-decode-p1-2026-08-15.md`。
 
 ## Router 与 mHC 的 CMP170HX 审计
 
@@ -151,15 +213,32 @@ VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER=0 \
 
 ## 后续顺序
 
-1. P0：GPU-side exact C128 boundary compact/fusion 原型，目标是异步 DSpark
-   decode 的空 launch；不允许 host sync 或大常驻 workspace。
-2. P1：把紧凑 MXFP4 indexer cache 作为容量专题独立 A/B，验 top-k 集合、
+1. P1：把紧凑 MXFP4 indexer cache 作为容量专题独立 A/B，验 top-k 集合、
    acceptance、长上下文正确性和每 PP rank 显存，不能只验 kernel latency。
-3. P1：基于现有 SM80 sparse kernel 扫描 decode split/reducer 与 prefill
-   `BLOCK_K/warps`，禁止照搬 ROCm 参数。
-4. P2：只有 compressor 再次成为 phase P0 时，研究两阶段 HCA compressor；
+2. P2：继续研究 attention output projection 的低驻留融合/低精度路径，不能用
+   960 MiB/PP0、PP1 的 BF16 weight cache 换取延迟。
+3. P2：只有 compressor 再次成为 phase P0 时，研究两阶段 HCA compressor；
    默认不新增常驻 buffer。
 
 所有 promotion 都必须使用相同模型、prompt hash、PP3 分区、DSpark width、
 max-batched-tokens 和 cache 配置做 A/B/A，并同时报告 TTFT、ms/round、
 acceptance、输出 hash 与各 rank 峰值显存。
+
+### MXFP4 容量路线的 SM80 前置门
+
+本轮已额外执行到编译门，不把“主线已有 68B row”误写成 SM80 可直接启用。现有
+Triton MXFP4 Q 量化在 CMP170HX 上被 `ptxas` 明确拒绝：
+
+```text
+Instruction 'cvt with .e2m1x2' not supported on .target 'sm_80'
+```
+
+此外，当前无 DeepGEMM 的 SM80 Triton indexer 只实现 FP8 prefill/paged logits。
+因此独立 backend 至少需要：软件 RTNE E2M1 Q/K 编码、MXFP4 prefill logits、
+MXFP4 paged decode logits，随后才能解除模型选择器、metadata builder 和 indexer
+fallback 的三道 fail-closed 检查。
+
+当前 `15,15,13` 分区每 rank 有 7 个 C4 indexer 层。132B→68B row 在 131K
+上下文约节省 14 MiB/rank，在 1M 约节省 112 MiB/rank。容量收益真实但不足以接受
+全量 BF16 反量化临时 buffer 或未经真实 logits/top-k/acceptance 验证的捷径；留给
+1M 上下文专题重新实现。
