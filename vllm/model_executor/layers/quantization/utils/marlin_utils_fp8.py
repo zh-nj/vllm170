@@ -179,6 +179,23 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
 
+    if getattr(layer, "discard_quantized_weight_after_bmm_cache", False):
+        assert hasattr(layer, "bmm_weight_bf16")
+        replace_parameter(
+            layer,
+            "weight",
+            torch.empty(0, dtype=layer.weight.dtype, device=device),
+        )
+        for scale_name in ("weight_scale", "weight_scale_inv"):
+            if hasattr(layer, scale_name):
+                scale = getattr(layer, scale_name)
+                replace_parameter(
+                    layer,
+                    scale_name,
+                    torch.empty(0, dtype=scale.dtype, device=device),
+                )
+        return
+
     # WORKSPACE
     layer.workspace = marlin_make_workspace_new(
         device, existing=getattr(layer, "workspace", None)

@@ -23,6 +23,8 @@ The defaults are the measured three-card configuration:
   batches retain the upstream shape heuristic.
 - sparse-prefill caller output with K tile 32 and no additional persistent
   attention weights.
+- BMM-only `wo_a` ownership: the grouped BF16 weight remains, while its unused
+  packed FP8 linear duplicate is released after loading.
 - direct PP activation receives into the V2 runner's persistent arena; the last
   stage also reuses that arena for DSpark auxiliary-hidden packing.
 
@@ -63,6 +65,10 @@ The promoted sparse kernel switches are
 path and backend tile. BF16 `wo_b` and indexer `wq_b` caches were measured but
 removed from serving because they add 960 MiB to PP0/PP1 or about 112 MiB per
 rank. Persistent attention memory is reserved for long-context capacity.
+The `wo_a` path instead removes an unused representation: set
+`VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A=0` to restore the packed FP8 duplicate for an
+audit run. The default PP3 partition saves roughly 487.5 MiB on PP0/PP1 and
+422.5 MiB on PP2 without changing the projection kernel.
 
 The CMP170HX launcher also enables the SM80 sparse-decode split path and direct
 caller output with `VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT=1` and

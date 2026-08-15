@@ -66,7 +66,8 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& perm_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
-    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
+    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+    int64_t thread_k, int64_t thread_n, int64_t num_threads, int64_t sms) {
   STD_TORCH_CHECK_NOT_IMPLEMENTED(false,
                                   "marlin_gemm(..) requires CUDA_ARCH >= 7.5");
   return torch::stable::empty({1, 1});
@@ -331,8 +332,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& s_type, bool has_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k_init,
-               int thread_n_init, int sms, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               int thread_n_init, int num_threads_init, int sms,
+               bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
   bool is_a_8bit = a_type.size_bits() == 8;
   STD_TORCH_CHECK(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [",
                   prob_m, ", ", prob_n, ", ", prob_k, "]");
@@ -440,8 +441,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     // Set thread config
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
-    if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+    if (thread_k != -1 && thread_n != -1 && num_threads_init != -1) {
+      thread_tfg = thread_config_t{thread_k, thread_n, num_threads_init};
       exec_cfg = exec_config_t{1, thread_tfg};
       STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                       " is not divisible by thread_n = ", thread_n);
@@ -554,7 +555,8 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& perm_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
-    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
+    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+    int64_t thread_k, int64_t thread_n, int64_t num_threads, int64_t sms) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_scalar_type = a.scalar_type();
@@ -677,16 +679,19 @@ torch::stable::Tensor marlin_gemm(
         "the a_scales parameter must be passed for 8bit activation.");
   }
 
-  // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
-  // auto -1)
-  int thread_k = -1;
-  // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
-  // auto -1)
-  int thread_n = -1;
-  // sms: number of SMs to use for the kernel
-  int sms = -1;
   const int32_t device_index = a.get_device_index();
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_index);
+  int device_sms = -1;
+  cudaDeviceGetAttribute(&device_sms, cudaDevAttrMultiProcessorCount,
+                         device_index);
+  STD_TORCH_CHECK(
+      (thread_k == -1 && thread_n == -1 && num_threads == -1) ||
+          (thread_k > 0 && thread_n > 0 &&
+           (num_threads == 128 || num_threads == 256)),
+      "thread_k, thread_n, and num_threads must either all be auto (-1) or "
+      "specify a supported 128/256-thread configuration");
+  if (sms == -1) sms = device_sms;
+  STD_TORCH_CHECK(sms > 0 && sms <= device_sms, "sms = ", sms,
+                  " must be in [1, ", device_sms, "]");
 
   // Alloc buffers
   torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -887,8 +892,8 @@ torch::stable::Tensor marlin_gemm(
       a_tmp.mutable_data_ptr(), size_m, size_n, size_k, a.stride(0),
       workspace.mutable_data_ptr(), a_type, b_type, c_type, s_type, has_bias,
       has_act_order, is_k_full, has_zp, num_groups, group_size, device_index,
-      get_current_cuda_stream(device_index), thread_k, thread_n, sms,
-      use_atomic_add, use_fp32_reduce, is_zp_float);
+      get_current_cuda_stream(device_index), thread_k, thread_n, num_threads,
+      sms, use_atomic_add, use_fp32_reduce, is_zp_float);
 
   return c;
 }

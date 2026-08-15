@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = False
     VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER: bool = True
+    VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A: bool = True
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
@@ -1136,6 +1137,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A", "1"))
     ),
     "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN", "0")

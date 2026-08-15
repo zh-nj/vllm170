@@ -274,6 +274,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+        self.wo_a.discard_quantized_weight_after_bmm_cache = (
+            envs.VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A
+        )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,

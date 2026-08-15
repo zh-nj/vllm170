@@ -1217,6 +1217,10 @@ def marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    thread_k: int = -1,
+    thread_n: int = -1,
+    num_threads: int = -1,
+    sms: int = -1,
 ) -> torch.Tensor:
     return torch.ops._C.marlin_gemm(
         a,
@@ -1238,6 +1242,10 @@ def marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        thread_k,
+        thread_n,
+        num_threads,
+        sms,
     )
 
 
@@ -1264,6 +1272,10 @@ if hasattr(torch.ops._C, "marlin_gemm"):
         use_atomic_add: bool = False,
         use_fp32_reduce: bool = False,
         is_zp_float: bool = False,
+        thread_k: int = -1,
+        thread_n: int = -1,
+        num_threads: int = -1,
+        sms: int = -1,
     ) -> torch.Tensor:
         dtype = a.dtype
         if dtype not in [torch.half, torch.bfloat16]:

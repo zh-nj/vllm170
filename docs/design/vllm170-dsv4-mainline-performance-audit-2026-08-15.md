@@ -215,8 +215,10 @@ VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER=0 \
 
 1. P1：把紧凑 MXFP4 indexer cache 作为容量专题独立 A/B，验 top-k 集合、
    acceptance、长上下文正确性和每 PP rank 显存，不能只验 kernel latency。
-2. P2：继续研究 attention output projection 的低驻留融合/低精度路径，不能用
-   960 MiB/PP0、PP1 的 BF16 weight cache 换取延迟。
+2. P2 已晋升：`wo_a` BMM cache 成为唯一 weight owner，释放从未进入 forward 的
+   packed FP8 linear 表示。5K PP3 A/B/A 中 PP0/PP1 workload peak 各下降
+   486 MiB，TTFT 变化仅 +0.10%，且没有新增 buffer。完整证据见
+   `docs/design/vllm170-dsv4-sm80-output-projection-p2-2026-08-15.md`。
 3. P2：只有 compressor 再次成为 phase P0 时，研究两阶段 HCA compressor；
    默认不新增常驻 buffer。
 
