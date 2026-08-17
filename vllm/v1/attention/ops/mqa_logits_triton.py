@@ -501,6 +501,7 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -512,6 +513,7 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke: [M] int32
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+        logits_out: optional caller-owned float32 output with shape `[M, N]`.
     Returns:
         logits:       [M, N] float32
     """
@@ -522,6 +524,7 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ks,
         cu_seqlen_ke,
         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
+        logits_out=logits_out,
     )
 
 
@@ -532,6 +535,7 @@ def _fp8_mqa_logits_triton_impl(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
     return _fp8_mqa_logits_bf16_impl(
@@ -542,6 +546,7 @@ def _fp8_mqa_logits_triton_impl(
         cu_seqlen_ks,
         cu_seqlen_ke,
         kv_group,
+        logits_out=logits_out,
     )
 
 
@@ -553,6 +558,7 @@ def _fp8_mqa_logits_bf16_impl(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_scales = k_scales.reshape(-1)
 
@@ -562,7 +568,12 @@ def _fp8_mqa_logits_bf16_impl(
     # The grid covers every (m, n_block) and each tile stores its full row
     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
     # is accepted for DeepGEMM signature parity only.
-    logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    if logits_out is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+    else:
+        if logits_out.shape != (M, N) or logits_out.dtype != torch.float32:
+            raise ValueError("logits_out must have shape (M, N) and dtype float32")
+        logits = logits_out
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -600,6 +611,24 @@ def _fp8_mqa_logits_bf16_impl(
     return logits
 
 
+@triton.jit
+def _prepare_streaming_tile_kernel(
+    row_starts_ptr,
+    row_ends_ptr,
+    tile_starts_ptr,
+    tile_ends_ptr,
+    tile_offset,
+    tile_width,
+):
+    row = tl.program_id(0)
+    row_start = tl.load(row_starts_ptr + row)
+    row_end = tl.load(row_ends_ptr + row)
+    local_start = tl.maximum(0, tl.minimum(row_start - tile_offset, tile_width))
+    local_end = tl.maximum(0, tl.minimum(row_end - tile_offset, tile_width))
+    tl.store(tile_starts_ptr + row, local_start)
+    tl.store(tile_ends_ptr + row, local_end)
+
+
 def fp8_mqa_logits_streaming_topk_triton(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -627,55 +656,66 @@ def fp8_mqa_logits_streaming_topk_triton(
         )
 
     q_bf16 = q.to(torch.bfloat16)
-    best_scores = torch.full(
-        (M, topk), float("-inf"), dtype=torch.float32, device=q.device
+    best_scores = torch.empty((M, topk), dtype=torch.float32, device=q.device)
+    next_scores = torch.empty_like(best_scores)
+    best_indices = torch.empty((M, topk), dtype=torch.int32, device=q.device)
+    next_indices = torch.empty_like(best_indices)
+    tile_width_max = min(tile_size, N)
+    k_bf16 = torch.empty(
+        (tile_width_max, k_fp8.shape[1]), dtype=torch.bfloat16, device=q.device
     )
-    best_indices = torch.full((M, topk), -1, dtype=torch.int32, device=q.device)
+    tile_logits_storage = torch.empty(
+        (M, tile_width_max), dtype=torch.float32, device=q.device
+    )
+    tile_starts = torch.empty(M, dtype=torch.int32, device=q.device)
+    tile_ends = torch.empty_like(tile_starts)
+    kv_group = _select_prefill_kv_group(M, N)
+    if tile_width_max < _PREFILL_BLOCK_N * kv_group:
+        kv_group = 1
 
     for tile_start in range(0, N, tile_size):
         tile_end = min(tile_start + tile_size, N)
         tile_width = tile_end - tile_start
-        tile_starts = (cu_seqlen_ks - tile_start).clamp(0, tile_width).contiguous()
-        tile_ends = (cu_seqlen_ke - tile_start).clamp(0, tile_width).contiguous()
+        _prepare_streaming_tile_kernel[(M,)](
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            tile_starts,
+            tile_ends,
+            tile_start,
+            tile_width,
+            num_warps=4,
+        )
+        k_bf16_slice = k_bf16[:tile_width]
+        k_bf16_slice.copy_(k_fp8[tile_start:tile_end])
+        tile_logits = tile_logits_storage[:, :tile_width]
         tile_logits = _fp8_mqa_logits_bf16_impl(
             q_bf16,
-            k_fp8[tile_start:tile_end].to(torch.bfloat16),
+            k_bf16_slice,
             k_scales[tile_start:tile_end],
             weights,
             tile_starts,
             tile_ends,
-            kv_group=1,
+            kv_group=kv_group,
+            logits_out=tile_logits,
         )
-        tile_indices = torch.full((M, topk), -1, dtype=torch.int32, device=q.device)
-        torch.ops._C.top_k_per_row_prefill(
+        torch.ops._C.top_k_per_row_prefill_update_candidates(
             tile_logits,
             tile_starts,
             tile_ends,
-            tile_indices,
+            cu_seqlen_ks,
+            best_scores,
+            best_indices,
+            next_scores,
+            next_indices,
+            tile_start,
             M,
             tile_logits.stride(0),
             tile_logits.stride(1),
             topk,
+            tile_start > 0,
         )
-        valid = tile_indices >= 0
-        tile_absolute_indices = tile_indices + tile_starts[:, None]
-        safe_indices = tile_absolute_indices.clamp(min=0, max=tile_width - 1).to(
-            torch.int64
-        )
-        tile_scores = tile_logits.gather(1, safe_indices).masked_fill(
-            ~valid, float("-inf")
-        )
-        row_relative_offset = tile_start + tile_starts - cu_seqlen_ks
-        row_relative_indices = torch.where(
-            valid,
-            tile_indices + row_relative_offset[:, None],
-            tile_indices,
-        )
-
-        candidate_scores = torch.cat((best_scores, tile_scores), dim=1)
-        candidate_indices = torch.cat((best_indices, row_relative_indices), dim=1)
-        best_scores, selected = candidate_scores.topk(topk, dim=1)
-        best_indices = candidate_indices.gather(1, selected)
+        best_scores, next_scores = next_scores, best_scores
+        best_indices, next_indices = next_indices, best_indices
 
     return best_scores, best_indices
 

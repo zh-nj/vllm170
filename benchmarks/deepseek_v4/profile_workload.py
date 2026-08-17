@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import time
 import urllib.error
@@ -63,17 +64,48 @@ class SpecMetrics:
     drafts: int = 0
     draft_tokens: int = 0
     accepted_tokens: int = 0
+    accepted_tokens_per_pos: tuple[int, ...] = ()
 
     def __sub__(self, other: SpecMetrics) -> SpecMetrics:
+        num_positions = max(
+            len(self.accepted_tokens_per_pos),
+            len(other.accepted_tokens_per_pos),
+        )
         return SpecMetrics(
             drafts=self.drafts - other.drafts,
             draft_tokens=self.draft_tokens - other.draft_tokens,
             accepted_tokens=self.accepted_tokens - other.accepted_tokens,
+            accepted_tokens_per_pos=tuple(
+                (
+                    self.accepted_tokens_per_pos[pos]
+                    if pos < len(self.accepted_tokens_per_pos)
+                    else 0
+                )
+                - (
+                    other.accepted_tokens_per_pos[pos]
+                    if pos < len(other.accepted_tokens_per_pos)
+                    else 0
+                )
+                for pos in range(num_positions)
+            ),
         )
+
+
+def conditional_acceptance_rates(
+    drafts: int, accepted_tokens_per_pos: tuple[int, ...]
+) -> list[float]:
+    """Return acceptance at each position conditioned on reaching it."""
+    denominator = drafts
+    rates = []
+    for accepted in accepted_tokens_per_pos:
+        rates.append(accepted / denominator if denominator > 0 else 0.0)
+        denominator = accepted
+    return rates
 
 
 def parse_spec_metrics(payload: str) -> SpecMetrics | None:
     values = {"drafts": 0, "draft_tokens": 0, "accepted_tokens": 0}
+    accepted_tokens_per_pos: dict[int, int] = {}
     found = False
     for raw_line in payload.splitlines():
         line = raw_line.strip()
@@ -92,11 +124,22 @@ def parse_spec_metrics(payload: str) -> SpecMetrics | None:
             values["drafts"] += value
         elif "num_draft_tokens" in metric_name:
             values["draft_tokens"] += value
-        elif "num_accepted_tokens_per_pos" not in metric_name and (
-            "num_accepted_tokens" in metric_name
-        ):
+        elif "num_accepted_tokens_per_pos" in metric_name:
+            position_match = re.search(r'position="(\d+)"', parts[0])
+            if position_match is not None:
+                position = int(position_match.group(1))
+                accepted_tokens_per_pos[position] = (
+                    accepted_tokens_per_pos.get(position, 0) + value
+                )
+        elif "num_accepted_tokens" in metric_name:
             values["accepted_tokens"] += value
-    return SpecMetrics(**values) if found else None
+    if not found:
+        return None
+    per_position = tuple(
+        accepted_tokens_per_pos.get(position, 0)
+        for position in range(max(accepted_tokens_per_pos, default=-1) + 1)
+    )
+    return SpecMetrics(**values, accepted_tokens_per_pos=per_position)
 
 
 def make_prompt(approx_tokens: int, seed: int) -> str:
@@ -189,12 +232,14 @@ def run_stream(
     model: str,
     prompt: str,
     max_tokens: int,
+    seed: int,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0,
+        "seed": seed,
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -290,8 +335,26 @@ def build_result(
         "pp_size": 3,
         "tp_size": 1,
         "dspark_tokens": int(os.getenv("DSV4_DSPARK_TOKENS", "0")),
+        "dspark_exact_topk": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "0"))
+        ),
+        "dspark_q1_audit": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT", "0"))
+        ),
+        "dspark_q1_audit_samples": int(
+            os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES", "64")
+        ),
         "max_num_batched_tokens": int(os.getenv("DSV4_MAX_BATCHED_TOKENS", "1715")),
         "max_num_seqs": int(os.getenv("DSV4_MAX_NUM_SEQS", "8")),
+        "indexer_max_logits_mb": int(
+            os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+        ),
+        "indexer_max_query_rows": int(
+            os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "0")
+        ),
+        "indexer_prefill_caller_logits": bool(
+            int(os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "0"))
+        ),
         "marlin_moe_block_size": int(os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "0")),
         "marlin_moe_block_size_min_m": int(
             os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "0")
@@ -320,6 +383,9 @@ def build_result(
         "dspark_kv_only_insert": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "0"))
         ),
+        "mhc_pre_broadcast": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST", "1"))
+        ),
         "profiler_enabled": not args.skip_profiler,
         "phase_profile_flows": os.getenv(
             "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
@@ -340,6 +406,16 @@ def build_result(
             )
         if metrics.draft_tokens > 0:
             result["acceptance_rate"] = metrics.accepted_tokens / metrics.draft_tokens
+        if metrics.drafts > 0:
+            result["per_position_acceptance_rates"] = [
+                accepted / metrics.drafts
+                for accepted in metrics.accepted_tokens_per_pos
+            ]
+            result["conditional_per_position_acceptance_rates"] = (
+                conditional_acceptance_rates(
+                    metrics.drafts, metrics.accepted_tokens_per_pos
+                )
+            )
     for name in ("ttft_s", "decode_s", "decode_tokens_per_s", "total_s"):
         if not math.isfinite(result[name]) or result[name] <= 0:
             raise RuntimeError(f"invalid timing field: {name}")
@@ -369,7 +445,7 @@ def main() -> None:
     wait_until_ready(args.base_url, args.startup_timeout)
     warmup_context = args.warmup_context or args.context
     warmup_prompt = make_exact_prompt(args.base_url, args.model, warmup_context, seed=1)
-    run_stream(args.base_url, args.model, warmup_prompt, 8)
+    run_stream(args.base_url, args.model, warmup_prompt, 8, seed=1)
     prompt = make_exact_prompt(args.base_url, args.model, args.context, args.seed)
     if args.phase_control is not None:
         args.phase_control.parent.mkdir(parents=True, exist_ok=True)
@@ -382,7 +458,13 @@ def main() -> None:
             profiler_started = True
         for repeat_index in range(args.repeats):
             before = fetch_metrics(args.base_url)
-            workload = run_stream(args.base_url, args.model, prompt, args.max_tokens)
+            workload = run_stream(
+                args.base_url,
+                args.model,
+                prompt,
+                args.max_tokens,
+                seed=args.seed,
+            )
             if workload["prompt_tokens"] != args.context:
                 raise RuntimeError(
                     "server prompt-token count changed after /tokenize alignment: "

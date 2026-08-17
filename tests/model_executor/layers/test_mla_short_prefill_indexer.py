@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+# isort: off
+import vllm.models.deepseek_v4  # noqa: F401
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+
+# isort: on
 from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
@@ -17,28 +21,66 @@ MLA_LAYER = "model.layers.0.self_attn.attn"
 @pytest.mark.parametrize(
     ("next_n", "num_decode_tokens", "num_rows", "seq_lens_shape", "expected"),
     [
-        (1, 6, 6, torch.Size((6, 1)), True),
-        (6, 6, 6, torch.Size((1, 6)), True),
-        (1, 1, 1, torch.Size((1, 1)), False),
-        (1, 6, 6, torch.Size((6,)), False),
-        (7, 7, 7, torch.Size((1, 7)), False),
+        (1, 6, 6, torch.Size((6, 1)), 6),
+        (6, 6, 6, torch.Size((1, 6)), 6),
+        (1, 8, 8, torch.Size((8, 1)), 8),
+        (8, 8, 8, torch.Size((1, 8)), 8),
+        (1, 1, 1, torch.Size((1, 1)), None),
+        (1, 6, 6, torch.Size((6,)), None),
+        (1, 8, 7, torch.Size((8, 1)), None),
+        (7, 7, 7, torch.Size((1, 7)), None),
     ],
 )
-def test_dspark_q6_decode_shape_detection(
+def test_dspark_verification_width_detection(
     next_n: int,
     num_decode_tokens: int,
     num_rows: int,
     seq_lens_shape: torch.Size,
-    expected: bool,
+    expected: int | None,
 ) -> None:
     assert (
-        sparse_indexer._is_dspark_q6_decode(
+        sparse_indexer._get_dspark_verification_width(
             next_n,
             num_decode_tokens,
             num_rows,
             seq_lens_shape,
         )
-        is expected
+        == expected
+    )
+
+
+def test_dspark_exact_topk_route_is_narrow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sparse_indexer.envs,
+        "VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK",
+        True,
+    )
+    monkeypatch.setattr(
+        sparse_indexer.current_platform,
+        "is_device_capability_family",
+        lambda capability: capability == 80,
+    )
+
+    assert sparse_indexer._should_use_dspark_exact_topk(
+        topk_tokens=512,
+        next_n=1,
+        num_decode_tokens=8,
+        num_rows=8,
+        seq_lens_shape=torch.Size((8, 1)),
+    )
+    assert not sparse_indexer._should_use_dspark_exact_topk(
+        topk_tokens=1024,
+        next_n=1,
+        num_decode_tokens=8,
+        num_rows=8,
+        seq_lens_shape=torch.Size((8, 1)),
+    )
+    assert not sparse_indexer._should_use_dspark_exact_topk(
+        topk_tokens=512,
+        next_n=1,
+        num_decode_tokens=8,
+        num_rows=8,
+        seq_lens_shape=torch.Size((8,)),
     )
 
 
@@ -49,6 +91,24 @@ def test_topk_audit_overlap_is_isolated_per_row() -> None:
     overlap = sparse_indexer._count_topk_overlap_per_row(reference, candidates)
 
     assert overlap.tolist() == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "next_n", "expected"),
+    [
+        (torch.tensor([1024]), 8, [1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024]),
+        (torch.arange(1017, 1025).reshape(1, 8), 8, list(range(1017, 1025))),
+        (torch.arange(1017, 1025).reshape(8, 1), 1, list(range(1017, 1025))),
+    ],
+)
+def test_dspark_audit_decodes_effective_row_ends(
+    seq_lens: torch.Tensor,
+    next_n: int,
+    expected: list[int],
+) -> None:
+    row_ends = sparse_indexer._decode_row_ends(seq_lens, next_n, 8)
+
+    assert row_ends.tolist() == expected
 
 
 def make_indexer_metadata(

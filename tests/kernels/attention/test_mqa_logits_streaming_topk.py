@@ -16,6 +16,38 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     reason="SM8x Triton kernel required",
 )
 @torch.inference_mode()
+def test_full_logits_uses_caller_output() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260816)
+    M, N, H, D = 3, 1024, 64, 128
+    q = torch.randn((M, H, D), device="cuda", generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    k = torch.randn((N, D), device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    scales = torch.rand((N,), device="cuda", generator=generator) + 0.5
+    weights = torch.randn((M, H), device="cuda", generator=generator)
+    starts = torch.zeros(M, dtype=torch.int32, device="cuda")
+    ends = torch.full((M,), N, dtype=torch.int32, device="cuda")
+    expected = fp8_mqa_logits_triton(q, (k, scales), weights, starts, ends)
+    output = torch.empty_like(expected)
+
+    actual = fp8_mqa_logits_triton(
+        q,
+        (k, scales),
+        weights,
+        starts,
+        ends,
+        logits_out=output,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(80),
+    reason="SM8x Triton kernel required",
+)
+@torch.inference_mode()
 def test_streaming_topk_matches_full_logits() -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260813)
     M, N, H, D, topk = 5, 2304, 64, 128, 512
@@ -49,7 +81,51 @@ def test_streaming_topk_matches_full_logits() -> None:
         indices.sort().values,
         expected_indices.to(torch.int32).sort().values,
     )
-    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+    torch.testing.assert_close(
+        scores.sort(dim=1, descending=True).values,
+        expected_scores,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(80),
+    reason="SM8x Triton kernel required",
+)
+@torch.inference_mode()
+def test_streaming_topk_matches_full_logits_with_grouped_kv_tiles() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260816)
+    M, N, H, D, topk = 32, 16384, 64, 128, 512
+    q = torch.randn((M, H, D), device="cuda", generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    k = torch.randn((N, D), device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    scales = torch.rand((N,), device="cuda", generator=generator) + 0.5
+    weights = torch.randn((M, H), device="cuda", generator=generator)
+    starts = torch.zeros(M, dtype=torch.int32, device="cuda")
+    ends = torch.full((M,), N, dtype=torch.int32, device="cuda")
+
+    full_logits = fp8_mqa_logits_triton(
+        q, (k, scales), weights, starts, ends, clean_logits=False
+    )
+    expected_scores = full_logits.topk(topk, dim=1).values
+    scores, _ = fp8_mqa_logits_streaming_topk_triton(
+        q,
+        (k, scales),
+        weights,
+        starts,
+        ends,
+        topk,
+        tile_size=8192,
+    )
+
+    torch.testing.assert_close(
+        scores.sort(dim=1, descending=True).values,
+        expected_scores,
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(
@@ -84,5 +160,10 @@ def test_streaming_topk_pads_rows_shorter_than_topk() -> None:
             expected_indices.to(torch.int32).sort().values,
         )
         assert torch.all(indices[row, valid:] == -1)
-        torch.testing.assert_close(scores[row, :valid], expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(
+            scores[row, :valid].sort(descending=True).values,
+            expected_scores,
+            rtol=0,
+            atol=0,
+        )
         assert torch.all(scores[row, valid:] == float("-inf"))

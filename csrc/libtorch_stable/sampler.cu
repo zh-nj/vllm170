@@ -564,6 +564,65 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
       nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
 }
 
+template <int kNumThreadsPerBlock, int kTopK>
+static __global__
+__launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefillUpdateCandidates(
+    const float* logits, const int* tileStarts, const int* tileEnds,
+    const int* rowStarts, const float* bestScores, const int* bestIndices,
+    float* nextScores, int* nextIndices, int tileOffset, int64_t strideLogitsM,
+    int64_t strideLogitsN, bool hasBest) {
+  constexpr int kNumBins = 2048;
+  constexpr int kItemsPerThread = 2;
+  using BlockSort =
+      cub::BlockRadixSort<float, kNumThreadsPerBlock, kItemsPerThread, int>;
+  __shared__ typename BlockSort::TempStorage sortStorage;
+
+  const int row = blockIdx.x;
+  const int rowStart = tileStarts[row];
+  const int rowEnd = tileEnds[row];
+  float* rowNextScores = nextScores + static_cast<int64_t>(row) * kTopK;
+  int* rowNextIndices = nextIndices + static_cast<int64_t>(row) * kTopK;
+
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, false, true>(
+      nullptr, logits + static_cast<int64_t>(row) * strideLogitsM, rowStart,
+      rowEnd, rowNextIndices, rowNextScores, strideLogitsN, kTopK);
+  __syncthreads();
+
+  if (!hasBest) {
+    const int tileIndex = rowNextIndices[threadIdx.x];
+    if (tileIndex < 0) rowNextScores[threadIdx.x] = __int_as_float(0xff800000);
+    rowNextIndices[threadIdx.x] =
+        tileIndex < 0 ? -1 : tileOffset + tileIndex - rowStarts[row];
+    return;
+  }
+
+  float candidateScores[kItemsPerThread];
+  int candidateIndices[kItemsPerThread];
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const int candidateOffset = threadIdx.x * kItemsPerThread + item;
+    if (candidateOffset < kTopK) {
+      candidateScores[item] =
+          bestScores[static_cast<int64_t>(row) * kTopK + candidateOffset];
+      candidateIndices[item] =
+          bestIndices[static_cast<int64_t>(row) * kTopK + candidateOffset];
+    } else {
+      const int tileCandidateOffset = candidateOffset - kTopK;
+      const int tileIndex = rowNextIndices[tileCandidateOffset];
+      candidateScores[item] = tileIndex < 0
+                                  ? __int_as_float(0xff800000)
+                                  : rowNextScores[tileCandidateOffset];
+      candidateIndices[item] =
+          tileIndex < 0 ? -1 : tileOffset + tileIndex - rowStarts[row];
+    }
+  }
+
+  BlockSort(sortStorage)
+      .SortDescendingBlockedToStriped(candidateScores, candidateIndices);
+  rowNextScores[threadIdx.x] = candidateScores[0];
+  rowNextIndices[threadIdx.x] = candidateIndices[0];
+}
+
 template <int kNumThreadsPerBlock, bool useRadixSort,
           bool multipleBlocksPerRow = false, bool mergeBlocks = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
@@ -753,4 +812,42 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
             static_cast<int>(stride0), static_cast<int>(stride1),
             static_cast<int>(topK), kSortingAlgorithmThreshold);
   }
+}
+
+void top_k_per_row_prefill_update_candidates(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& tileStarts,
+    const torch::stable::Tensor& tileEnds,
+    const torch::stable::Tensor& rowStarts,
+    const torch::stable::Tensor& bestScores,
+    const torch::stable::Tensor& bestIndices, torch::stable::Tensor& nextScores,
+    torch::stable::Tensor& nextIndices, int64_t tileOffset, int64_t numRows,
+    int64_t stride0, int64_t stride1, int64_t topK, bool hasBest) {
+  constexpr int kTopK = 512;
+  constexpr int kNumThreadsPerBlock = 512;
+  STD_TORCH_CHECK(topK == kTopK,
+                  "top_k_per_row_prefill_update_candidates supports only "
+                  "topK=512");
+  STD_TORCH_CHECK(bestScores.dim() == 2 && bestScores.size(0) == numRows &&
+                      bestScores.size(1) == kTopK,
+                  "bestScores must have shape [numRows, 512]");
+  STD_TORCH_CHECK(bestIndices.sizes().equals(bestScores.sizes()) &&
+                      nextScores.sizes().equals(bestScores.sizes()) &&
+                      nextIndices.sizes().equals(bestScores.sizes()),
+                  "candidate tensors must have matching shapes");
+  STD_TORCH_CHECK(tileStarts.size(0) == numRows &&
+                      tileEnds.size(0) == numRows &&
+                      rowStarts.size(0) == numRows,
+                  "row bound tensors must contain numRows elements");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      logits.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  vllm::topKPerRowPrefillUpdateCandidates<kNumThreadsPerBlock, kTopK>
+      <<<numRows, kNumThreadsPerBlock, 2 * kTopK * sizeof(int32_t), stream>>>(
+          logits.const_data_ptr<float>(), tileStarts.const_data_ptr<int>(),
+          tileEnds.const_data_ptr<int>(), rowStarts.const_data_ptr<int>(),
+          bestScores.const_data_ptr<float>(), bestIndices.const_data_ptr<int>(),
+          nextScores.mutable_data_ptr<float>(),
+          nextIndices.mutable_data_ptr<int>(), static_cast<int>(tileOffset),
+          logits.stride(0), logits.stride(1), hasBest);
 }

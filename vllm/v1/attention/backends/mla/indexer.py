@@ -80,11 +80,17 @@ def split_indexer_prefill_chunks(
     workspace_size: int,
     max_logits_bytes: int,
     request_offset: int = 0,
+    max_query_rows: int = 0,
+    streaming_min_row_len: int = 0,
+    streaming_max_query_rows: int = 0,
 ) -> list[tuple[slice, slice]]:
     """
     Split prefill requests into chunks for the sparse indexer, respecting:
     - N constraint: total_seq_lens <= workspace_size (existing O(N) workspace)
     - Logits constraint: M * N * 4 <= max_logits_bytes
+    - Optional query-row constraint: M <= max_query_rows
+    - Optional streaming constraint: M <= streaming_max_query_rows once the
+      longest row reaches streaming_min_row_len
 
     When a single request-level chunk still exceeds the logits budget,
     sub-chunks on the query dimension (M) to bound peak memory.
@@ -97,13 +103,25 @@ def split_indexer_prefill_chunks(
     end = 0
 
     while end < n:
-        start, chunk_m, chunk_n = end, 0, 0
+        start, chunk_m, chunk_n, chunk_max_row_len = end, 0, 0, 0
 
         while end < n:
             q, s = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
             new_m, new_n = chunk_m + q, chunk_n + s
-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+            new_max_row_len = max(chunk_max_row_len, s)
+            use_streaming = (
+                streaming_max_query_rows > 0
+                and new_max_row_len >= streaming_min_row_len
+            )
+            within_compute_workspace = (
+                new_m <= streaming_max_query_rows
+                if use_streaming
+                else new_m * new_n <= max_logits_elems
+                and (max_query_rows <= 0 or new_m <= max_query_rows)
+            )
+            if new_n <= workspace_size and within_compute_workspace:
                 chunk_m, chunk_n = new_m, new_n
+                chunk_max_row_len = new_max_row_len
                 end += 1
             else:
                 break
@@ -112,10 +130,21 @@ def split_indexer_prefill_chunks(
         # on the query dimension.
         if end == start:
             chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
+            chunk_max_row_len = chunk_n
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
+        use_streaming = (
+            streaming_max_query_rows > 0 and chunk_max_row_len >= streaming_min_row_len
+        )
+        if use_streaming:
+            max_q = streaming_max_query_rows
+        else:
+            max_q = (
+                max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
+            )
+            if max_query_rows > 0:
+                max_q = min(max_q, max_query_rows)
         for q_off in range(0, chunk_m, max_q):
             sub_m = min(max_q, chunk_m - q_off)
             chunks.append((req_slice, slice(q_off, q_off + sub_m)))
@@ -194,6 +223,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    max_row_len: int = 0
 
 
 _BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS = (
@@ -441,6 +471,7 @@ class DeepseekV32IndexerMetadata:
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
     # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
@@ -449,7 +480,9 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    # A prefill batch cannot contain more than max_num_seqs histories, so lower
+    # concurrency deployments do not need to reserve all 40 full-length rows.
+    return max_model_len * min(max_num_seqs, 40)
 
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
@@ -836,6 +869,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.max_prefill_buffer_size,
                 max_logits_bytes,
                 request_offset=num_decodes,
+                max_query_rows=envs.VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS,
+                streaming_min_row_len=(
+                    envs.VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN
+                    if envs.VLLM_INDEXER_PREFILL_STREAMING_TOPK
+                    and current_platform.is_device_capability_family(80)
+                    and self.dcp_world_size == 1
+                    else 0
+                ),
+                streaming_max_query_rows=(
+                    envs.VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS
+                    if envs.VLLM_INDEXER_PREFILL_STREAMING_TOPK
+                    and current_platform.is_device_capability_family(80)
+                    and self.dcp_world_size == 1
+                    else 0
+                ),
             )
 
             chunks = []
@@ -1085,4 +1133,5 @@ def build_prefill_chunk_metadata(
         local_cu_seq_lens=local_cu_seq_lens,
         local_total_seq_lens=local_total_seq_lens,
         max_local_total_seq_lens=max_local_total_seq_lens,
+        max_row_len=int(compressed_seq_lens_cpu[start_idx:end_idx].max().item()),
     )

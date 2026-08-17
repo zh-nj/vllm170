@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS: int = 0
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = False
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
@@ -69,11 +70,23 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = False
     VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER: bool = True
+    VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST: bool = True
     VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A: bool = True
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+    VLLM_INDEXER_PREFILL_CALLER_LOGITS: bool = False
+    VLLM_INDEXER_PREFILL_STREAMING_TOPK: bool = False
+    VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN: int = 16384
+    VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE: int = 16384
+    VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS: int = 512
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
+    VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_MIN_LEN: int = 0
+    VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES: int = 8
+    VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES: int = 64
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN: int = 0
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES: int = 8
@@ -1091,6 +1104,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    "VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "0")
+    ),
     # Maximum BF16 gather workspace for DeepSeek V4 sparse prefill. The
     # implementation reduces requests per chunk as context grows. One request
     # always remains admissible because splitting its KV rows requires an
@@ -1126,8 +1142,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M": lambda: int(
         os.getenv("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
     ),
+    "VLLM_INDEXER_PREFILL_CALLER_LOGITS": lambda: (
+        os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "0") == "1"
+    ),
+    "VLLM_INDEXER_PREFILL_STREAMING_TOPK": lambda: (
+        os.getenv("VLLM_INDEXER_PREFILL_STREAMING_TOPK", "0") == "1"
+    ),
+    "VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN": lambda: int(
+        os.getenv("VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN", "16384")
+    ),
+    "VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE": lambda: int(
+        os.getenv("VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE", "16384")
+    ),
+    "VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS", "512")
+    ),
     "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
         os.getenv("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT",
+                os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT", "0"),
+            )
+        )
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_MIN_LEN": lambda: int(
+        os.getenv(
+            "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_MIN_LEN",
+            os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN", "0"),
+        )
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES": lambda: int(
+        os.getenv(
+            "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES",
+            os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES", "8"),
+        )
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES", "64")
     ),
     "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT", "0"))
@@ -1137,6 +1197,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST", "1"))
     ),
     "VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A", "1"))

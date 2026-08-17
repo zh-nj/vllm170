@@ -12,6 +12,7 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
+    _collect_q1_acceptance_audit_records,
     _iter_request_chunks,
 )
 
@@ -23,6 +24,81 @@ def test_iter_request_chunks_preserves_request_boundaries():
         (0, 2),
         (2, 3),
         (3, 4),
+    ]
+
+
+def test_collect_q1_acceptance_audit_records() -> None:
+    processed_logits = torch.tensor(
+        [
+            [0.0, 1.0, 4.0, 3.5],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [5.0, 2.0, 1.0, 4.75],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    draft_sampled = torch.tensor([0, 2, 3, 0, 3, 2])
+    sampled = torch.tensor([[2, 3, 0], [0, 0, 0]])
+    num_sampled = torch.tensor([3, 1], dtype=torch.int32)
+    pos = torch.tensor([100, 101, 102, 200, 201, 202])
+    cu_num_logits = torch.tensor([0, 3, 6], dtype=torch.int32)
+    temperatures = torch.zeros(2)
+
+    records = _collect_q1_acceptance_audit_records(
+        processed_logits,
+        draft_sampled,
+        sampled,
+        num_sampled,
+        pos,
+        cu_num_logits,
+        temperatures,
+        max_rows=2,
+    )
+
+    assert records == [
+        {
+            "request_index": 0,
+            "position": 100,
+            "num_draft_tokens": 2,
+            "accepted_length": 2,
+            "draft_token_id": 2,
+            "sampler_target_id": 2,
+            "torch_top1_id": 2,
+            "torch_top2_id": 3,
+            "draft_strict_rank": 1,
+            "draft_rank_end": 1,
+            "temperature": 0.0,
+            "sampler_target_logit": 4.0,
+            "draft_logit": 4.0,
+            "torch_top1_logit": 4.0,
+            "torch_top2_logit": 3.5,
+            "top2_margin": 0.5,
+            "draft_gap": 0.0,
+            "accepted": True,
+            "sampler_argmax_matches_torch": True,
+        },
+        {
+            "request_index": 1,
+            "position": 200,
+            "num_draft_tokens": 2,
+            "accepted_length": 0,
+            "draft_token_id": 3,
+            "sampler_target_id": 0,
+            "torch_top1_id": 0,
+            "torch_top2_id": 3,
+            "draft_strict_rank": 2,
+            "draft_rank_end": 2,
+            "temperature": 0.0,
+            "sampler_target_logit": 5.0,
+            "draft_logit": 4.75,
+            "torch_top1_logit": 5.0,
+            "torch_top2_logit": 4.75,
+            "top2_margin": 0.25,
+            "draft_gap": 0.25,
+            "accepted": False,
+            "sampler_argmax_matches_torch": True,
+        },
     ]
 
 

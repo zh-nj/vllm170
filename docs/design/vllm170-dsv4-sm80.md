@@ -128,7 +128,7 @@ Markov head，必须根据其独立量化元数据构造 head-specific config，
 | 设施 | 当前处理 | 准入判断 |
 | --- | --- | --- |
 | 部署长度 RoPE cache | cache extent 使用部署 `max_model_len`，YaRN 频率、original max position、mscale 和模型声明上限不变 | 已接入；bounded/full 有效前缀逐元素一致 |
-| q6 精确 top-k | 增加 opt-in 真实 logits 审计，同时识别 V2 runner 的 flattened q6 和 native q6 | 暂不改变默认 selector |
+| DSpark q6/q8 精确 top-k | 真实 logits 审计识别 V2 runner 的 flattened/native q6/q8；CMP170HX 启动器使用精确 radix selector | 已接入；32K A/B/A 每轮耗时改善 2.20%，无新增显存 |
 | sparse-prefill gather | 按字节预算计算每批请求数，dummy/profile 与真实 forward 共用同一公式 | 已接入；默认临时预算 512 MiB |
 | streaming indexer | SM80 正确性原型只保留一个 K tile 和 top-k candidates，并返回 score/index | 未接 serving；等待 fused Triton selector/merge |
 | profiling/验收 | 固定 prompt/output hash、server token、DSpark counters、PP rank trace、三流程 CUDA Event 阶段记录和机器可读验收状态 | 已接入；CMP 上 CUDA activity 受 CUPTI 限制 |
@@ -149,11 +149,18 @@ RoPE cache 的 key 包含部署 extent，避免相同 YaRN 配置的 full/bounde
 131,072 后由 256 MiB/rank 降至 32 MiB/rank，静态节省 224 MiB/rank。该优化只减少
 驻留 cache，不修改外部 position contract。
 
-q6 审计在 eager 模式下捕获了 PP3 三个 stage 各 8 个真实样本，共 24 个 layer 样本、
-144 个 logits 行；32K 请求对应的压缩长度为 6155–6157。严格按行隔离集合后，SM80
-persistent top-512 相对精确 radix selector 的 recall 均为 100%，没有漏选行。因此
-`VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT` 仅作为同步审计开关，精确 selector 不设为默认；
-更长 context 仍需继续采样，不能把本次结果外推到全部长度。
+最新 32K eager 审计分别覆盖 q6 和生产 q8。q6 的 24 个 layer 样本、144 行中漏选
+28/73,728 个精确候选，recall 为 99.9620%；q8 的 24 个 layer 样本、192 行中漏选
+19/98,304 个候选，recall 为 99.9807%，其中 3 行发生漏选。两种验证宽度都证明
+SM80 persistent top-512 并非严格集合选择器。CMP170HX 启动器因此只对单请求
+DSpark q6/q8、top-k 512 改用精确 radix selector；其他 shape 保留原路由。
+
+生产 q8 的 32K Graph A/B/A 使用相同 32,768-token prompt、seed 和 64-token 输出。
+精确路径相对前后 persistent 基线的平均 median 每轮耗时改善 2.20%，B 组中位
+decode 吞吐为 80.23 token/s，6/6 输出均正确取回口令。精确路径可完成 PP3 全图
+捕获，不申请 persistent selector 的 1 MiB workspace，也不增加常驻显存。详细证据与
+回滚边界见
+`docs/design/vllm170-dsv4-sm80-dspark-exact-topk-2026-08-16.md`。
 
 streaming 原型在 CMP170HX 上使用 CUDA Events 测得以下隔离结果；所有行的数学
 top-k 集合和 score 都与 full logits 一致：
@@ -320,13 +327,14 @@ vllm serve /models/deepseek-v4-flash \
   --moe-backend marlin \
   --speculative-config '{
     "method":"dspark",
-    "num_speculative_tokens":7
+    "num_speculative_tokens":5
   }'
 ```
 
 DeepSeek-V4-Flash-0731 的 DSpark 权重就在 target checkpoint 内，不应再填写独立
-`model` 路径。当前生产基线使用 `num_speculative_tokens=7`；5-token 仅用于形成 q6
-审计目标。更改 checkpoint 后必须重新核对 DSpark 配置，而不能机械沿用。
+`model` 路径。checkpoint 声明 `dspark_block_size=5`，因此生产基线使用
+`num_speculative_tokens=5`；7-token 保留用于 q8 selector 审计和回归对照。更改
+checkpoint 后必须重新核对 DSpark 配置，而不能机械沿用。
 
 只有 Marlin 基线通过后，才将 `--moe-backend marlin` 改为：
 

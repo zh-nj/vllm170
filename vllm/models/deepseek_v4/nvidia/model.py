@@ -967,7 +967,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with phase_profile_stage("layer.mhc_attention_pre", x, level="stage"):
             if residual is None:
                 # Run standalone mhc_pre on first layer
-                if x.dim() == 2:
+                if x.dim() == 2 and envs.VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST:
                     assert self.hc_attn_fn_broadcast is not None
                     residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
                         x,
@@ -984,9 +984,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                         fn_broadcast=self.hc_attn_fn_broadcast,
                     )
                 else:
-                    residual = x
+                    if x.dim() == 2:
+                        residual = x[:, None, :].repeat(1, self.hc_mult, 1)
+                    else:
+                        residual = x
                     post_mix, res_mix, x = mhc_pre_tilelang(
-                        x,
+                        residual,
                         self.hc_attn_fn,
                         self.hc_attn_scale,
                         self.hc_attn_base,

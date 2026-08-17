@@ -46,7 +46,10 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
+from vllm.v1.attention.backends.mla.indexer import (
+    get_max_prefill_buffer_size,
+    split_indexer_prefill_chunks,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
     split_prefill_chunks,
@@ -1212,6 +1215,96 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
+
+
+def test_split_indexer_prefill_chunks_bounds_full_logits_query_rows():
+    seq_lens = torch.tensor([8192])
+    query_lens = torch.tensor([1715])
+
+    out = split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size=8192,
+        max_logits_bytes=96 * 1024 * 1024,
+        max_query_rows=1024,
+    )
+
+    assert out == [
+        (slice(0, 1), slice(0, 1024)),
+        (slice(0, 1), slice(1024, 1715)),
+    ]
+
+
+def test_split_indexer_prefill_chunks_combines_logits_and_query_row_caps():
+    seq_lens = torch.tensor([65536])
+    query_lens = torch.tensor([1715])
+
+    out = split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size=65536,
+        max_logits_bytes=96 * 1024 * 1024,
+        max_query_rows=1024,
+    )
+
+    assert out == [
+        (slice(0, 1), slice(0, 384)),
+        (slice(0, 1), slice(384, 768)),
+        (slice(0, 1), slice(768, 1152)),
+        (slice(0, 1), slice(1152, 1536)),
+        (slice(0, 1), slice(1536, 1715)),
+    ]
+
+
+def test_split_indexer_prefill_chunks_streaming_bounds_query_rows():
+    seq_lens = torch.tensor([65536])
+    query_lens = torch.tensor([1715])
+    max_logits_bytes = 32 * 1024 * 1024
+
+    out = split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size=65536,
+        max_logits_bytes=max_logits_bytes,
+        streaming_min_row_len=16384,
+        streaming_max_query_rows=1024,
+    )
+
+    assert out == [
+        (slice(0, 1), slice(0, 1024)),
+        (slice(0, 1), slice(1024, 1715)),
+    ]
+
+
+def test_split_indexer_prefill_chunks_streaming_keeps_short_context_cap():
+    seq_lens = torch.tensor([8192])
+    query_lens = torch.tensor([1715])
+
+    out = split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size=8192,
+        max_logits_bytes=32 * 1024 * 1024,
+        streaming_min_row_len=16384,
+        streaming_max_query_rows=1024,
+    )
+
+    assert out == [
+        (slice(0, 1), slice(0, 1024)),
+        (slice(0, 1), slice(1024, 1715)),
+    ]
+
+
+@pytest.mark.parametrize("max_num_seqs,expected_multiplier", [(1, 1), (8, 8), (64, 40)])
+def test_indexer_prefill_buffer_respects_request_capacity(
+    max_num_seqs, expected_multiplier
+):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1024),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+    )
+
+    assert get_max_prefill_buffer_size(config) == 1024 * expected_multiplier
 
 
 def test_triton_indexer_query_subchunks_reuse_gathered_kv(monkeypatch):

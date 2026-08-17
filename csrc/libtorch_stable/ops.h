@@ -421,6 +421,16 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
                            torch::stable::Tensor& indices, int64_t numRows,
                            int64_t stride0, int64_t stride1, int64_t topK);
 
+void top_k_per_row_prefill_update_candidates(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& tileStarts,
+    const torch::stable::Tensor& tileEnds,
+    const torch::stable::Tensor& rowStarts,
+    const torch::stable::Tensor& bestScores,
+    const torch::stable::Tensor& bestIndices, torch::stable::Tensor& nextScores,
+    torch::stable::Tensor& nextIndices, int64_t tileOffset, int64_t numRows,
+    int64_t stride0, int64_t stride1, int64_t topK, bool hasBest);
+
 void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           const torch::stable::Tensor& seqLens,
                           torch::stable::Tensor& indices, int64_t numRows,

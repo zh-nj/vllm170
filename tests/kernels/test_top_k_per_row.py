@@ -375,20 +375,31 @@ def test_top_k_per_row_decode_large_vocab_size(clean_logits: bool) -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("context_tokens", [1024, 32768, 131072, 262144])
+@pytest.mark.parametrize("seq_lens_layout", ["native", "flat"])
+@pytest.mark.parametrize("next_n", [6, 8])
 @torch.inference_mode()
-def test_top_k_per_row_decode_dspark_q6_is_exact() -> None:
-    """Guard the exact top-512 set used by a single-request DSpark q6 pass."""
+def test_top_k_per_row_decode_dspark_is_exact(
+    next_n: int,
+    seq_lens_layout: str,
+    context_tokens: int,
+) -> None:
+    """Guard exact DSpark sets at the production long-context checkpoints."""
     set_random_seed(0)
     torch.set_default_device("cuda:0")
-    next_n = 6
     top_k = 512
-    vocab_size = 32768
-    seq_lens = torch.tensor([vocab_size], dtype=torch.int32, device="cuda")
+    vocab_size = context_tokens // 4
     row_ends = (
         vocab_size
         - next_n
         + torch.arange(1, next_n + 1, dtype=torch.int32, device="cuda")
     )
+    if seq_lens_layout == "native":
+        seq_lens = row_ends.reshape(1, next_n)
+        kernel_next_n = next_n
+    else:
+        seq_lens = row_ends.reshape(next_n, 1)
+        kernel_next_n = 1
     logits = torch.stack(
         [
             torch.randperm(vocab_size, device="cuda", dtype=torch.int64).float()
@@ -400,7 +411,7 @@ def test_top_k_per_row_decode_dspark_q6_is_exact() -> None:
 
     torch.ops._C.top_k_per_row_decode(
         logits,
-        next_n,
+        kernel_next_n,
         seq_lens,
         indices,
         next_n,
@@ -410,10 +421,14 @@ def test_top_k_per_row_decode_dspark_q6_is_exact() -> None:
     )
     torch.accelerator.synchronize()
 
-    expected = torch.stack(
-        [logits[row, : row_ends[row]].topk(top_k).indices for row in range(next_n)]
-    )
-    assert torch.equal(indices.sort().values, expected.to(torch.int32).sort().values)
+    for row in range(next_n):
+        valid_count = min(top_k, int(row_ends[row]))
+        expected = logits[row, : row_ends[row]].topk(valid_count).indices
+        assert torch.equal(
+            indices[row, :valid_count].sort().values,
+            expected.to(torch.int32).sort().values,
+        )
+        assert torch.all(indices[row, valid_count:] == -1)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

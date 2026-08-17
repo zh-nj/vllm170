@@ -16,9 +16,10 @@ The defaults are the measured three-card configuration:
 
 - physical GPUs `1,2,3`, PP3 with `15,15,13` layers and TP1;
 - Triton sparse MLA, FP8 KV cache, block size 256;
-- CUDA Graph execution and DSpark with 7 speculative tokens;
+- CUDA Graph execution and checkpoint-native DSpark with 5 speculative tokens;
 - 131,072-token context, 1,715 batched tokens, and 8 sequences;
-- a 32 MiB sparse-indexer logits budget and 1.6 GB KV cache per GPU.
+- a 96 MiB caller-owned sparse-indexer logits budget, a 1,024-row cap, and
+  1.6 GB KV cache per GPU;
 - Marlin block-M 48 for MoE batches with at least 1,000 tokens; smaller decode
   batches retain the upstream shape heuristic.
 - sparse-prefill caller output with K tile 32 and no additional persistent
@@ -27,6 +28,18 @@ The defaults are the measured three-card configuration:
   packed FP8 linear duplicate is released after loading.
 - direct PP activation receives into the V2 runner's persistent arena; the last
   stage also reuses that arena for DSpark auxiliary-hidden packing.
+
+For a single-request 1,048,576-token deployment, use the capacity preset:
+
+```bash
+benchmarks/deepseek_v4/run_cmp170hx_pp3_1m.sh
+```
+
+It uses PP partition `15,16,12`, a 2.7 GB per-rank KV budget, and one active
+sequence. The PP0/PP1 KV admission requirement is 2.46 GiB; the configured
+budget exposes 1,071,031 cache tokens, or 1.02 concurrent full-length
+requests. Keep `DSV4_MAX_NUM_SEQS=1` unless the KV and indexer workspace
+budgets are recalculated for the higher concurrency.
 
 Do not add `--enforce-eager`: it disables the CUDA Graph decode path and causes
 an order-of-magnitude regression on this machine. The launcher defaults to
@@ -39,10 +52,10 @@ DSV4_MODE=production benchmarks/deepseek_v4/run_cmp170hx_pp3.sh
 
 The main overrides are `DSV4_MODEL_DIR`, `CUDA_VISIBLE_DEVICES`,
 `DSV4_MOE_BACKEND`, `DSV4_DSPARK_TOKENS`, `DSV4_KV_CACHE_BYTES`, and
-`DSV4_MAX_MODEL_LEN`. The 1,715-token scheduler limit is specific to the
-measured 5,000-token, PP3, DSpark-7 workload: reserving 48 speculative slots
-leaves 1,667 target tokens and produces balanced `1667 + 1667 + 1666` prefill
-microbatches. Override `DSV4_MAX_BATCHED_TOKENS` for other traffic shapes. Set
+`DSV4_MAX_MODEL_LEN`. The 1,715-token scheduler limit was originally selected
+for the measured 5,000-token, PP3, DSpark-7 workload. The promoted DSpark-5
+default reserves 32 speculative slots and leaves 1,683 target tokens per
+scheduler step. Override `DSV4_MAX_BATCHED_TOKENS` for other traffic shapes. Set
 `VLLM_MARLIN_MOE_BLOCK_SIZE=0` to restore Marlin's upstream shape heuristic.
 `VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M` controls the minimum token batch affected by
 an explicit block size.
@@ -51,6 +64,21 @@ The sparse-prefill gather workspace has a byte budget rather than assuming
 that four maximum-length requests always fit. The default is 512 MiB; override
 it with `VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB`. Setting it to zero restores
 the legacy four-request limit.
+
+The sparse-indexer prefill gather workspace is also bounded by the scheduler's
+request capacity. Deployments with fewer than 40 active sequences reserve at
+most `max_num_seqs * max_model_len` history entries instead of 40 full-length
+histories. The 1M single-sequence preset therefore removes a redundant 39x
+indexer reservation without changing logits or top-k results.
+
+The CMP170HX launcher intentionally uses temporary memory for a better
+sparse-indexer score wave: `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=96` and
+`VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS=1024`. The logits tensor is a view of the
+shared workspace when `VLLM_INDEXER_PREFILL_CALLER_LOGITS=1`; this avoids the
+multi-layer allocator retention seen with independent 96 MiB allocations.
+The measured 262K PP3 TTFT improved by 1.62% after 32K drift normalization,
+without increasing sampled whole-GPU peak memory. Set the budget to `32`, the
+row cap to `0`, and caller logits to `0` to restore the previous route.
 
 The CMP170HX launcher enables `VLLM_PP_REUSE_RECV_BUFFER=1`. Set it to `0` to
 restore allocating PP receives and DSpark's dedicated hidden-state buffer.
@@ -84,7 +112,8 @@ The canonical profile runs a same-context warmup, then opens one measurement
 window for both the per-worker Torch profiler and CUDA-event phase records.
 PP ranks are written independently. The harness records prompt/output hashes,
 server token counts, speculative acceptance, ms/round, the live Git revision,
-and the full topology. It calibrates the generated prompt through the server's
+unconditional and reached-position-conditional acceptance, and the full
+topology. It calibrates the generated prompt through the server's
 `/tokenize` endpoint and fails unless `usage.prompt_tokens` exactly matches
 `DSV4_PROFILE_CONTEXT`:
 
@@ -287,27 +316,62 @@ Use Nsight Systems/Compute on isolated kernel microbenchmarks after the PP3
 trace identifies a bottleneck. Late-attaching Nsight to already initialized
 spawned workers is not a supported acceptance path on this host.
 
-Use DSpark width 5 to audit the q6 target pass (`next_n=6`) and width 7 for the
-production q8 configuration. A captured run is acceptable only when the
+The checkpoint declares `dspark_block_size=5`, so width 5 is the production
+default. Width 7 remains available for q8 selector audits and regression
+comparisons. A captured run is acceptable only when the
 completion length matches exactly, timing fields are finite, speculative
 counters conserve their meaning, and the profiler-owned process group exits.
 
-The opt-in real-logits audit compares the persistent and exact q6 top-k sets.
-It intentionally synchronizes and therefore requires eager mode; it is a
-correctness probe, not a performance run:
+The opt-in q1 acceptance audit records the production sampler decision, target
+rank, drafter base logits, Markov bias, and final draft logits. Drafter-stage
+records require eager execution because Python cannot inspect intermediates from
+a replayed CUDA Graph. The audit skips non-final prefill chunks, remains bounded
+and disabled by default, and synchronizes the GPU, so its latency is not a
+production measurement:
 
 ```bash
-VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT=1 \
-VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN=5000 \
-VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES=8 \
-DSV4_DSPARK_TOKENS=5 \
+VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT=1 \
+VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES=64 \
+DSV4_PROFILE_EXECUTION=benchmark \
+benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh --enforce-eager
+```
+
+Pair `DSpark q1 drafter audit` and `DSpark q1 acceptance audit` records by
+`position`. The final drafter proposal may have no target record when the
+request reaches its output limit. ID differences at equal maximum logits are
+ties, not numerical mismatches.
+
+The opt-in real-logits audit compares either the persistent or exact selector
+with an independent `torch.topk` reference for both q6 and q8. It validates the
+index set, selected-score multiset, index range and uniqueness, short-row
+padding, cutoff ties, and non-finite logits. It intentionally synchronizes and
+therefore requires eager mode; it is a correctness probe, not a performance
+run. Disable the production exact route when auditing the persistent selector:
+
+```bash
+VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK=0 \
+VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT=1 \
+VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_MIN_LEN=5000 \
+VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES=8 \
+DSV4_DSPARK_TOKENS=7 \
 benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh --enforce-eager
 ```
 
 The minimum is measured in compressed indexer tokens. It prevents warmup and
 short-context requests from consuming the bounded per-worker sample budget.
+When the 512th score is tied, different index sets can both be mathematically
+valid; use `strict_score_misses`, `score_mismatches`, invalid/duplicate indices,
+and padding errors as the correctness gate rather than raw index recall alone.
+The old `VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT*` names remain compatibility aliases.
 
-## SM80 streaming-indexer prototype
+The CMP170HX launcher defaults
+`VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK=1`. The route is deliberately narrow: SM80,
+single-request DSpark q6/q8, and top-k 512. Other decode shapes keep their
+existing cooperative/persistent selector. Set the variable to `0` for an A/B
+rollback. The real 32K audit and A/B/A evidence are recorded in
+`docs/design/vllm170-dsv4-sm80-dspark-exact-topk-2026-08-16.md`.
+
+## SM80 streaming-indexer experiment
 
 The prototype benchmark compares full logits plus the production prefill
 selector against tile-local exact top-k plus candidate merge:
@@ -315,15 +379,27 @@ selector against tile-local exact top-k plus candidate merge:
 ```bash
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
     benchmarks/kernels/deepseek_v4_streaming_indexer.py \
-    --rows 8 --keys 32768 --tile-size 1024
+    --rows 1715 --keys 65536 --tile-size 8192 \
+    --full-row-chunk 128 --streaming-row-chunk 1024
 ```
 
-It fails if either selected indices or scores differ from the mathematical
-full-logits top-k, and reports CUDA-Event latency plus peak allocated bytes as
-JSON. This is a design probe, not a serving backend. Current CMP170HX results
-show a large memory reduction for small row counts but prohibitive latency;
-production routing remains disabled until score, local selection, and
-candidate merge are fused in a native SM80 implementation.
+It fails if the selected score set differs from the mathematical full-logits
+top-k, and reports CUDA-Event latency plus peak allocated bytes as JSON. The
+serving route is experimental and defaults off. It is restricted to SM80,
+FP8 indexer cache, DCP=1, top-k=512, and long compressed rows:
+
+```bash
+VLLM_INDEXER_PREFILL_STREAMING_TOPK=1
+VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN=16384
+VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE=16384
+VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS=512
+```
+
+The 2026-08-16 CMP170HX PP3 work reduced long-shape temporary memory and made
+the corrected isolated 262K-shape kernel 2.44% faster than full logits. The final service
+A/B still regressed normalized 262K TTFT by 1.37%, so production routing
+remains disabled. See
+`docs/design/vllm170-dsv4-sm80-streaming-indexer-2026-08-16.md`.
 
 ## Minimum performance suite
 

@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
 from collections.abc import Iterator
 
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.logger import init_logger
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -32,6 +36,8 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
 
+logger = init_logger(__name__)
+
 
 def _iter_request_chunks(
     cu_num_logits: np.ndarray, max_chunk_logits: int
@@ -46,6 +52,123 @@ def _iter_request_chunks(
         end = min(num_reqs, max(start + 1, end))
         yield start, end
         start = end
+
+
+def _collect_q1_acceptance_audit_records(
+    processed_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    pos: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    request_temperatures: torch.Tensor,
+    max_rows: int,
+) -> list[dict[str, bool | float | int]]:
+    """Collect a bounded greedy q1 audit from rejection-sampler tensors."""
+    if max_rows <= 0:
+        return []
+    num_draft_tokens = torch.diff(cu_num_logits).to(torch.int64) - 1
+    valid_requests = torch.nonzero(
+        (num_draft_tokens > 0) & (request_temperatures == 0),
+        as_tuple=False,
+    ).flatten()[:max_rows]
+    if valid_requests.numel() == 0:
+        return []
+
+    starts = cu_num_logits[:-1].to(torch.int64).index_select(0, valid_requests)
+    q1_logits = processed_logits.index_select(0, starts).to(torch.float32)
+    top_values, top_ids = torch.topk(q1_logits, k=2, dim=-1)
+    draft_ids = draft_sampled.index_select(0, starts + 1).to(torch.int64)
+    sampler_target_ids = sampled.index_select(0, valid_requests)[:, 0].to(torch.int64)
+    draft_logits = q1_logits.gather(1, draft_ids[:, None]).squeeze(1)
+    draft_strict_ranks = 1 + (q1_logits > draft_logits[:, None]).sum(dim=1)
+    draft_rank_ends = (q1_logits >= draft_logits[:, None]).sum(dim=1)
+    sampler_target_logits = q1_logits.gather(
+        1, sampler_target_ids[:, None]
+    ).squeeze(1)
+    accepted_lengths = (
+        num_sampled.index_select(0, valid_requests).to(torch.int64) - 1
+    )
+
+    integer_rows = torch.stack(
+        (
+            valid_requests.to(torch.int64),
+            pos.index_select(0, starts).to(torch.int64),
+            num_draft_tokens.index_select(0, valid_requests),
+            accepted_lengths,
+            draft_ids,
+            sampler_target_ids,
+            top_ids[:, 0].to(torch.int64),
+            top_ids[:, 1].to(torch.int64),
+            draft_strict_ranks.to(torch.int64),
+            draft_rank_ends.to(torch.int64),
+        ),
+        dim=1,
+    ).cpu()
+    float_rows = torch.stack(
+        (
+            request_temperatures.index_select(0, valid_requests).to(torch.float32),
+            sampler_target_logits,
+            draft_logits,
+            top_values[:, 0],
+            top_values[:, 1],
+            top_values[:, 0] - top_values[:, 1],
+            sampler_target_logits - draft_logits,
+        ),
+        dim=1,
+    ).cpu()
+
+    records: list[dict[str, bool | float | int]] = []
+    for integer_row, float_row in zip(
+        integer_rows.tolist(), float_rows.tolist(), strict=True
+    ):
+        (
+            request_index,
+            position,
+            draft_count,
+            accepted_length,
+            draft_token_id,
+            sampler_target_id,
+            torch_top1_id,
+            torch_top2_id,
+            draft_strict_rank,
+            draft_rank_end,
+        ) = integer_row
+        (
+            temperature,
+            sampler_target_logit,
+            draft_logit,
+            torch_top1_logit,
+            torch_top2_logit,
+            top2_margin,
+            draft_gap,
+        ) = float_row
+        records.append(
+            {
+                "request_index": request_index,
+                "position": position,
+                "num_draft_tokens": draft_count,
+                "accepted_length": accepted_length,
+                "draft_token_id": draft_token_id,
+                "sampler_target_id": sampler_target_id,
+                "torch_top1_id": torch_top1_id,
+                "torch_top2_id": torch_top2_id,
+                "draft_strict_rank": draft_strict_rank,
+                "draft_rank_end": draft_rank_end,
+                "temperature": temperature,
+                "sampler_target_logit": sampler_target_logit,
+                "draft_logit": draft_logit,
+                "torch_top1_logit": torch_top1_logit,
+                "torch_top2_logit": torch_top2_logit,
+                "top2_margin": top2_margin,
+                "draft_gap": draft_gap,
+                "accepted": draft_token_id == sampler_target_id,
+                "sampler_argmax_matches_torch": (
+                    sampler_target_id == torch_top1_id
+                ),
+            }
+        )
+    return records
 
 
 @triton.jit
@@ -77,6 +200,15 @@ class RejectionSampler:
     ):
         self.sampler = sampler
         self.num_speculative_steps = spec_config.num_speculative_tokens
+        self._q1_audit_samples = 0
+        self._q1_audit_sample_limit = 0
+        if (
+            spec_config.method == "dspark"
+            and envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT
+        ):
+            self._q1_audit_sample_limit = max(
+                0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES
+            )
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
         self.synthetic_conditional_rates: torch.Tensor | None = None
@@ -171,7 +303,55 @@ class RejectionSampler:
                 use_fp64=self.sampler.use_fp64_gumbel,
                 use_block_verification=self.use_block_verification,
             )
+        self._audit_q1(
+            processed_logits,
+            draft_sampled,
+            sampled,
+            num_sampled,
+            pos,
+            cu_num_logits,
+            idx_mapping,
+        )
         return processed_logits, sampled, num_sampled
+
+    def _audit_q1(
+        self,
+        processed_logits: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        pos: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        remaining = self._q1_audit_sample_limit - self._q1_audit_samples
+        if remaining <= 0:
+            return
+        control_path = envs.VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH
+        if control_path and not os.path.exists(control_path):
+            return
+        request_temperatures = (
+            self.sampler.sampling_states.temperature.gpu.index_select(
+                0, idx_mapping.to(torch.int64)
+            )
+        )
+        records = _collect_q1_acceptance_audit_records(
+            processed_logits,
+            draft_sampled,
+            sampled,
+            num_sampled,
+            pos,
+            cu_num_logits,
+            request_temperatures,
+            remaining,
+        )
+        for record in records:
+            record["sample_index"] = self._q1_audit_samples
+            logger.info(
+                "DSpark q1 acceptance audit: %s",
+                json.dumps(record, sort_keys=True),
+            )
+            self._q1_audit_samples += 1
 
     def _verify_in_chunks(
         self,
