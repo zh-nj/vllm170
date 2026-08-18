@@ -788,6 +788,7 @@ def _resample_kernel(
         vocab_size,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
+        RNG_DOMAIN=0,
     )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(

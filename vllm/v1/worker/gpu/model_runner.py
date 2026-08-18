@@ -1267,6 +1267,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch,
                         # Draft logits are needed for probabilistic rejection sampling.
                         self.speculator.draft_logits,
+                        getattr(self.speculator, "draft_confidence", None),
                     )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected

@@ -12,6 +12,7 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
+    _collect_probabilistic_acceptance_audit_records,
     _collect_q1_acceptance_audit_records,
     _iter_request_chunks,
 )
@@ -99,6 +100,89 @@ def test_collect_q1_acceptance_audit_records() -> None:
             "accepted": False,
             "sampler_argmax_matches_torch": True,
         },
+    ]
+
+
+def test_collect_probabilistic_acceptance_audit_records() -> None:
+    processed_logits = torch.tensor(
+        [
+            [2.0, 1.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, float("-inf"), 2.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    draft_logits = torch.tensor(
+        [
+            [[1.0, 2.0, 0.0], [1.0, 0.0, 2.0]],
+            [[0.0, 2.0, 1.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+    draft_sampled = torch.tensor([9, 0, 1, 8, 1])
+    num_sampled = torch.tensor([2, 1], dtype=torch.int32)
+    pos = torch.tensor([100, 101, 102, 200, 201])
+    cu_num_logits = torch.tensor([0, 3, 5], dtype=torch.int32)
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
+    draft_confidence = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+
+    records = _collect_probabilistic_acceptance_audit_records(
+        processed_logits,
+        draft_logits,
+        draft_sampled,
+        num_sampled,
+        pos,
+        cu_num_logits,
+        idx_mapping,
+        max_rows=3,
+        draft_confidence=draft_confidence,
+    )
+
+    assert [(row["request_index"], row["draft_step"]) for row in records] == [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+    ]
+    assert records[0]["reached"] is True and records[0]["accepted"] is True
+    assert records[1]["reached"] is True and records[1]["accepted"] is False
+    assert records[2]["reached"] is True and records[2]["accepted"] is False
+    assert records[0]["top1_match"] is False
+    assert records[0]["confidence_logit"] == pytest.approx(0.3)
+    assert records[0]["confidence_probability"] == pytest.approx(
+        torch.sigmoid(torch.tensor(0.3)).item()
+    )
+    assert records[2]["draft_in_target_support"] is False
+    assert records[2]["draft_mass_outside_target_support"] == pytest.approx(
+        torch.softmax(draft_logits[0, 0], dim=-1)[1].item()
+    )
+    expected_overlap = torch.minimum(
+        torch.softmax(processed_logits[0], dim=-1),
+        torch.softmax(draft_logits[1, 0], dim=-1),
+    ).sum()
+    assert records[0]["expected_overlap"] == pytest.approx(expected_overlap.item())
+    assert records[0]["draft_temperature_ratio_07_expected_overlap"] == pytest.approx(
+        torch.minimum(
+            torch.softmax(processed_logits[0], dim=-1),
+            torch.softmax(draft_logits[1, 0] / 0.7, dim=-1),
+        )
+        .sum()
+        .item()
+    )
+    assert records[0]["target_support_oracle_expected_overlap"] == pytest.approx(
+        expected_overlap.item()
+    )
+    target_probs = torch.softmax(processed_logits[0], dim=-1)
+    draft_top1_id = draft_logits[1, 0].argmax()
+    assert records[0]["draft_top_k_1_expected_overlap"] == pytest.approx(
+        target_probs[draft_top1_id].item()
+    )
+    assert records[0]["draft_top_k_64_expected_overlap"] == pytest.approx(
+        expected_overlap.item()
+    )
+    assert "draft_top_p_050_expected_overlap" in records[0]
+    assert "draft_top_p_099_expected_overlap" in records[0]
+    assert records[2]["target_support_oracle_expected_overlap"] > records[2][
+        "expected_overlap"
     ]
 
 

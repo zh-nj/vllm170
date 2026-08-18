@@ -103,6 +103,16 @@ def conditional_acceptance_rates(
     return rates
 
 
+def resolve_top_p(scenario: str, requested: float | None) -> float:
+    """Resolve and validate the scenario-specific nucleus threshold."""
+    expected = 0.95 if scenario == "agentic" else 1.0
+    if requested is not None and not math.isclose(requested, expected):
+        raise ValueError(
+            f"{scenario} scenario requires top_p={expected}, got {requested}"
+        )
+    return expected
+
+
 def parse_spec_metrics(payload: str) -> SpecMetrics | None:
     values = {"drafts": 0, "draft_tokens": 0, "accepted_tokens": 0}
     accepted_tokens_per_pos: dict[int, int] = {}
@@ -233,12 +243,15 @@ def run_stream(
     prompt: str,
     max_tokens: int,
     seed: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": temperature,
+        "top_p": top_p,
         "seed": seed,
         "ignore_eos": True,
         "stream": True,
@@ -335,6 +348,12 @@ def build_result(
         "pp_size": 3,
         "tp_size": 1,
         "dspark_tokens": int(os.getenv("DSV4_DSPARK_TOKENS", "0")),
+        "dspark_draft_sample_method": os.getenv(
+            "DSV4_DSPARK_DRAFT_SAMPLE_METHOD", "greedy"
+        ),
+        "scenario": args.scenario,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
         "dspark_exact_topk": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "0"))
         ),
@@ -347,32 +366,32 @@ def build_result(
         "max_num_batched_tokens": int(os.getenv("DSV4_MAX_BATCHED_TOKENS", "1715")),
         "max_num_seqs": int(os.getenv("DSV4_MAX_NUM_SEQS", "8")),
         "indexer_max_logits_mb": int(
-            os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+            os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "96")
         ),
         "indexer_max_query_rows": int(
-            os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "0")
+            os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "1024")
         ),
         "indexer_prefill_caller_logits": bool(
-            int(os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "0"))
+            int(os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "1"))
         ),
-        "marlin_moe_block_size": int(os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "0")),
+        "marlin_moe_block_size": int(os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "48")),
         "marlin_moe_block_size_min_m": int(
-            os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "0")
+            os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "1000")
         ),
         "marlin_moe_caller_fp32_workspace": bool(
             int(os.getenv("VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE", "1"))
         ),
         "sparse_prefill_caller_output": bool(
-            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "0"))
+            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "1"))
         ),
         "sparse_prefill_block_k": int(
-            os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
+            os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "32")
         ),
         "sparse_decode_caller_output": bool(
-            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "0"))
+            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "1"))
         ),
         "sparse_decode_split": bool(
-            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "0"))
+            int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1"))
         ),
         "direct_ragged_swa": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
@@ -381,7 +400,7 @@ def build_result(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
         ),
         "dspark_kv_only_insert": bool(
-            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "0"))
+            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "1"))
         ),
         "mhc_pre_broadcast": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST", "1"))
@@ -428,6 +447,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="dsv4s")
     parser.add_argument("--context", type=int, default=32000)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--scenario", choices=("general", "agentic"), default="general")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float)
     parser.add_argument("--warmup-context", type=int)
     parser.add_argument("--seed", type=int, default=4242)
     parser.add_argument("--repeats", type=int, default=1)
@@ -442,10 +464,21 @@ def main() -> None:
     args = parse_args()
     if args.repeats <= 0:
         raise ValueError("repeats must be positive")
+    if not 0.0 <= args.temperature <= 2.0:
+        raise ValueError("temperature must be in [0, 2]")
+    args.top_p = resolve_top_p(args.scenario, args.top_p)
     wait_until_ready(args.base_url, args.startup_timeout)
     warmup_context = args.warmup_context or args.context
     warmup_prompt = make_exact_prompt(args.base_url, args.model, warmup_context, seed=1)
-    run_stream(args.base_url, args.model, warmup_prompt, 8, seed=1)
+    run_stream(
+        args.base_url,
+        args.model,
+        warmup_prompt,
+        8,
+        seed=1,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
     prompt = make_exact_prompt(args.base_url, args.model, args.context, args.seed)
     if args.phase_control is not None:
         args.phase_control.parent.mkdir(parents=True, exist_ok=True)
@@ -464,6 +497,8 @@ def main() -> None:
                 prompt,
                 args.max_tokens,
                 seed=args.seed,
+                temperature=args.temperature,
+                top_p=args.top_p,
             )
             if workload["prompt_tokens"] != args.context:
                 raise RuntimeError(

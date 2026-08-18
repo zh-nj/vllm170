@@ -22,10 +22,10 @@ DSpark 接受率收益，因此生产默认继续使用 broadcast 路径。
 
 后续 q1 审计确认了这一判断：四组 1K/32K、Graph/eager 数据共有 40 次 q1 拒绝，
 draft token 只有 1 次进入 target top-2。所有生产 sampler 与独立 PyTorch argmax 的差异
-都是 top-2 完全同分，没有非同分错误。进一步按 checkpoint 原生
-`dspark_block_size=5` 做生产形态 A/B 后，q5 相对 q7 的六次重复均值 decode 提升
-`2.15%`，ms/round 降低 `4.23%`。因此启动器生产默认已从 q7 调整为 q5；q7 只保留
-为 q8 selector 审计和回归对照。
+都是 top-2 完全同分，没有非同分错误。进一步做生产形态 A/B 后，q5 相对 q7 的六次
+重复均值 decode 提升 `2.15%`，ms/round 降低 `4.23%`。因此启动器的 CMP170HX 实测
+默认已从 q7 调整为 q5。官方模型 README 明确推荐 q7，所以 q7 仍是支持的生产候选，
+不能把 `dspark_block_size=5` 解释成 q7 超出 DSpark 合同。
 
 base/Markov 分解进一步覆盖 109 个 q1 轮次：最终 draft 命中 63 次，假设禁用 Markov
 只命中 58 次，Markov 共救回 12 次、破坏 7 次。当前不应关闭或缩放 Markov；后续正确
@@ -197,9 +197,10 @@ logits、实际 draft token、生产 rejection 输出与接受长度，同时用
 
 ### q5/q7 生产形态对照
 
-checkpoint 的 `config.json` 声明 `dspark_block_size=5`。q7 虽然通过 vLLM 的宽度校验，
-但它要求生成两个超出 checkpoint 原生 block 的尾部位置；实测 q6/q7 接受率经常接近零。
-关闭 q1 审计后，32K、128 output、Graph、固定请求 seed 的六次重复为：
+checkpoint 的 `config.json` 声明 `dspark_block_size=5`，但官方模型 README 推荐
+`num_speculative_tokens=7`。因此不能再把 q6/q7 的低无条件接受率归因于“超出原生
+block”；它首先受更长前缀的连乘口径影响。关闭 q1 审计后，32K、128 output、Graph、
+固定请求 seed 的六次重复为：
 
 | 指标 | q5 | q7 | q5 相对 q7 |
 | --- | ---: | ---: | ---: |
@@ -209,14 +210,22 @@ checkpoint 的 `config.json` 声明 `dspark_block_size=5`。q7 虽然通过 vLLM
 | mean decode | 110.92 tok/s | 108.58 tok/s | +2.15% |
 | PP2 workload peak | 62138 MiB | 62310 MiB | -172 MiB |
 
-q5 少验证两个低价值尾部 token，虽然每轮平均接受长度略降，但轮次更快，最终 decode
-吞吐稳定提升，同时减少 PP2 Graph/工作区显存。TTFT 差异约 0.8%，处于本机运行漂移内，
-不作为晋升依据。
+在这组 greedy A/B 中，q5 少验证两个边际收益较低的尾部 token，虽然每轮平均接受长度
+略降，但轮次更快，最终 decode 吞吐稳定提升，同时减少 PP2 Graph/工作区显存。该结果
+支持 q5 作为本机实测默认，不否定官方 q7 配置；probabilistic 模式仍需独立 q5/q7 A/B。
+TTFT 差异约 0.8%，处于本机运行漂移内，不作为晋升依据。
+
+后续 RNG-domain 修复后的 32K、9-seed probabilistic A/B 已补齐。general 中 q7 的
+accepted length 提高 `5.78%`，但 ms/round 增加 `5.38%`，合并 decode 仅 `+0.12%`；
+agentic `top_p=0.95` 中 accepted length 下降 `15.43%`，合并 decode 下降 `16.19%`。
+因此 q7 仍是官方支持宽度，但没有通过本机 probabilistic 晋升门，q5 继续作为
+CMP170HX 默认。
 
 证据：
 
 - q5：`profiles/deepseek_v4/dspark-q5-promotion/20260817T061441Z`
 - q7：`profiles/deepseek_v4/dspark-fixed-seed-per-pos/20260817T053441Z`
+- probabilistic q7：`profiles/deepseek_v4/probabilistic-q7-post-rng`
 
 ## 5. q1 base logits 与 Markov bias 分解
 
@@ -313,7 +322,7 @@ FP32 head 会改变近同分候选和后续生成轨迹；32K 虽提高 q1，却
 q3 的 round 快 2.36%，但 accepted length 少 13.35%，最终 decode 比 q5 慢 9.59%；
 q4 的平均 decode 仍比 q5 慢 0.75%，没有足够收益进入 A/B/A。由此可见“约 60% 接受率”
 不能脱离 draft 宽度解释：q5 分母更大，但每轮实际前进 token 更多。生产默认继续保持
-checkpoint 原生 q5。证据目录为
+CMP170HX 实测 q5。证据目录为
 `profiles/deepseek_v4/dspark-width-audit/{q3-graph-32k,q4-graph-32k}`。
 
 剩余主线仍是同一捕获输入的逐层高精度对照。优先顺序为 `main_proj/main_norm`、三层
@@ -385,7 +394,7 @@ q5 必须同时看 accepted length、ms/round、decode tok/s 和这两组逐位�
 把 q1 命中从 65/109 提升到 72/109：修复 13 行、损伤 6 行，净增 7 行。因此关闭
 Markov 并不是 q1 优化。
 
-当前结论是 checkpoint 原生 `q5 + Markov scale 1` 已在本机达到 accepted length
+当前结论是本机实测 `q5 + checkpoint Markov scale 1` 已达到 accepted length
 `3.521`、约 `110.92 tok/s` 的 32K Graph 基线；继续为抬高“接受百分比”调 scale、
 head dtype 或 proposal 宽度会降低实际吞吐。后续性能优化应以 q5 的 `ms/round` 为目标，
 而不是继续寻找已无证据支持的 SM80 接受率 bug。

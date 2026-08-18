@@ -141,6 +141,12 @@ def get_pp_indices(
     are attempting to reduce maximum memory consumption across partitions.
     """
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    if (
+        "VLLM_PP_LAYER_PARTITION" not in os.environ
+        and partition_list_str == "15,16,12"
+        and (num_hidden_layers != 43 or pp_size != 3)
+    ):
+        partition_list_str = None
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

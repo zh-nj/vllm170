@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 PROFILE_WORKLOAD = (
     Path(__file__).parents[2] / "benchmarks" / "deepseek_v4" / "profile_workload.py"
 )
@@ -125,8 +127,27 @@ def test_run_stream_passes_request_seed(monkeypatch) -> None:
         "prompt",
         max_tokens=2,
         seed=17,
+        temperature=1.0,
+        top_p=0.95,
     )
 
     assert captured_payload["seed"] == 17
+    assert captured_payload["temperature"] == 1.0
+    assert captured_payload["top_p"] == 0.95
     assert result["prompt_tokens"] == 3
     assert result["completion_tokens"] == 2
+
+
+@pytest.mark.parametrize(
+    ("scenario", "requested", "expected"),
+    (("general", None, 1.0), ("general", 1.0, 1.0), ("agentic", None, 0.95)),
+)
+def test_resolve_top_p_enforces_scenario_policy(
+    scenario: str, requested: float | None, expected: float
+) -> None:
+    assert profile_workload.resolve_top_p(scenario, requested) == expected
+
+
+def test_resolve_top_p_rejects_wrong_agentic_threshold() -> None:
+    with pytest.raises(ValueError, match="agentic scenario requires top_p=0.95"):
+        profile_workload.resolve_top_p("agentic", 1.0)

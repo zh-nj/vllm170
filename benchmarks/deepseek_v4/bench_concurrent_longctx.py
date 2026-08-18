@@ -21,6 +21,7 @@ from profile_workload import (
     SpecMetrics,
     conditional_acceptance_rates,
     fetch_metrics,
+    resolve_top_p,
 )
 
 WORDS = (
@@ -102,10 +103,25 @@ def request_json(
         return json.loads(response.read())
 
 
-def count_tokens(base_url: str, model: str, prompt: str) -> int:
+def count_tokens(
+    base_url: str,
+    model: str,
+    prompt: str,
+    reasoning_effort: str | None = None,
+) -> int:
+    payload: dict[str, Any] = {"model": model, "prompt": prompt}
+    if reasoning_effort is not None:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "reasoning_effort": reasoning_effort,
+            },
+        }
     response = request_json(
         f"{base_url}/tokenize",
-        {"model": model, "prompt": prompt},
+        payload,
         300,
     )
     count = response.get("count")
@@ -133,6 +149,7 @@ def make_exact_prompt(
     target_tokens: int,
     seed: int,
     needle: str,
+    reasoning_effort: str | None = None,
 ) -> str:
     rng = random.Random(seed)
     words = [rng.choice(WORDS) for _ in range(target_tokens)]
@@ -140,7 +157,9 @@ def make_exact_prompt(
     observations: list[tuple[int, int]] = []
     for _ in range(20):
         prompt = render_prompt(words, word_count, needle)
-        actual_tokens = count_tokens(base_url, model, prompt)
+        actual_tokens = count_tokens(
+            base_url, model, prompt, reasoning_effort=reasoning_effort
+        )
         observations.append((word_count, actual_tokens))
         if actual_tokens == target_tokens:
             return prompt
@@ -161,18 +180,30 @@ def run_stream(
     all_needles: tuple[str, ...],
     barrier: threading.Barrier,
     timeout: float,
+    seed: int,
+    temperature: float,
+    top_p: float,
+    reasoning_effort: str | None,
 ) -> RequestResult:
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "seed": seed,
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    endpoint = "completions"
+    if reasoning_effort is not None:
+        endpoint = "chat/completions"
+        payload.pop("prompt")
+        payload["messages"] = [{"role": "user", "content": prompt}]
+        payload["reasoning_effort"] = reasoning_effort
     request = urllib.request.Request(
-        f"{base_url}/v1/completions",
+        f"{base_url}/v1/{endpoint}",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -194,6 +225,14 @@ def run_stream(
                 usage.update(event["usage"])
             for choice in event.get("choices", ()):
                 text = choice.get("text", "")
+                if reasoning_effort is not None:
+                    delta = choice.get("delta") or {}
+                    text = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or delta.get("content")
+                        or ""
+                    )
                 if text:
                     first_token_at = first_token_at or time.perf_counter()
                     output.append(text)
@@ -237,21 +276,30 @@ def run_branch_stream(
     branches: int,
     seed: int,
     timeout: float,
+    temperature: float,
+    top_p: float,
+    reasoning_effort: str | None,
 ) -> tuple[float, float, float, dict[str, int], list[BranchResult]]:
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0.1,
-        "top_p": 1,
+        "temperature": temperature,
+        "top_p": top_p,
         "seed": seed,
         "ignore_eos": True,
         "n": branches,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    endpoint = "completions"
+    if reasoning_effort is not None:
+        endpoint = "chat/completions"
+        payload.pop("prompt")
+        payload["messages"] = [{"role": "user", "content": prompt}]
+        payload["reasoning_effort"] = reasoning_effort
     request = urllib.request.Request(
-        f"{base_url}/v1/completions",
+        f"{base_url}/v1/{endpoint}",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -272,6 +320,14 @@ def run_branch_stream(
                 usage.update(event["usage"])
             for choice in event.get("choices", ()):
                 text = choice.get("text", "")
+                if reasoning_effort is not None:
+                    delta = choice.get("delta") or {}
+                    text = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or delta.get("content")
+                        or ""
+                    )
                 if not text:
                     continue
                 first_token_at = first_token_at or time.perf_counter()
@@ -308,6 +364,12 @@ def main() -> None:
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--seed", type=int, default=170)
+    parser.add_argument(
+        "--scenario", choices=("general", "agentic"), default="general"
+    )
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float)
+    parser.add_argument("--reasoning-effort", choices=("low", "high", "max"))
     parser.add_argument("--mode", choices=("target", "dspark"), required=True)
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--output", type=Path, required=True)
@@ -316,6 +378,9 @@ def main() -> None:
         raise ValueError("concurrency must be positive")
     if args.branches <= 0:
         raise ValueError("branches must be positive")
+    if not 0.0 <= args.temperature <= 2.0:
+        raise ValueError("temperature must be in [0, 2]")
+    args.top_p = resolve_top_p(args.scenario, args.top_p)
     if args.branches > 1:
         if args.concurrency != 1:
             raise ValueError("branch mode requires --concurrency 1")
@@ -326,6 +391,7 @@ def main() -> None:
             args.prompt_tokens,
             args.seed,
             needle,
+            args.reasoning_effort,
         )
         metrics_before = fetch_metrics(args.base_url)
         (
@@ -342,6 +408,9 @@ def main() -> None:
             args.branches,
             args.seed,
             args.timeout,
+            args.temperature,
+            args.top_p,
+            args.reasoning_effort,
         )
         metrics_after = fetch_metrics(args.base_url)
         prompt_tokens = int(usage.get("prompt_tokens", 0))
@@ -354,6 +423,10 @@ def main() -> None:
             "branches": args.branches,
             "prompt_tokens": prompt_tokens,
             "max_tokens_per_branch": args.max_tokens,
+            "scenario": args.scenario,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "reasoning_effort": args.reasoning_effort,
             "completion_tokens": completion_tokens,
             "ttft_s": first_token_at - started_at,
             "decode_s": decode_s,
@@ -400,6 +473,7 @@ def main() -> None:
             args.prompt_tokens,
             args.seed + index,
             needles[index],
+            args.reasoning_effort,
         )
         for index in range(args.concurrency)
     ]
@@ -420,6 +494,10 @@ def main() -> None:
                 needles,
                 barrier,
                 args.timeout,
+                args.seed + index,
+                args.temperature,
+                args.top_p,
+                args.reasoning_effort,
             )
             for index in range(args.concurrency)
         ]
@@ -446,6 +524,10 @@ def main() -> None:
         "concurrency": args.concurrency,
         "prompt_tokens_per_request": args.prompt_tokens,
         "max_tokens_per_request": args.max_tokens,
+        "scenario": args.scenario,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "reasoning_effort": args.reasoning_effort,
         "total_tokens_per_request": args.prompt_tokens + args.max_tokens,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,

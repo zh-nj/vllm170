@@ -38,6 +38,15 @@ def test_custom_layer_partition(monkeypatch: pytest.MonkeyPatch):
             _verify("5,5,5,5", 21, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
 
 
+def test_default_cmp170hx_layer_partition(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    assert [get_pp_indices(43, rank, 3) for rank in range(3)] == [
+        (0, 15),
+        (15, 31),
+        (31, 43),
+    ]
+
+
 @pytest.mark.parametrize(
     "num_hidden_layers,pp_size,pp_rank,indices",
     [

@@ -38,6 +38,10 @@ _FP32_BYTES = 4
 
 logger = init_logger(__name__)
 
+_PROB_AUDIT_DRAFT_TEMPERATURE_RATIOS = (0.7, 0.8, 0.9, 1.1, 1.2, 1.3)
+_PROB_AUDIT_DRAFT_TOP_K = (1, 2, 4, 8, 16, 32, 64)
+_PROB_AUDIT_DRAFT_TOP_P = (0.5, 0.7, 0.8, 0.9, 0.95, 0.99)
+
 
 def _iter_request_chunks(
     cu_num_logits: np.ndarray, max_chunk_logits: int
@@ -171,6 +175,237 @@ def _collect_q1_acceptance_audit_records(
     return records
 
 
+def _collect_probabilistic_acceptance_audit_records(
+    processed_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    pos: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    max_rows: int,
+    draft_confidence: torch.Tensor | None = None,
+) -> list[dict[str, bool | float | int]]:
+    """Collect theoretical overlap and observed probabilistic acceptance."""
+    if max_rows <= 0:
+        return []
+
+    cu_num_logits_cpu = cu_num_logits.to(torch.int64).cpu().tolist()
+    idx_mapping_cpu = idx_mapping.to(torch.int64).cpu().tolist()
+    row_indices: list[int] = []
+    request_indices: list[int] = []
+    request_state_indices: list[int] = []
+    draft_steps: list[int] = []
+    for request_index, request_state_index in enumerate(idx_mapping_cpu):
+        start = cu_num_logits_cpu[request_index]
+        num_draft_tokens = cu_num_logits_cpu[request_index + 1] - start - 1
+        for draft_step in range(num_draft_tokens):
+            row_indices.append(start + draft_step)
+            request_indices.append(request_index)
+            request_state_indices.append(request_state_index)
+            draft_steps.append(draft_step)
+            if len(row_indices) >= max_rows:
+                break
+        if len(row_indices) >= max_rows:
+            break
+    if not row_indices:
+        return []
+
+    device = processed_logits.device
+    row_tensor = torch.tensor(row_indices, dtype=torch.int64, device=device)
+    request_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
+    state_tensor = torch.tensor(
+        request_state_indices, dtype=torch.int64, device=device
+    )
+    step_tensor = torch.tensor(draft_steps, dtype=torch.int64, device=device)
+    target = processed_logits.index_select(0, row_tensor).to(torch.float32)
+    draft = draft_logits[state_tensor, step_tensor].to(torch.float32)
+    target_probs = target.softmax(dim=-1)
+    draft_probs = draft.softmax(dim=-1)
+    target_support = torch.isfinite(target)
+    overlap = torch.minimum(target_probs, draft_probs).sum(dim=-1)
+    draft_mass_outside_target = draft_probs.masked_fill(target_support, 0.0).sum(
+        dim=-1
+    )
+    counterfactual_overlaps = {
+        ratio: torch.minimum(
+            target_probs,
+            (draft / ratio).softmax(dim=-1),
+        ).sum(dim=-1)
+        for ratio in _PROB_AUDIT_DRAFT_TEMPERATURE_RATIOS
+    }
+
+    draft_sorted, draft_sort_indices = draft.sort(dim=-1, descending=False)
+    target_sorted_probs = target_probs.gather(1, draft_sort_indices)
+    target_sorted_support = target_support.gather(1, draft_sort_indices)
+    draft_sorted_cumulative = draft_sorted.softmax(dim=-1).cumsum(dim=-1)
+    top_k_overlaps: dict[int, torch.Tensor] = {}
+    for top_k in _PROB_AUDIT_DRAFT_TOP_K:
+        keep = min(top_k, draft.shape[-1])
+        top_k_logits = draft_sorted.clone()
+        top_k_logits[:, :-keep] = float("-inf")
+        top_k_probs = top_k_logits.softmax(dim=-1)
+        top_k_overlaps[top_k] = torch.minimum(
+            target_sorted_probs, top_k_probs
+        ).sum(dim=-1)
+
+    top_p_overlaps: dict[float, torch.Tensor] = {}
+    draft_top_p_mass_outside_target: torch.Tensor | None = None
+    for top_p in _PROB_AUDIT_DRAFT_TOP_P:
+        top_p_mask = draft_sorted_cumulative <= 1.0 - top_p
+        top_p_mask[:, -1] = False
+        top_p_logits = draft_sorted.masked_fill(top_p_mask, float("-inf"))
+        top_p_probs = top_p_logits.softmax(dim=-1)
+        top_p_overlaps[top_p] = torch.minimum(
+            target_sorted_probs, top_p_probs
+        ).sum(dim=-1)
+        if top_p == 0.95:
+            draft_top_p_mass_outside_target = top_p_probs.masked_fill(
+                target_sorted_support, 0.0
+            ).sum(dim=-1)
+    assert draft_top_p_mass_outside_target is not None
+
+    target_support_draft_probs = draft_probs.masked_fill(~target_support, 0.0)
+    target_support_draft_probs /= target_support_draft_probs.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(torch.finfo(target_support_draft_probs.dtype).tiny)
+    target_support_overlap = torch.minimum(
+        target_probs, target_support_draft_probs
+    ).sum(dim=-1)
+    draft_ids = draft_sampled.index_select(0, row_tensor + 1).to(torch.int64)
+    target_selected = target_probs.gather(1, draft_ids[:, None]).squeeze(1)
+    draft_selected = draft_probs.gather(1, draft_ids[:, None]).squeeze(1)
+    sampled_accept_probability = torch.minimum(
+        torch.ones_like(target_selected), target_selected / draft_selected
+    )
+    accepted_lengths = (
+        num_sampled.index_select(0, request_tensor).to(torch.int64) - 1
+    )
+
+    integer_rows = torch.stack(
+        (
+            request_tensor,
+            state_tensor,
+            step_tensor,
+            pos.index_select(0, row_tensor).to(torch.int64),
+            accepted_lengths,
+            draft_ids,
+            target.argmax(dim=-1).to(torch.int64),
+            draft.argmax(dim=-1).to(torch.int64),
+        ),
+        dim=1,
+    ).cpu()
+    float_rows = torch.stack(
+        (
+            overlap,
+            sampled_accept_probability,
+            target_selected,
+            draft_selected,
+            draft_mass_outside_target,
+            *(top_k_overlaps[top_k] for top_k in _PROB_AUDIT_DRAFT_TOP_K),
+            *(top_p_overlaps[top_p] for top_p in _PROB_AUDIT_DRAFT_TOP_P),
+            draft_top_p_mass_outside_target,
+            target_support_overlap,
+            *(
+                counterfactual_overlaps[ratio]
+                for ratio in _PROB_AUDIT_DRAFT_TEMPERATURE_RATIOS
+            ),
+        ),
+        dim=1,
+    ).cpu()
+    confidence_rows = (
+        draft_confidence[state_tensor, step_tensor].to(torch.float32).cpu().tolist()
+        if draft_confidence is not None
+        else [None] * len(row_indices)
+    )
+
+    records: list[dict[str, bool | float | int]] = []
+    for integer_row, float_row, confidence_logit in zip(
+        integer_rows.tolist(),
+        float_rows.tolist(),
+        confidence_rows,
+        strict=True,
+    ):
+        (
+            request_index,
+            request_state_index,
+            draft_step,
+            position,
+            accepted_length,
+            draft_token_id,
+            target_top1_id,
+            draft_top1_id,
+        ) = integer_row
+        (
+            expected_overlap,
+            sampled_probability,
+            target_probability,
+            draft_probability,
+            outside_mass,
+        ) = float_row[:5]
+        num_top_k = len(_PROB_AUDIT_DRAFT_TOP_K)
+        num_top_p = len(_PROB_AUDIT_DRAFT_TOP_P)
+        filtered_start = 5
+        top_k_overlap_values = float_row[
+            filtered_start : filtered_start + num_top_k
+        ]
+        top_p_start = filtered_start + num_top_k
+        top_p_overlap_values = float_row[top_p_start : top_p_start + num_top_p]
+        draft_top_p_outside_mass = float_row[top_p_start + num_top_p]
+        target_support_expected_overlap = float_row[top_p_start + num_top_p + 1]
+        temperature_ratio_overlaps = float_row[top_p_start + num_top_p + 2 :]
+        record: dict[str, bool | float | int] = {
+            "request_index": request_index,
+            "request_state_index": request_state_index,
+            "draft_step": draft_step,
+            "position": position,
+            "accepted_length": accepted_length,
+            "draft_token_id": draft_token_id,
+            "target_top1_id": target_top1_id,
+            "draft_top1_id": draft_top1_id,
+            "reached": draft_step <= accepted_length,
+            "accepted": draft_step < accepted_length,
+            "top1_match": target_top1_id == draft_top1_id,
+            "draft_in_target_support": target_probability > 0.0,
+            "expected_overlap": expected_overlap,
+            "sampled_accept_probability": sampled_probability,
+            "target_probability": target_probability,
+            "draft_probability": draft_probability,
+            "draft_mass_outside_target_support": outside_mass,
+            "draft_top_p_095_mass_outside_target_support": (
+                draft_top_p_outside_mass
+            ),
+            "target_support_oracle_expected_overlap": (
+                target_support_expected_overlap
+            ),
+        }
+        for top_k, top_k_overlap in zip(
+            _PROB_AUDIT_DRAFT_TOP_K, top_k_overlap_values, strict=True
+        ):
+            record[f"draft_top_k_{top_k}_expected_overlap"] = top_k_overlap
+        for top_p, top_p_overlap in zip(
+            _PROB_AUDIT_DRAFT_TOP_P, top_p_overlap_values, strict=True
+        ):
+            top_p_label = f"{top_p:.2f}".replace(".", "")
+            record[f"draft_top_p_{top_p_label}_expected_overlap"] = top_p_overlap
+        for ratio, ratio_overlap in zip(
+            _PROB_AUDIT_DRAFT_TEMPERATURE_RATIOS,
+            temperature_ratio_overlaps,
+            strict=True,
+        ):
+            ratio_label = f"{ratio:.1f}".replace(".", "")
+            record[f"draft_temperature_ratio_{ratio_label}_expected_overlap"] = (
+                ratio_overlap
+            )
+        if confidence_logit is not None:
+            record["confidence_logit"] = confidence_logit
+            record["confidence_probability"] = torch.sigmoid(
+                torch.tensor(confidence_logit)
+            ).item()
+        records.append(record)
+    return records
+
+
 @triton.jit
 def _flatten_sampled_kernel(
     # [num_logits]
@@ -208,6 +443,16 @@ class RejectionSampler:
         ):
             self._q1_audit_sample_limit = max(
                 0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES
+            )
+        self._prob_audit_samples = 0
+        self._prob_audit_sample_limit = 0
+        if (
+            spec_config.method == "dspark"
+            and spec_config.draft_sample_method == "probabilistic"
+            and envs.VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT
+        ):
+            self._prob_audit_sample_limit = max(
+                0, envs.VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES
             )
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
@@ -270,6 +515,7 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        draft_confidence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with optional_phase_profile_stage(
             "target.rejection.apply_sampling_params", logits
@@ -312,7 +558,55 @@ class RejectionSampler:
             cu_num_logits,
             idx_mapping,
         )
+        self._audit_probabilistic(
+            processed_logits,
+            draft_logits,
+            draft_sampled,
+            num_sampled,
+            pos,
+            cu_num_logits,
+            idx_mapping,
+            draft_confidence,
+        )
         return processed_logits, sampled, num_sampled
+
+    def _audit_probabilistic(
+        self,
+        processed_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        pos: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        draft_confidence: torch.Tensor | None,
+    ) -> None:
+        remaining = self._prob_audit_sample_limit - self._prob_audit_samples
+        if remaining <= 0 or draft_logits is None:
+            return
+        control_path = envs.VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH
+        if control_path and not os.path.exists(control_path):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        records = _collect_probabilistic_acceptance_audit_records(
+            processed_logits,
+            draft_logits,
+            draft_sampled,
+            num_sampled,
+            pos,
+            cu_num_logits,
+            idx_mapping,
+            remaining,
+            draft_confidence,
+        )
+        for record in records:
+            record["sample_index"] = self._prob_audit_samples
+            logger.info(
+                "DSpark probabilistic acceptance audit: %s",
+                json.dumps(record, sort_keys=True),
+            )
+            self._prob_audit_samples += 1
 
     def _audit_q1(
         self,
@@ -362,6 +656,7 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         max_num_logprobs: int,
+        draft_confidence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
@@ -385,6 +680,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                draft_confidence,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -423,6 +719,7 @@ class RejectionSampler:
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
+        draft_confidence: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -453,6 +750,7 @@ class RejectionSampler:
                 pos,
                 max_chunk_logits,
                 max_num_logprobs,
+                draft_confidence,
             )
 
         with optional_phase_profile_stage("target.rejection.counts", num_sampled):

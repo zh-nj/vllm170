@@ -318,6 +318,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
+                rng_domain=1,
             )
         return self._greedy_sample_draft(hidden_states)
 

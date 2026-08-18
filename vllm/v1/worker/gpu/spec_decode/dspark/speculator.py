@@ -25,6 +25,7 @@ backbone forward AND the sequential Markov sampling.
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -269,6 +270,16 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
+        self.draft_confidence = (
+            torch.empty(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                dtype=torch.float32,
+                device=device,
+            )
+            if envs.VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT
+            else None
+        )
         self._q1_drafter_audit_samples = 0
         self._q1_drafter_audit_sample_limit = (
             max(0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES)
@@ -280,6 +291,18 @@ class DSparkSpeculator(DFlashSpeculator):
             if self._q1_drafter_audit_sample_limit > 0
             else None
         )
+        self._reference_dump_path = (
+            envs.VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH
+        )
+        self._reference_dump_active = False
+        self._reference_dump_written = False
+        self._reference_dump: dict[str, Any] | None = None
+
+    def _capture_reference_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if not self._reference_dump_active:
+            return
+        assert self._reference_dump is not None
+        self._reference_dump[name] = tensor.detach().to(device="cpu", copy=True)
 
     def set_target_hidden_states_workspace(self, workspace: torch.Tensor) -> bool:
         if (
@@ -299,11 +322,22 @@ class DSparkSpeculator(DFlashSpeculator):
         num_target_tokens: int,
     ) -> torch.Tensor:
         if self._target_hidden_states_workspace is None:
-            return super()._prepare_context_hidden_states(
+            hidden_states = super()._prepare_context_hidden_states(
                 last_hidden_states, aux_hidden_states, num_target_tokens
             )
+            if aux_hidden_states:
+                for i, tensor in enumerate(aux_hidden_states):
+                    self._capture_reference_tensor(
+                        f"target_aux_hidden_{i}", tensor[:num_target_tokens]
+                    )
+            self._capture_reference_tensor(
+                "context_main_x", hidden_states[:num_target_tokens]
+            )
+            return hidden_states
         if not aux_hidden_states:
-            return last_hidden_states[:num_target_tokens]
+            hidden_states = last_hidden_states[:num_target_tokens]
+            self._capture_reference_tensor("context_main_x", hidden_states)
+            return hidden_states
 
         num_rows = aux_hidden_states[0].shape[0]
         packed_width = sum(tensor.shape[-1] for tensor in aux_hidden_states)
@@ -326,6 +360,13 @@ class DSparkSpeculator(DFlashSpeculator):
             packed_hidden_states = torch.cat(aux_hidden_states, dim=-1)
 
         hidden_states = self.model.combine_hidden_states(packed_hidden_states)
+        for i, tensor in enumerate(aux_hidden_states):
+            self._capture_reference_tensor(
+                f"target_aux_hidden_{i}", tensor[:num_target_tokens]
+            )
+        self._capture_reference_tensor(
+            "context_main_x", hidden_states[:num_target_tokens]
+        )
         return hidden_states[:num_target_tokens]
 
     def load_draft_model(
@@ -404,6 +445,14 @@ class DSparkSpeculator(DFlashSpeculator):
             base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        sample_hidden_by_step = sample_hidden.view(num_reqs, n_spec, -1)
+        self._capture_reference_tensor("draft_head_hidden", sample_hidden_by_step)
+        self._capture_reference_tensor("draft_base_logits", base_logits)
+        if self._reference_dump_active:
+            assert self._reference_dump is not None
+            self._reference_dump["draft_previous_ids"] = []
+            self._reference_dump["draft_markov_bias"] = []
+            self._reference_dump["draft_final_logits"] = []
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -420,6 +469,23 @@ class DSparkSpeculator(DFlashSpeculator):
                 markov_embed = self.model.markov_embed(prev)
                 bias = self.model.markov_bias(markov_embed)
                 logits_i = base_logits[:, i] + bias
+                if self.draft_confidence is not None:
+                    self.draft_confidence[:num_reqs, i] = (
+                        self.model.compute_draft_confidence(
+                            sample_hidden_by_step[:, i], markov_embed
+                        )
+                    )
+            if self._reference_dump_active:
+                assert self._reference_dump is not None
+                self._reference_dump["draft_previous_ids"].append(
+                    prev.detach().to(device="cpu", copy=True)
+                )
+                self._reference_dump["draft_markov_bias"].append(
+                    bias.detach().to(device="cpu", copy=True)
+                )
+                self._reference_dump["draft_final_logits"].append(
+                    logits_i.detach().to(device="cpu", copy=True)
+                )
             with phase_profile_stage(
                 "draft.markov_sample",
                 logits_i,
@@ -445,6 +511,7 @@ class DSparkSpeculator(DFlashSpeculator):
                         output_processed_logits=self.draft_logits,
                         output_processed_logits_col=self._step_cols[i],
                         use_fp64=self.use_fp64_gumbel,
+                        rng_domain=1,
                     )
                 else:
                     draft_sampled_i = self.model.map_draft_to_target(
@@ -472,13 +539,62 @@ class DSparkSpeculator(DFlashSpeculator):
     def propose(
         self, input_batch: InputBatch, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
+        control_path = envs.VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH
+        control_ready = not control_path or os.path.exists(control_path)
+        should_dump = (
+            bool(self._reference_dump_path)
+            and not self._reference_dump_written
+            and not kwargs.get("dummy_run", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and control_ready
+        )
+        if should_dump:
+            self._reference_dump_active = True
+            self._reference_dump = {
+                "schema_version": 1,
+                "num_reqs": input_batch.num_reqs,
+                "num_target_tokens": input_batch.num_tokens,
+                "num_speculative_steps": self.num_speculative_steps,
+            }
         if self._q1_drafter_audit_sample_limit > 0:
             decode_mask = self._q1_drafter_decode_mask
             assert decode_mask is not None
             decode_mask[: input_batch.num_reqs].copy_(
                 torch.from_numpy(_get_q1_drafter_audit_eligible_rows(input_batch))
             )
-        return super().propose(input_batch, *args, **kwargs)
+        try:
+            draft_tokens = super().propose(input_batch, *args, **kwargs)
+            if should_dump:
+                num_reqs = input_batch.num_reqs
+                num_query_tokens = num_reqs * self.num_query_per_req
+                num_target_tokens = input_batch.num_tokens
+                self._capture_reference_tensor(
+                    "context_positions",
+                    self.context_positions[:num_target_tokens],
+                )
+                self._capture_reference_tensor(
+                    "query_input_ids",
+                    self.input_buffers.input_ids[:num_query_tokens],
+                )
+                self._capture_reference_tensor(
+                    "query_positions",
+                    self.input_buffers.positions[:num_query_tokens],
+                )
+                self._capture_reference_tensor(
+                    "sample_indices",
+                    self.sample_indices[: num_reqs * self.num_speculative_steps],
+                )
+                self._capture_reference_tensor("draft_tokens", draft_tokens)
+                assert self._reference_dump is not None
+                output_path = Path(self._reference_dump_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(self._reference_dump, output_path)
+                self._reference_dump_written = True
+                logger.info("Saved DSpark reference dump to %s", output_path)
+            return draft_tokens
+        finally:
+            if should_dump:
+                self._reference_dump_active = False
 
     def _generate_draft(
         self,

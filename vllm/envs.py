@@ -47,8 +47,8 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
-    VLLM_PP_LAYER_PARTITION: str | None = None
-    VLLM_PP_REUSE_RECV_BUFFER: bool = False
+    VLLM_PP_LAYER_PARTITION: str | None = "15,16,12"
+    VLLM_PP_REUSE_RECV_BUFFER: bool = True
     VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -59,23 +59,23 @@ if TYPE_CHECKING:
     VLLM_CPU_INT4_W4A8: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
-    VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
-    VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS: int = 0
+    VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 96
+    VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS: int = 1024
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB: int = 512
-    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = False
-    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 0
-    VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT: bool = False
-    VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT: bool = False
-    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = False
-    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = False
-    VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = False
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT: bool = True
+    VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 32
+    VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT: bool = True
+    VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT: bool = True
+    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = True
+    VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = True
+    VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT: bool = True
     VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER: bool = True
     VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST: bool = True
     VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A: bool = True
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
-    VLLM_INDEXER_PREFILL_CALLER_LOGITS: bool = False
+    VLLM_INDEXER_PREFILL_CALLER_LOGITS: bool = True
     VLLM_INDEXER_PREFILL_STREAMING_TOPK: bool = False
     VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN: int = 16384
     VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE: int = 16384
@@ -87,6 +87,9 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES: int = 8
     VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES: int = 64
+    VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES: int = 64
+    VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH: str = ""
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN: int = 0
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_SAMPLES: int = 8
@@ -97,8 +100,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS: str = "prefill,decode,dspark"
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES: str = ""
-    VLLM_MARLIN_MOE_BLOCK_SIZE: int = 0
-    VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M: int = 0
+    VLLM_MARLIN_MOE_BLOCK_SIZE: int = 48
+    VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M: int = 1000
     VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -106,7 +109,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
-    VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
+    VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "spawn"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -893,11 +896,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else True
     ),
     # Pipeline stage partition strategy
-    "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", "15,16,12"),
     # Receive PP activations directly into the V2 runner's stable input arena.
-    # This stays opt-in until the target topology passes real-hardware A/B.
     "VLLM_PP_REUSE_RECV_BUFFER": lambda: bool(
-        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER", "0"))
+        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER", "1"))
     ),
     # Validate that PP receive-buffer reuse stays on the worker's main CUDA stream.
     "VLLM_PP_REUSE_RECV_BUFFER_DEBUG": lambda: bool(
@@ -967,9 +969,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0"))
     ),
     # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
+    # Both spawn and fork work.
     "VLLM_WORKER_MULTIPROC_METHOD": env_with_choices(
-        "VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork"]
+        "VLLM_WORKER_MULTIPROC_METHOD", "spawn", ["spawn", "fork"]
     ),
     # Path to the cache for storing downloaded assets
     "VLLM_ASSETS_CACHE": lambda: os.path.expanduser(
@@ -1100,12 +1102,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XLA_USE_SPMD": lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
-    # Default: 512 MB
+    # Default: 96 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
-        os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "96")
     ),
     "VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS": lambda: int(
-        os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "0")
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS", "1024")
     ),
     # Maximum BF16 gather workspace for DeepSeek V4 sparse prefill. The
     # implementation reduces requests per chunk as context grows. One request
@@ -1115,23 +1117,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB", "512")
     ),
     "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "1"))
     ),
     # Hardware-specific sparse prefill K tile. Zero retains the backend default.
     "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "0")
+        os.getenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K", "32")
     ),
     "VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", "1"))
     ),
     "VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1"))
     ),
     "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
     ),
     "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
     ),
     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
         os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
@@ -1143,7 +1145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
     ),
     "VLLM_INDEXER_PREFILL_CALLER_LOGITS": lambda: (
-        os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "0") == "1"
+        os.getenv("VLLM_INDEXER_PREFILL_CALLER_LOGITS", "1") == "1"
     ),
     "VLLM_INDEXER_PREFILL_STREAMING_TOPK": lambda: (
         os.getenv("VLLM_INDEXER_PREFILL_STREAMING_TOPK", "0") == "1"
@@ -1189,11 +1191,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES", "64")
     ),
+    "VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES", "64")
+    ),
+    "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH": lambda: os.getenv(
+        "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH", ""
+    ),
     "VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT", "0"))
     ),
     "VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "1"))
     ),
     "VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER", "1"))
@@ -1234,10 +1245,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Marlin MoE token alignment block size for hardware-specific A/B.
     # Zero keeps the shape heuristic.
     "VLLM_MARLIN_MOE_BLOCK_SIZE": lambda: int(
-        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "0")
+        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "48")
     ),
     "VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M": lambda: int(
-        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "0")
+        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "1000")
     ),
     "VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE": lambda: bool(
         int(os.getenv("VLLM_MARLIN_MOE_CALLER_FP32_WORKSPACE", "1"))
@@ -2329,6 +2340,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.

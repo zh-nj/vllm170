@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 import vllm.envs as envs
+from vllm.env_override import _set_project_environment_defaults
 from vllm.envs import (
     disable_envs_cache,
     enable_envs_cache,
@@ -16,6 +17,46 @@ from vllm.envs import (
     environment_variables,
 )
 from vllm.exceptions import VLLMValidationError
+
+
+def test_cmp170hx_project_environment_defaults() -> None:
+    expected = {
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "VLLM_PP_LAYER_PARTITION": "15,16,12",
+        "VLLM_PP_REUSE_RECV_BUFFER": True,
+        "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": 96,
+        "VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS": 1024,
+        "VLLM_INDEXER_PREFILL_CALLER_LOGITS": True,
+        "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_TEMP_MB": 512,
+        "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT": True,
+        "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K": 32,
+        "VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT": True,
+        "VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT": True,
+        "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": True,
+        "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128": True,
+        "VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT": True,
+        "VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER": True,
+        "VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A": True,
+        "VLLM_MARLIN_MOE_BLOCK_SIZE": 48,
+        "VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M": 1000,
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        actual = {name: environment_variables[name]() for name in expected}
+    assert actual == expected
+
+
+def test_external_project_environment_defaults_preserve_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("NCCL_P2P_DISABLE", "HF_HUB_OFFLINE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+
+    _set_project_environment_defaults()
+
+    assert os.environ["NCCL_P2P_DISABLE"] == "1"
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
 
 
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):

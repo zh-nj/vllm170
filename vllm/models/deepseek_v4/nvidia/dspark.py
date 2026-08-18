@@ -147,6 +147,16 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self.confidence_head = (
+            nn.Linear(
+                config.hidden_size + config.dspark_markov_rank,
+                1,
+                bias=False,
+                dtype=torch.float32,
+            )
+            if envs.VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT
+            else None
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -410,6 +420,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         with phase_profile_stage("draft.markov.projection", markov_embed):
             return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def compute_draft_confidence(
+        self, hidden_states: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        confidence_head = self.model.confidence_head
+        assert confidence_head is not None
+        features = torch.cat((hidden_states, markov_embed), dim=-1).to(torch.float32)
+        return confidence_head(features).squeeze(-1)
+
     # --- Weight loading ----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -553,9 +571,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
         if rest.startswith("confidence_head."):
-            return None
+            if self.model.confidence_head is None:
+                return None
+            return "model.confidence_head." + rest.removeprefix(
+                "confidence_head.proj."
+            )
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
         head_prefixes = (

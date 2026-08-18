@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -126,6 +127,77 @@ def _assert_distribution_match(
         f"{prefix}Chi-squared test failed: chi2={chi2:.1f}, "
         f"df={df}, threshold={threshold:.1f}. "
         f"Output distribution does not match target distribution."
+    )
+
+
+def test_draft_rng_domain_preserves_target_distribution():
+    """Draft sampling and target rejection must use independent RNG domains."""
+    torch.manual_seed(170)
+    device = "cuda"
+    num_trials = 65536
+    vocab_size = 128
+    target_logits_1d = torch.randn(vocab_size, device=device) * 1.3
+    draft_logits_1d = (
+        target_logits_1d * 0.7 + torch.randn(vocab_size, device=device) * 0.8
+    )
+
+    idx_mapping = torch.arange(num_trials, dtype=torch.int32, device=device)
+    seeds = torch.arange(num_trials, dtype=torch.int64, device=device) + 7000
+    temperature = torch.ones(num_trials, dtype=torch.float32, device=device)
+    positions = torch.full((num_trials,), 123, dtype=torch.int32, device=device)
+    draft_logits = torch.empty(
+        num_trials, 1, vocab_size, dtype=torch.float32, device=device
+    )
+    draft_ids = gumbel_sample(
+        draft_logits_1d.expand(num_trials, -1).contiguous(),
+        idx_mapping,
+        temperature,
+        seeds,
+        positions,
+        apply_temperature=True,
+        output_processed_logits=draft_logits,
+        output_processed_logits_col=torch.zeros((), dtype=torch.int32, device=device),
+        rng_domain=1,
+    )
+
+    draft_sampled = torch.zeros(
+        num_trials, 2, dtype=torch.int64, device=device
+    )
+    draft_sampled[:, 1] = draft_ids
+    cu_num_logits = (
+        torch.arange(num_trials + 1, dtype=torch.int32, device=device) * 2
+    )
+    expanded_idx_mapping = idx_mapping.repeat_interleave(2)
+    expanded_local_pos = torch.arange(
+        2, dtype=torch.int32, device=device
+    ).repeat(num_trials)
+    rejection_positions = torch.empty(
+        num_trials, 2, dtype=torch.int32, device=device
+    )
+    rejection_positions[:, 0] = positions
+    rejection_positions[:, 1] = positions + 1
+    target_logits = target_logits_1d.expand(num_trials * 2, -1).contiguous()
+
+    sampled, _ = rejection_sample(
+        target_logits=target_logits,
+        draft_logits=draft_logits,
+        draft_sampled=draft_sampled.flatten(),
+        cu_num_logits=cu_num_logits,
+        pos=rejection_positions.flatten(),
+        idx_mapping=idx_mapping,
+        expanded_idx_mapping=expanded_idx_mapping,
+        expanded_local_pos=expanded_local_pos,
+        temperature=temperature,
+        seed=seeds,
+        num_speculative_steps=1,
+    )
+
+    _assert_distribution_match(
+        sampled[:, 0],
+        target_logits_1d.softmax(dim=0),
+        device,
+        label="draft RNG domain",
+        min_expected=20.0,
     )
 
 

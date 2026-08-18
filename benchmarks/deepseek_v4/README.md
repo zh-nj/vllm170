@@ -16,7 +16,8 @@ The defaults are the measured three-card configuration:
 
 - physical GPUs `1,2,3`, PP3 with `15,15,13` layers and TP1;
 - Triton sparse MLA, FP8 KV cache, block size 256;
-- CUDA Graph execution and checkpoint-native DSpark with 5 speculative tokens;
+- CUDA Graph execution and the measured CMP170HX DSpark default of 5
+  speculative tokens; the official model README recommends width 7;
 - 131,072-token context, 1,715 batched tokens, and 8 sequences;
 - a 96 MiB caller-owned sparse-indexer logits budget, a 1,024-row cap, and
   1.6 GB KV cache per GPU;
@@ -50,10 +51,92 @@ normal serving:
 DSV4_MODE=production benchmarks/deepseek_v4/run_cmp170hx_pp3.sh
 ```
 
+Probabilistic DSpark must be enabled explicitly; request-side temperature alone
+does not change the draft sampler:
+
+```bash
+DSV4_DSPARK_TOKENS=5 \
+DSV4_DSPARK_DRAFT_SAMPLE_METHOD=probabilistic \
+DSV4_MODE=production \
+benchmarks/deepseek_v4/run_cmp170hx_pp3.sh
+```
+
+Send `temperature=1.0, top_p=1.0` for general sampling and
+`temperature=1.0, top_p=0.95` for agentic traffic. The profile and long-context
+harnesses enforce this scenario-to-`top_p` mapping. For tool-call validation,
+start the service with `--enable-auto-tool-choice --tool-call-parser
+deepseek_v4`, then run:
+
+```bash
+.venv/bin/python benchmarks/deepseek_v4/bench_probabilistic_agentic.py \
+  --base-url http://127.0.0.1:8098 --model dsv4s --repeats 3 \
+  --output /tmp/dsv4-probabilistic-agentic.json
+```
+
+`bench_concurrent_longctx.py` can also exercise the real chat-template
+reasoning levels. For example, keep `top_p=1.0` fixed and run the same prompt
+and seed twice to compare temperature under maximum reasoning:
+
+```bash
+.venv/bin/python benchmarks/deepseek_v4/bench_concurrent_longctx.py \
+  --base-url http://127.0.0.1:8098 --model dsv4s \
+  --concurrency 1 --prompt-tokens 32768 --max-tokens 128 \
+  --seed 8400 --scenario general --top-p 1.0 \
+  --reasoning-effort max --temperature 0 --mode dspark \
+  --output /tmp/dsv4-max-temp0.json
+
+.venv/bin/python benchmarks/deepseek_v4/bench_concurrent_longctx.py \
+  --base-url http://127.0.0.1:8098 --model dsv4s \
+  --concurrency 1 --prompt-tokens 32768 --max-tokens 128 \
+  --seed 8400 --scenario general --top-p 1.0 \
+  --reasoning-effort max --temperature 1 --mode dspark \
+  --output /tmp/dsv4-max-temp1.json
+```
+
+When `--reasoning-effort` is present, the harness uses the chat endpoint and
+counts the fully rendered chat prompt, so `--prompt-tokens` remains exact.
+
+The CMP170HX PP3 matrix, quality evidence, stage profile, and rejected P0
+candidates are documented in
+`docs/design/vllm170-dsv4-sm80-dspark-probabilistic-2026-08-17.md`.
+Set `VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT=1` only for distribution diagnosis.
+It logs exact p/q overlap and counterfactual proposals, and temporarily loads
+the checkpoint confidence head. The audit synchronizes full-vocabulary data,
+so its latency is not a serving benchmark.
+
+For a one-shot DSpark implementation/reference comparison on CMP170HX, capture
+one eager proposal and then replay the official DSpark layers and weights:
+
+```bash
+VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH=/tmp/dsv4-dspark-reference.pt \
+DSV4_DSPARK_TOKENS=5 \
+DSV4_DSPARK_DRAFT_SAMPLE_METHOD=probabilistic \
+DSV4_PROFILE_EXECUTION=detail \
+DSV4_PROFILE_CONTEXT=1024 \
+DSV4_PROFILE_TEMPERATURE=1 \
+DSV4_PROFILE_TOKENS=8 \
+DSV4_PROFILE_REPEATS=1 \
+benchmarks/deepseek_v4/profile_cmp170hx_pp3.sh
+
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/deepseek_v4/compare_dspark_official_reference.py \
+  --model "${DSV4_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4-Flash-0731}" \
+  --capture /tmp/dsv4-dspark-reference.pt \
+  --output /tmp/dsv4-dspark-official-comparison.json
+```
+
+The checkpoint calls the three DSpark parameter groups `mtp.0/1/2`; that is a
+weight namespace, not an MTP runtime mode. The official TileLang linear uses an
+SM89 FP8 MMA that cannot execute on CMP170HX, so the comparison tool keeps the
+official DSpark architecture and weights but automatically uses portable
+FP32-accumulating quantization math on SM80. It is a correctness reference, not
+a kernel performance comparison.
+
 The main overrides are `DSV4_MODEL_DIR`, `CUDA_VISIBLE_DEVICES`,
-`DSV4_MOE_BACKEND`, `DSV4_DSPARK_TOKENS`, `DSV4_KV_CACHE_BYTES`, and
+`DSV4_MOE_BACKEND`, `DSV4_DSPARK_TOKENS`,
+`DSV4_DSPARK_DRAFT_SAMPLE_METHOD`, `DSV4_KV_CACHE_BYTES`, and
 `DSV4_MAX_MODEL_LEN`. The 1,715-token scheduler limit was originally selected
-for the measured 5,000-token, PP3, DSpark-7 workload. The promoted DSpark-5
+for the measured 5,000-token, PP3, DSpark-7 workload. The measured DSpark-5
 default reserves 32 speculative slots and leaves 1,683 target tokens per
 scheduler step. Override `DSV4_MAX_BATCHED_TOKENS` for other traffic shapes. Set
 `VLLM_MARLIN_MOE_BLOCK_SIZE=0` to restore Marlin's upstream shape heuristic.
@@ -316,9 +399,15 @@ Use Nsight Systems/Compute on isolated kernel microbenchmarks after the PP3
 trace identifies a bottleneck. Late-attaching Nsight to already initialized
 spawned workers is not a supported acceptance path on this host.
 
-The checkpoint declares `dspark_block_size=5`, so width 5 is the production
-default. Width 7 remains available for q8 selector audits and regression
-comparisons. A captured run is acceptable only when the
+The checkpoint declares `dspark_block_size=5`, while its official README
+recommends `num_speculative_tokens=7`. Width 5 is this CMP170HX launcher's
+measured default because its earlier greedy 32K A/B improved decode throughput
+by 2.15%; width 7 remains a supported production candidate, not merely an audit
+shape. Probabilistic q5/q7 promotion must compare accepted length, ms/round and
+decode throughput instead of acceptance percentage alone. The current 32K,
+9-seed probabilistic A/B retained q5: q7 was throughput-neutral for general
+sampling and 16.19% slower for agentic `top_p=0.95`. A captured run is
+acceptable only when the
 completion length matches exactly, timing fields are finite, speculative
 counters conserve their meaning, and the profiler-owned process group exits.
 

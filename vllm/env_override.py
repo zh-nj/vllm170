@@ -5,6 +5,19 @@ import importlib.util
 import os
 
 
+def _set_project_environment_defaults() -> None:
+    defaults = {
+        "NCCL_P2P_DISABLE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    }
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+
+
+_set_project_environment_defaults()
+
+
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().
     PyTorch version must not be determined by importing directly
