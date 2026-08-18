@@ -670,14 +670,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         if self.enable_cuda_graph:
             # For full cudagraph capture, one `decode_wrapper` for each batch
-            # size is needed for FlashInfer.
+            # size and uniform query length is needed for FlashInfer.
             self._decode_wrappers_cudagraph: dict[
-                int, BatchDecodeWithPagedKVCacheWrapper
+                tuple[int, int], BatchDecodeWithPagedKVCacheWrapper
             ] = {}
-            self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
+            self._decode_cudagraph_max_tokens = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
-                self._decode_cudagraph_max_bs = min(
-                    self._decode_cudagraph_max_bs,
+                self._decode_cudagraph_max_tokens = min(
+                    self._decode_cudagraph_max_tokens,
                     self.compilation_config.max_cudagraph_capture_size,
                 )
         try:
@@ -772,6 +772,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         supports_spec_as_decode = (
             self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
+            or (
+                current_platform.is_device_capability(80)
+                and not self.attention_config.use_non_causal
+            )
         )
         self._init_reorder_batch_threshold(
             1,
@@ -899,10 +903,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> AttentionCGSupport:
         """Get the cudagraph support level for FlashInfer attention.
 
+        Native FlashInfer FA2 tensor-core decode supports a fixed uniform
+        multi-token query on SM80, including CUDA graph replay.
+
         The SM90 XQA integration only enables single-token decode today. Keep
         specdec CUDA graphs limited to trtllm-gen until vLLM wires the XQA
         specdec mask.
         """
+        if (
+            current_platform.is_device_capability(80)
+            and not vllm_config.attention_config.use_non_causal
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
+
         if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
@@ -1010,9 +1023,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+    def _get_decode_wrapper(
+        self,
+        batch_size: int,
+        q_len_per_req: int,
+        use_cudagraph: bool = False,
+    ):
         if use_cudagraph:
-            decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
+            wrapper_key = (batch_size, q_len_per_req)
+            decode_wrapper = self._decode_wrappers_cudagraph.get(wrapper_key, None)
         else:
             decode_wrapper = self._decode_wrapper
 
@@ -1044,7 +1063,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
             # save the decode wrapper
             if use_cudagraph:
-                self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
+                self._decode_wrappers_cudagraph[wrapper_key] = decode_wrapper
             else:
                 self._decode_wrapper = decode_wrapper
 
@@ -1476,12 +1495,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and pure_decode
-                    and num_decode_tokens <= self._decode_cudagraph_max_bs
+                    and num_decode_tokens <= self._decode_cudagraph_max_tokens
                 )
-                num_input_tokens = num_decode_tokens
+                assert num_decode_tokens % num_decodes == 0, (
+                    "FlashInfer native decode requires uniform query lengths per "
+                    f"request. Got {num_decode_tokens=} and {num_decodes=}."
+                )
+                q_len_per_req = num_decode_tokens // num_decodes
 
                 decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
+                    num_decodes, q_len_per_req, use_cudagraph
                 )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
@@ -1494,11 +1517,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 fast_plan_decode(
                     decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                    indptr_cpu=self.paged_kv_indptr.cpu[: num_decodes + 1],
                     indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
+                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[:num_decodes],
                     num_qo_heads=self.num_qo_heads * self.dcp_world_size,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
@@ -1513,6 +1534,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    q_len_per_req=q_len_per_req,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -2312,6 +2334,7 @@ def fast_plan_decode(
     non_blocking: bool = True,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    q_len_per_req: int = 1,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
@@ -2353,6 +2376,7 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            q_len_per_req=q_len_per_req,
         )
         self.vllm_first_call = False
         return
@@ -2380,6 +2404,7 @@ def fast_plan_decode(
         non_blocking=non_blocking,
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
+        q_len_per_req=q_len_per_req,
     )
 
 

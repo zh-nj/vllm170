@@ -287,6 +287,67 @@ def test_fast_plan_decode_matches_full_plan(
     torch.testing.assert_close(fast_output, ref_output, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="Native FlashInfer speculative decode CUDA graphs target SM80.",
+)
+@torch.inference_mode
+def test_fast_plan_decode_multi_token_matches_reference() -> None:
+    from vllm.v1.attention.backends.flashinfer import fast_plan_decode
+
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+    kv_lens = [128, 68]
+    query_len = 4
+    block_size = 16
+    num_seqs = len(kv_lens)
+    num_query_heads, num_kv_heads = 8, 2
+    head_size = 128
+    dtype = torch.bfloat16
+
+    query = torch.randn(num_seqs * query_len, num_query_heads, head_size, dtype=dtype)
+    key_value_cache = torch.randn(
+        NUM_BLOCKS, 2, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    kv_indptr, kv_indices, kv_last_page_lens, block_tables = _make_paged_kv_metadata(
+        kv_lens, block_size, NUM_BLOCKS
+    )
+    ref_output = ref_paged_attn(
+        query.clone(),
+        key_value_cache[:, 0],
+        key_value_cache[:, 1],
+        [query_len] * num_seqs,
+        kv_lens,
+        block_tables,
+        head_size**-0.5,
+    )
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
+    wrapper = _make_cg_decode_wrapper(
+        num_seqs, kv_indices.clone(), workspace, use_tensor_cores=True
+    )
+    plan_kwargs = dict(
+        indptr_cpu=kv_indptr,
+        indices=kv_indices,
+        last_page_len_cpu=kv_last_page_lens,
+        num_qo_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_size,
+        page_size=block_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=query_len,
+    )
+
+    fast_plan_decode(wrapper, **plan_kwargs)
+    warmup_output = wrapper.run(query, key_value_cache)
+    fast_plan_decode(wrapper, **plan_kwargs)
+    fast_output = wrapper.run(query, key_value_cache)
+
+    torch.testing.assert_close(warmup_output, ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(fast_output, ref_output, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("kv_lens", [[1328, 18, 463], [1, 54, 293, 70]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)

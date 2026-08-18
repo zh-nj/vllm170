@@ -13,6 +13,7 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.config import SpeculativeConfig, set_current_vllm_config
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferDecodeKernel,
@@ -73,3 +74,50 @@ def test_flashinfer_gqa_dcp_spec_decode_clamps_reorder_threshold(monkeypatch):
         builder.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
     )
     assert builder.reorder_batch_threshold == 1
+
+
+def test_flashinfer_sm80_supports_spec_decode_full_graph(monkeypatch):
+    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda capability, device_id=0: capability == 80,
+    )
+    monkeypatch.setattr(
+        flashinfer_backend, "can_use_trtllm_attention", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "get_per_layer_parameters",
+        lambda *args, **kwargs: {
+            "layer.0": PerLayerParameters(
+                window_left=-1, logits_soft_cap=None, sm_scale=0.1, has_sinks=False
+            )
+        },
+    )
+
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=vllm_config.model_config.get_num_kv_heads(
+            vllm_config.parallel_config
+        ),
+        head_size=vllm_config.model_config.get_head_size(),
+        dtype=vllm_config.model_config.dtype,
+    )
+    with set_current_vllm_config(vllm_config):
+        builder = FlashInferMetadataBuilder(
+            kv_cache_spec,
+            ["layer.0"],
+            vllm_config,
+            torch.device("cpu"),
+        )
+
+    assert builder.reorder_batch_threshold == 4
+    assert (
+        builder.get_cudagraph_support(vllm_config, kv_cache_spec)
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
