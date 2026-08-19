@@ -125,6 +125,7 @@ class KVBlockZeroer:
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
+        seen_strided_storages: set[tuple[int, int]] = set()
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
 
@@ -149,18 +150,34 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
+
+                el = kv.element_size()
+                block_stride_bytes = kv.stride(block_dim) * el
+                if block_dim == 0:
+                    block_data_bytes = kv[0].numel() * el
+                    if block_stride_bytes > block_data_bytes:
+                        # Packed cache views start at per-layer offsets in one
+                        # shared block slab. Zero the slab once from its storage
+                        # base instead of a full stride from every layer offset.
+                        storage = kv.untyped_storage()
+                        storage_key = (storage.data_ptr(), block_stride_bytes)
+                        if storage_key in seen_strided_storages:
+                            continue
+                        seen_strided_storages.add(storage_key)
+                        assert block_stride_bytes % 4 == 0
+                        seg_addrs.append(storage.data_ptr())
+                        seg_page_sizes.append(block_stride_bytes // 4 * ratio)
+                        continue
+
                 dp = kv.data_ptr()
                 if dp in seen_ptrs:
                     continue
                 seen_ptrs.add(dp)
 
-                el = kv.element_size()
-                cur_bytes = kv.stride(block_dim) * el
-                assert cur_bytes % 4 == 0
-                kernel_block_el = cur_bytes // 4
+                assert block_stride_bytes % 4 == 0
+                kernel_block_el = block_stride_bytes // 4
                 cur_page_el = kernel_block_el * ratio
 
-                block_stride_bytes = cur_bytes
                 outer_dims = [
                     d
                     for d in range(block_dim)

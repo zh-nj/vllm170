@@ -693,6 +693,28 @@ def test_adaptive_long_prefill_cap_only_under_contention():
     }
 
 
+def test_adaptive_long_prefill_caps_pp_inflight_startup():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_model_len=8192,
+        long_prefill_token_threshold=200,
+        enable_adaptive_long_prefill=True,
+        async_scheduling=True,
+        pipeline_parallel_size=3,
+        use_v2_model_runner=True,
+    )
+    request = create_requests(num_requests=1, num_tokens=1900)[0]
+    scheduler.add_request(request)
+
+    assert scheduler.vllm_config.max_concurrent_batches == 4
+    for _ in range(4):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[request.request_id] == 200
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 1024
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)

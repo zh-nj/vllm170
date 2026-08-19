@@ -1,10 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from vllm.v1.worker.utils import KVBlockZeroer, _zero_kv_blocks_kernel
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    KVBlockZeroer,
+    _zero_kv_blocks_kernel,
+)
+
+
+class _BlocksFirstBackend:
+    @staticmethod
+    def get_kv_cache_block_dim(*args, **kwargs):
+        return 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -86,6 +99,60 @@ def test_non_uniform_page_sizes():
         assert torch.all(storage[1] == 0)
         assert torch.all(storage[2] == 0)
         assert torch.all(storage[3] == 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_strided_blocks_first_views_zero_shared_storage_slab_once():
+    device = torch.device("cuda")
+    num_blocks = 4
+    block_stride = 12
+    storage = torch.ones(num_blocks * block_stride, dtype=torch.int32, device=device)
+    view_a = torch.as_strided(
+        storage,
+        size=(num_blocks, 4),
+        stride=(block_stride, 1),
+        storage_offset=0,
+    )
+    view_b = torch.as_strided(
+        storage,
+        size=(num_blocks, 6),
+        stride=(block_stride, 1),
+        storage_offset=4,
+    )
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.int32,
+    )
+    groups = [
+        AttentionGroup(_BlocksFirstBackend, ["view_a"], spec, 0),
+        AttentionGroup(_BlocksFirstBackend, ["view_b"], spec, 0),
+    ]
+    zeroer = KVBlockZeroer(
+        device,
+        groups,
+        kernel_block_sizes=[4],
+        cache_dtype="auto",
+        static_forward_context={
+            "view_a": SimpleNamespace(kv_cache=view_a),
+            "view_b": SimpleNamespace(kv_cache=view_b),
+        },
+    )
+    assert zeroer._meta is not None
+    seg_addrs, seg_page_sizes, _, _, n_segs = zeroer._meta
+    assert n_segs == 1
+    assert seg_addrs.item() == storage.data_ptr()
+    assert seg_page_sizes.item() == block_stride
+
+    zeroer.zero_block_ids([2])
+    torch.accelerator.synchronize()
+
+    blocks = storage.view(num_blocks, block_stride)
+    assert torch.all(blocks[0] == 1)
+    assert torch.all(blocks[1] == 1)
+    assert torch.all(blocks[2] == 0)
+    assert torch.all(blocks[3] == 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

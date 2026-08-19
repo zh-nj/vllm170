@@ -295,6 +295,14 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Keep early solo prefills capped until all PP in-flight batches have
+        # had an opportunity to admit concurrently arriving requests.
+        self._adaptive_long_prefill_pp_startup_tokens = (
+            self.scheduler_config.long_prefill_token_threshold
+            * vllm_config.max_concurrent_batches
+            if self.use_pp
+            else 0
+        )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -533,7 +541,15 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
             )
             if (
-                (not adaptive_long_prefill_is_solo or request.num_computed_tokens == 0)
+                (
+                    not adaptive_long_prefill_is_solo
+                    or request.num_computed_tokens == 0
+                    or (
+                        self.use_pp
+                        and request.num_computed_tokens
+                        < self._adaptive_long_prefill_pp_startup_tokens
+                    )
+                )
                 and 0
                 < self.scheduler_config.long_prefill_token_threshold
                 < num_new_tokens
@@ -927,6 +943,11 @@ class Scheduler(SchedulerInterface):
                     if (
                         not adaptive_long_prefill_is_solo
                         or request.num_computed_tokens == 0
+                        or (
+                            self.use_pp
+                            and request.num_computed_tokens
+                            < self._adaptive_long_prefill_pp_startup_tokens
+                        )
                     ) and 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
