@@ -7,6 +7,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 BENCHMARK = (
     Path(__file__).parents[2]
     / "benchmarks"
@@ -61,10 +63,14 @@ def test_run_stream_uses_chat_max_and_counts_reasoning_token(monkeypatch) -> Non
         captured["payload"] = json.loads(request.data)
         return FakeResponse(
             (
-                b'data: {"choices":[{"delta":{"reasoning":"think"}}]}\n',
                 (
-                    b'data: {"usage":{"prompt_tokens":3,"completion_tokens":2},'
-                    b'"choices":[{"delta":{"content":"answer"}}]}\n'
+                    b'data: {"choices":[{"delta":{"reasoning":"think"},'
+                    b'"token_ids":[11,12]}]}\n'
+                ),
+                (
+                    b'data: {"usage":{"prompt_tokens":3,"completion_tokens":3},'
+                    b'"choices":[{"delta":{"content":"answer"},'
+                    b'"token_ids":[13]}]}\n'
                 ),
                 b"data: [DONE]\n",
             )
@@ -75,7 +81,7 @@ def test_run_stream_uses_chat_max_and_counts_reasoning_token(monkeypatch) -> Non
         "http://server",
         "model",
         "prompt",
-        max_tokens=2,
+        max_tokens=3,
         index=0,
         needle="answer",
         all_needles=("answer",),
@@ -89,7 +95,9 @@ def test_run_stream_uses_chat_max_and_counts_reasoning_token(monkeypatch) -> Non
 
     assert captured["url"].endswith("/v1/chat/completions")
     assert captured["payload"]["reasoning_effort"] == "max"
+    assert captured["payload"]["return_token_ids"] is True
     assert captured["payload"]["messages"][0]["content"] == "prompt"
     assert result.prompt_tokens == 3
-    assert result.completion_tokens == 2
+    assert result.completion_tokens == 3
+    assert result.decode_tokens_per_s == pytest.approx(2 / result.decode_s)
     assert result.output_text == "thinkanswer"

@@ -485,6 +485,15 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        adaptive_long_prefill_is_solo = (
+            self.scheduler_config.enable_adaptive_long_prefill
+            and len(self.running)
+            + len(self.waiting)
+            + len(self.skipped_waiting)
+            + self.num_waiting_for_streaming_input
+            <= 1
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -523,7 +532,12 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            if (
+                (not adaptive_long_prefill_is_solo or request.num_computed_tokens == 0)
+                and 0
+                < self.scheduler_config.long_prefill_token_threshold
+                < num_new_tokens
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
@@ -910,7 +924,10 @@ class Scheduler(SchedulerInterface):
                         pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
+                    if (
+                        not adaptive_long_prefill_is_solo
+                        or request.num_computed_tokens == 0
+                    ) and 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow

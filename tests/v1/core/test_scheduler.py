@@ -661,6 +661,38 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
 
 
+def test_adaptive_long_prefill_cap_only_under_contention():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=400,
+        enable_adaptive_long_prefill=True,
+    )
+    request = create_requests(num_requests=1, num_tokens=1600)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 400
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 1024
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=400,
+        enable_adaptive_long_prefill=True,
+    )
+    requests = create_requests(num_requests=2, num_tokens=800)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        requests[0].request_id: 400,
+        requests[1].request_id: 400,
+    }
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)

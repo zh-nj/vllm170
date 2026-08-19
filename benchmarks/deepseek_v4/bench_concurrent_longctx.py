@@ -78,6 +78,7 @@ class RequestResult:
     decode_tokens_per_s: float
     needle_found: bool
     cross_talk: tuple[str, ...]
+    token_arrival_times: tuple[float, ...]
     output_text: str
     output_text_sha256: str
 
@@ -195,6 +196,7 @@ def run_stream(
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
+        "return_token_ids": True,
     }
     endpoint = "completions"
     if reasoning_effort is not None:
@@ -210,6 +212,7 @@ def run_stream(
     barrier.wait()
     started_at = time.perf_counter()
     first_token_at: float | None = None
+    token_arrival_times: list[float] = []
     output: list[str] = []
     usage: dict[str, int] = {}
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -224,6 +227,11 @@ def run_stream(
             if event.get("usage"):
                 usage.update(event["usage"])
             for choice in event.get("choices", ()):
+                token_ids = choice.get("token_ids") or ()
+                if token_ids:
+                    arrived_at = time.perf_counter()
+                    first_token_at = first_token_at or arrived_at
+                    token_arrival_times.extend([arrived_at] * len(token_ids))
                 text = choice.get("text", "")
                 if reasoning_effort is not None:
                     delta = choice.get("delta") or {}
@@ -246,7 +254,13 @@ def run_stream(
             f"request {index}: expected {max_tokens} completion tokens, "
             f"got {completion_tokens}"
         )
+    if len(token_arrival_times) != completion_tokens:
+        raise RuntimeError(
+            f"request {index}: expected {completion_tokens} returned token IDs, "
+            f"got {len(token_arrival_times)}"
+        )
     decode_s = finished_at - first_token_at
+    decode_tokens = completion_tokens - 1
     cross_talk = tuple(
         other for other in all_needles if other != needle and other in output_text
     )
@@ -260,9 +274,10 @@ def run_stream(
         finished_at=finished_at,
         ttft_s=first_token_at - started_at,
         decode_s=decode_s,
-        decode_tokens_per_s=(completion_tokens - 1) / decode_s,
+        decode_tokens_per_s=decode_tokens / decode_s,
         needle_found=needle in output_text,
         cross_talk=cross_talk,
+        token_arrival_times=tuple(token_arrival_times),
         output_text=output_text,
         output_text_sha256=hashlib.sha256(output_text.encode()).hexdigest(),
     )
@@ -364,9 +379,7 @@ def main() -> None:
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--seed", type=int, default=170)
-    parser.add_argument(
-        "--scenario", choices=("general", "agentic"), default="general"
-    )
+    parser.add_argument("--scenario", choices=("general", "agentic"), default="general")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--reasoning-effort", choices=("low", "high", "max"))
@@ -506,14 +519,27 @@ def main() -> None:
     results.sort(key=lambda result: result.index)
 
     started_at = min(result.started_at for result in results)
+    decode_started_at = min(result.first_token_at for result in results)
     prefill_finished_at = max(result.first_token_at for result in results)
     finished_at = max(result.finished_at for result in results)
     prompt_tokens = sum(result.prompt_tokens for result in results)
     completion_tokens = sum(result.completion_tokens for result in results)
     prefill_s = prefill_finished_at - started_at
     decode_s = finished_at - prefill_finished_at
+    mixed_decode_s = finished_at - decode_started_at
     wall_s = finished_at - started_at
     ttfts = [result.ttft_s for result in results]
+    decode_tokens_after_first = completion_tokens - 1
+    decode_tokens_after_all_first = sum(
+        arrived_at >= prefill_finished_at
+        for result in results
+        for arrived_at in result.token_arrival_times
+    ) - sum(result.first_token_at == prefill_finished_at for result in results)
+    request_results = []
+    for result in results:
+        request_result = asdict(result)
+        request_result.pop("token_arrival_times")
+        request_results.append(request_result)
     spec_metrics: SpecMetrics | None = None
     if metrics_before is not None and metrics_after is not None:
         spec_metrics = metrics_after - metrics_before
@@ -533,10 +559,14 @@ def main() -> None:
         "completion_tokens": completion_tokens,
         "prefill_s": prefill_s,
         "aggregate_prefill_tokens_per_s": prompt_tokens / prefill_s,
-        "decode_s_after_all_first_tokens": decode_s,
-        "aggregate_decode_tokens_per_s": (
-            args.concurrency * (args.max_tokens - 1) / decode_s
+        "decode_s_since_first_token": mixed_decode_s,
+        "decode_tokens_since_first_token": decode_tokens_after_first,
+        "aggregate_decode_tokens_per_s_since_first": (
+            decode_tokens_after_first / mixed_decode_s
         ),
+        "decode_s_after_all_first_tokens": decode_s,
+        "decode_tokens_after_all_first_tokens": decode_tokens_after_all_first,
+        "aggregate_decode_tokens_per_s": decode_tokens_after_all_first / decode_s,
         "service_completion_tokens_per_s": completion_tokens / wall_s,
         "ttft_min_s": min(ttfts),
         "ttft_mean_s": sum(ttfts) / len(ttfts),
@@ -544,7 +574,7 @@ def main() -> None:
         "wall_s": wall_s,
         "needle_passes": sum(result.needle_found for result in results),
         "cross_talk_failures": sum(bool(result.cross_talk) for result in results),
-        "requests": [asdict(result) for result in results],
+        "requests": request_results,
     }
     if spec_metrics is not None:
         summary["spec_decode"] = asdict(spec_metrics)

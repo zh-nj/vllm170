@@ -99,6 +99,9 @@ counts the fully rendered chat prompt, so `--prompt-tokens` remains exact.
 The CMP170HX PP3 matrix, quality evidence, stage profile, and rejected P0
 candidates are documented in
 `docs/design/vllm170-dsv4-sm80-dspark-probabilistic-2026-08-17.md`.
+The single-GPU Qwen3.8-27B-NVFP4 4x32K scheduler study and production command
+are documented in
+`docs/design/vllm170-qwen38-nvfp4-sm80-4x32k-scheduler-2026-08-19.md`.
 Set `VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT=1` only for distribution diagnosis.
 It logs exact p/q overlap and counterfactual proposals, and temporarily loads
 the checkpoint confidence head. The audit synchronizes full-vocabulary data,
