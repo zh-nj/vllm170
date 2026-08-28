@@ -456,11 +456,11 @@ valid; use `strict_score_misses`, `score_mismatches`, invalid/duplicate indices,
 and padding errors as the correctness gate rather than raw index recall alone.
 The old `VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT*` names remain compatibility aliases.
 
-The CMP170HX launcher defaults
-`VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK=1`. The route is deliberately narrow: SM80,
-single-request DSpark q6/q8, and top-k 512. Other decode shapes keep their
-existing cooperative/persistent selector. Set the variable to `0` for an A/B
-rollback. The real 32K audit and A/B/A evidence are recorded in
+The project defaults `VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK=1`; launchers do not
+need to repeat it. The route is deliberately narrow: SM80, single-request
+DSpark q6/q8, and top-k 512. Other decode shapes keep their existing
+cooperative/persistent selector. Set the variable to `0` for an A/B rollback.
+The real 32K audit and A/B/A evidence are recorded in
 `docs/design/vllm170-dsv4-sm80-dspark-exact-topk-2026-08-16.md`.
 
 ## SM80 streaming-indexer experiment

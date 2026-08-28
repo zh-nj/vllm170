@@ -988,6 +988,19 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
+                if (
+                    self.method == "dspark"
+                    and self.draft_model_config.hf_config.model_type == "qwen3"
+                    and "DSparkDraftModel" in self.draft_model_config.architectures
+                ):
+                    # SpecForge Qwen checkpoints use the generic remote-code
+                    # architecture name even though their weights follow the
+                    # native Qwen3 DSpark layout.
+                    self.draft_model_config.hf_config.architectures = [
+                        "Qwen3DSparkModel"
+                    ]
+                    self.update_arch_()
+
                 if self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures

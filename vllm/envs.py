@@ -81,7 +81,7 @@ if TYPE_CHECKING:
     VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE: int = 16384
     VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS: int = 512
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
-    VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK: bool = False
+    VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK: bool = True
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_MIN_LEN: int = 0
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT_SAMPLES: int = 8
@@ -1163,7 +1163,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
     ),
     "VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "0"))
+        int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "1"))
     ),
     "VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT": lambda: bool(
         int(

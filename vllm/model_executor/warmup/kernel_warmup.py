@@ -51,6 +51,190 @@ logger = init_logger(__name__)
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
 
 
+def _warmup_v2_spec_decode_triton_kernels(runner: "GPUModelRunner") -> None:
+    spec_config = runner.speculative_config
+    rejection_sampler = getattr(runner, "rejection_sampler", None)
+    vocab_size = getattr(runner, "vocab_size", None)
+    if vocab_size is None:
+        input_batch = getattr(runner, "input_batch", None)
+        vocab_size = getattr(input_batch, "vocab_size", None)
+    if spec_config is None or rejection_sampler is None or vocab_size is None:
+        return
+
+    logger.info_once("Warming up V2 speculative decoding Triton kernels.")
+    warmup_rejection = getattr(rejection_sampler, "warmup", None)
+    if warmup_rejection is not None:
+        warmup_rejection(
+            vocab_size=vocab_size,
+            dtype=runner.model_config.dtype,
+            max_num_reqs=runner.max_num_reqs,
+        )
+
+    speculator = getattr(runner, "speculator", None)
+    if speculator is None:
+        speculator = getattr(runner, "drafter", None)
+    warmup_prepare_inputs = getattr(speculator, "warmup_prepare_inputs", None)
+    if (
+        spec_config.use_dflash() or spec_config.use_dspark()
+    ) and warmup_prepare_inputs is not None:
+        warmup_prepare_inputs()
+
+
+def _warmup_spec_decode_triton_kernels(runner: "GPUModelRunner") -> None:
+    """Compile speculative kernels whose runtime variants dummy runs miss."""
+    _warmup_v2_spec_decode_triton_kernels(runner)
+
+    spec_config = runner.speculative_config
+    rejection_sampler = getattr(runner, "rejection_sampler", None)
+    input_batch = getattr(runner, "input_batch", None)
+    if spec_config is None or rejection_sampler is None or input_batch is None:
+        return
+
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+    from vllm.v1.sample.rejection_sampler import rejection_greedy_sample_kernel
+    from vllm.v1.spec_decode.utils import (
+        PADDING_SLOT_ID,
+        eagle_prepare_inputs_padded_kernel,
+        eagle_prepare_next_token_padded_kernel,
+        eagle_step_slot_mapping_metadata_kernel,
+        next_power_of_2,
+    )
+
+    batch_size = runner.max_num_reqs
+    num_spec_tokens = spec_config.num_speculative_tokens
+    num_sampled_tokens = num_spec_tokens + 1
+    device = runner.device
+    logger.info_once("Warming up speculative decoding Triton kernels.")
+
+    cu_num_draft_tokens = (
+        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
+        * num_spec_tokens
+    )
+    num_draft_tokens = batch_size * num_spec_tokens
+    output_token_ids = torch.full(
+        (batch_size, num_sampled_tokens),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    draft_token_ids = torch.zeros(num_draft_tokens, dtype=torch.int32, device=device)
+    target_argmax = torch.zeros(num_draft_tokens, dtype=torch.int64, device=device)
+    bonus_token_ids = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    synthetic_conditional_rates = rejection_sampler.synthetic_conditional_rates
+    synthetic_mode = synthetic_conditional_rates is not None
+    uniform_probs = torch.zeros_like(draft_token_ids, dtype=torch.float32)
+
+    # Rejection sampling switches to the Triton top-k/top-p path at eight rows.
+    if num_draft_tokens >= 8:
+        sampling_rows = 8
+        vocab_size = input_batch.vocab_size
+        sampling_logits = torch.zeros(
+            (sampling_rows, vocab_size), dtype=torch.float32, device=device
+        )
+        top_k = torch.full(
+            (sampling_rows,),
+            max(vocab_size - 1, 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        top_p = torch.full((sampling_rows,), 0.9, dtype=torch.float32, device=device)
+        for k, p in ((top_k, None), (None, top_p), (top_k, top_p)):
+            sampling_logits.zero_()
+            apply_top_k_top_p(sampling_logits, k, p)
+
+    rejection_greedy_sample_kernel[(batch_size,)](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        target_argmax,
+        bonus_token_ids,
+        None,
+        num_spec_tokens,
+        uniform_probs if synthetic_mode else None,
+        synthetic_conditional_rates,
+        SYNTHETIC_MODE=synthetic_mode,
+    )
+
+    drafter = getattr(runner, "drafter", None)
+    if (
+        spec_config.disable_padded_drafter_batch
+        or drafter is None
+        or not hasattr(drafter, "prepare_next_token_ids_padded")
+        or not hasattr(drafter, "prepare_inputs_padded")
+    ):
+        return
+
+    warmup_batch_sizes = sorted({1, batch_size})
+    for warmup_batch_size in warmup_batch_sizes:
+        discard_request_mask = torch.zeros(
+            warmup_batch_size, dtype=torch.bool, device=device
+        )
+        backup_token_ids = torch.zeros(
+            warmup_batch_size, dtype=torch.int32, device=device
+        )
+        next_token_ids = torch.empty_like(backup_token_ids)
+        valid_sampled_tokens_count = torch.empty_like(backup_token_ids)
+        for sampled_width in (1, num_sampled_tokens):
+            sampled_token_ids = torch.zeros(
+                (warmup_batch_size, sampled_width),
+                dtype=torch.int32,
+                device=device,
+            )
+            eagle_prepare_next_token_padded_kernel[(warmup_batch_size,)](
+                sampled_token_ids,
+                discard_request_mask,
+                backup_token_ids,
+                next_token_ids,
+                valid_sampled_tokens_count,
+                input_batch.vocab_size,
+                sampled_width,
+                warmup_batch_size,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=next_power_of_2(sampled_width),
+            )
+
+        query_start_loc = (
+            torch.arange(warmup_batch_size + 1, dtype=torch.int32, device=device)
+            * num_sampled_tokens
+        )
+        token_indices_to_sample = torch.empty_like(backup_token_ids)
+        num_rejected_tokens = torch.empty_like(backup_token_ids)
+        eagle_prepare_inputs_padded_kernel[(warmup_batch_size,)](
+            cu_num_draft_tokens[:warmup_batch_size],
+            valid_sampled_tokens_count,
+            query_start_loc,
+            token_indices_to_sample,
+            num_rejected_tokens,
+            warmup_batch_size,
+        )
+
+    block_size = getattr(drafter, "block_size", -1)
+    kv_cache_gid = getattr(drafter, "kv_cache_gid", -1)
+    block_tables = input_batch.block_table.block_tables
+    if block_size <= 0 or not 0 <= kv_cache_gid < len(block_tables):
+        return
+
+    for warmup_batch_size in warmup_batch_sizes:
+        block_table = block_tables[kv_cache_gid].block_table.gpu[:warmup_batch_size]
+        positions = torch.zeros(warmup_batch_size, dtype=torch.int64, device=device)
+        seq_lens = torch.zeros(warmup_batch_size, dtype=torch.int32, device=device)
+        clamped_positions = torch.empty_like(positions)
+        slot_mapping = torch.empty(warmup_batch_size, dtype=torch.int64, device=device)
+        eagle_step_slot_mapping_metadata_kernel[(warmup_batch_size,)](
+            positions,
+            block_table,
+            block_table.stride(0),
+            seq_lens,
+            clamped_positions,
+            slot_mapping,
+            block_size=block_size,
+            max_model_len=drafter.max_model_len,
+            n_blocks_per_req=block_table.shape[1],
+            PAD_ID=PADDING_SLOT_ID,
+            batch_size=warmup_batch_size,
+        )
+
+
 def _ll_bf16_router_shapes_from_model(
     model: torch.nn.Module,
 ) -> tuple[tuple[int, int], ...]:
@@ -126,6 +310,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:
+        _warmup_spec_decode_triton_kernels(worker.model_runner)
         kimi_k3_triton_warmup(worker)
         fa4_cutedsl_warmup(worker)
         sparse_mla_triton_warmup(worker)

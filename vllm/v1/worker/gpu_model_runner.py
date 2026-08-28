@@ -6257,14 +6257,16 @@ class GPUModelRunner(
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 
-        dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
+        dummy_tensors = lambda v, dtype=None: torch.full(
+            (num_reqs,), v, device=self.device, dtype=dtype
+        )
 
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
             all_greedy=False,
             all_random=False,
             top_p=dummy_tensors(0.9),
-            top_k=dummy_tensors(logits.size(1) - 1),
+            top_k=dummy_tensors(logits.size(1) - 1, dtype=torch.int32),
             generators={},
             max_num_logprobs=None,
             logprob_token_ids=None,

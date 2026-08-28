@@ -87,12 +87,8 @@ def _collect_q1_acceptance_audit_records(
     draft_logits = q1_logits.gather(1, draft_ids[:, None]).squeeze(1)
     draft_strict_ranks = 1 + (q1_logits > draft_logits[:, None]).sum(dim=1)
     draft_rank_ends = (q1_logits >= draft_logits[:, None]).sum(dim=1)
-    sampler_target_logits = q1_logits.gather(
-        1, sampler_target_ids[:, None]
-    ).squeeze(1)
-    accepted_lengths = (
-        num_sampled.index_select(0, valid_requests).to(torch.int64) - 1
-    )
+    sampler_target_logits = q1_logits.gather(1, sampler_target_ids[:, None]).squeeze(1)
+    accepted_lengths = num_sampled.index_select(0, valid_requests).to(torch.int64) - 1
 
     integer_rows = torch.stack(
         (
@@ -167,9 +163,7 @@ def _collect_q1_acceptance_audit_records(
                 "top2_margin": top2_margin,
                 "draft_gap": draft_gap,
                 "accepted": draft_token_id == sampler_target_id,
-                "sampler_argmax_matches_torch": (
-                    sampler_target_id == torch_top1_id
-                ),
+                "sampler_argmax_matches_torch": (sampler_target_id == torch_top1_id),
             }
         )
     return records
@@ -214,9 +208,7 @@ def _collect_probabilistic_acceptance_audit_records(
     device = processed_logits.device
     row_tensor = torch.tensor(row_indices, dtype=torch.int64, device=device)
     request_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
-    state_tensor = torch.tensor(
-        request_state_indices, dtype=torch.int64, device=device
-    )
+    state_tensor = torch.tensor(request_state_indices, dtype=torch.int64, device=device)
     step_tensor = torch.tensor(draft_steps, dtype=torch.int64, device=device)
     target = processed_logits.index_select(0, row_tensor).to(torch.float32)
     draft = draft_logits[state_tensor, step_tensor].to(torch.float32)
@@ -224,9 +216,7 @@ def _collect_probabilistic_acceptance_audit_records(
     draft_probs = draft.softmax(dim=-1)
     target_support = torch.isfinite(target)
     overlap = torch.minimum(target_probs, draft_probs).sum(dim=-1)
-    draft_mass_outside_target = draft_probs.masked_fill(target_support, 0.0).sum(
-        dim=-1
-    )
+    draft_mass_outside_target = draft_probs.masked_fill(target_support, 0.0).sum(dim=-1)
     counterfactual_overlaps = {
         ratio: torch.minimum(
             target_probs,
@@ -245,9 +235,9 @@ def _collect_probabilistic_acceptance_audit_records(
         top_k_logits = draft_sorted.clone()
         top_k_logits[:, :-keep] = float("-inf")
         top_k_probs = top_k_logits.softmax(dim=-1)
-        top_k_overlaps[top_k] = torch.minimum(
-            target_sorted_probs, top_k_probs
-        ).sum(dim=-1)
+        top_k_overlaps[top_k] = torch.minimum(target_sorted_probs, top_k_probs).sum(
+            dim=-1
+        )
 
     top_p_overlaps: dict[float, torch.Tensor] = {}
     draft_top_p_mass_outside_target: torch.Tensor | None = None
@@ -256,9 +246,9 @@ def _collect_probabilistic_acceptance_audit_records(
         top_p_mask[:, -1] = False
         top_p_logits = draft_sorted.masked_fill(top_p_mask, float("-inf"))
         top_p_probs = top_p_logits.softmax(dim=-1)
-        top_p_overlaps[top_p] = torch.minimum(
-            target_sorted_probs, top_p_probs
-        ).sum(dim=-1)
+        top_p_overlaps[top_p] = torch.minimum(target_sorted_probs, top_p_probs).sum(
+            dim=-1
+        )
         if top_p == 0.95:
             draft_top_p_mass_outside_target = top_p_probs.masked_fill(
                 target_sorted_support, 0.0
@@ -278,9 +268,7 @@ def _collect_probabilistic_acceptance_audit_records(
     sampled_accept_probability = torch.minimum(
         torch.ones_like(target_selected), target_selected / draft_selected
     )
-    accepted_lengths = (
-        num_sampled.index_select(0, request_tensor).to(torch.int64) - 1
-    )
+    accepted_lengths = num_sampled.index_select(0, request_tensor).to(torch.int64) - 1
 
     integer_rows = torch.stack(
         (
@@ -346,9 +334,7 @@ def _collect_probabilistic_acceptance_audit_records(
         num_top_k = len(_PROB_AUDIT_DRAFT_TOP_K)
         num_top_p = len(_PROB_AUDIT_DRAFT_TOP_P)
         filtered_start = 5
-        top_k_overlap_values = float_row[
-            filtered_start : filtered_start + num_top_k
-        ]
+        top_k_overlap_values = float_row[filtered_start : filtered_start + num_top_k]
         top_p_start = filtered_start + num_top_k
         top_p_overlap_values = float_row[top_p_start : top_p_start + num_top_p]
         draft_top_p_outside_mass = float_row[top_p_start + num_top_p]
@@ -372,12 +358,8 @@ def _collect_probabilistic_acceptance_audit_records(
             "target_probability": target_probability,
             "draft_probability": draft_probability,
             "draft_mass_outside_target_support": outside_mass,
-            "draft_top_p_095_mass_outside_target_support": (
-                draft_top_p_outside_mass
-            ),
-            "target_support_oracle_expected_overlap": (
-                target_support_expected_overlap
-            ),
+            "draft_top_p_095_mass_outside_target_support": (draft_top_p_outside_mass),
+            "target_support_oracle_expected_overlap": (target_support_expected_overlap),
         }
         for top_k, top_k_overlap in zip(
             _PROB_AUDIT_DRAFT_TOP_K, top_k_overlap_values, strict=True
@@ -434,13 +416,12 @@ class RejectionSampler:
         device: torch.device,
     ):
         self.sampler = sampler
+        self.device = device
         self.num_speculative_steps = spec_config.num_speculative_tokens
+        self.has_draft_logits = spec_config.draft_sample_method == "probabilistic"
         self._q1_audit_samples = 0
         self._q1_audit_sample_limit = 0
-        if (
-            spec_config.method == "dspark"
-            and envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT
-        ):
+        if spec_config.method == "dspark" and envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT:
             self._q1_audit_sample_limit = max(
                 0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES
             )
@@ -468,6 +449,65 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+
+    @torch.inference_mode()
+    def warmup(
+        self,
+        *,
+        vocab_size: int,
+        dtype: torch.dtype,
+        max_num_reqs: int,
+    ) -> None:
+        """Compile the runtime-dtype rejection sampling kernels."""
+        num_logits_per_req = self.num_speculative_steps + 1
+        num_logits = max_num_reqs * num_logits_per_req
+        target_logits = torch.zeros(
+            num_logits,
+            vocab_size,
+            dtype=dtype,
+            device=self.device,
+        )
+        if vocab_size > 1:
+            target_logits[:, 1] = 1
+        draft_sampled = torch.zeros(num_logits, dtype=torch.int32, device=self.device)
+        cu_num_logits = (
+            torch.arange(max_num_reqs + 1, dtype=torch.int32, device=self.device)
+            * num_logits_per_req
+        )
+        idx_mapping = torch.arange(max_num_reqs, dtype=torch.int32, device=self.device)
+        expanded_idx_mapping = idx_mapping.repeat_interleave(num_logits_per_req)
+        expanded_local_pos = torch.arange(
+            num_logits_per_req, dtype=torch.int32, device=self.device
+        ).repeat(max_num_reqs)
+        pos = torch.arange(num_logits, dtype=torch.int64, device=self.device)
+        temperature = torch.zeros(max_num_reqs, dtype=torch.float32, device=self.device)
+        seed = torch.zeros(max_num_reqs, dtype=torch.int64, device=self.device)
+        draft_logits = None
+        if self.has_draft_logits:
+            draft_logits = torch.zeros(
+                max_num_reqs,
+                self.num_speculative_steps,
+                vocab_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        rejection_sample(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            seed,
+            self.num_speculative_steps,
+            self.synthetic_conditional_rates,
+            use_fp64=self.sampler.use_fp64_gumbel,
+            use_block_verification=self.use_block_verification,
+        )
 
     def _get_logprobs_tensors(
         self,

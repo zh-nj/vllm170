@@ -152,18 +152,21 @@ DSV4_MAX_BATCHED_TOKENS=1715 \
 DSV4_DSPARK_TOKENS=5 \
 benchmarks/deepseek_v4/run_cmp170hx_pp3.sh \
   --enable-adaptive-long-prefill \
-  --long-prefill-token-threshold 424 \
-  --kernel-config '{"enable_jit_warmup":false}'
+  --long-prefill-token-threshold 424
 ```
 
 生产命令保留启动器已验收的 `VLLM_PP_REUSE_RECV_BUFFER=1`。本轮先使用 `0`
 隔离根因，再用默认 `1` 完成 benchmark 和 production prefix-cache 模式的
 重复负载门禁；三种路径都通过。
 
-`enable_jit_warmup=false` 是当前工作区另一条未提交 warmup 修改下的启动规避项，
-不是本次 scheduler/KV 修复的必要条件。它会使首轮 32K 请求编译若干 TileLang/
-Triton shape；正式接流量前应先执行同形状预热。待该 warmup 修改独立验收后，
-应恢复启动器默认预热并移除此覆盖。
+已修复另一条 warmup 修改对 V2 runner 和 PP 非末级的兼容问题，生产命令恢复
+默认 `enable_jit_warmup=true`，无需再添加关闭覆盖。实机默认预热成功启动后连续
+运行两轮不同输入的 4×32K→256：prefill 分别为 5,818.0、5,854.2 tok/s，
+聚合 tail decode 分别为 237.9、235.3 tok/s，两轮均 4/4 语义通过且无串扰。
+
+默认预热仍未覆盖首轮的 6 个 DSV4 长上下文 TileLang/Triton shape；第二轮没有
+新增在线编译。因而同形状预热不是正确性前提，但在正式流量受首请求延迟 SLO
+约束时仍然必要。应在进程启动后、接流量前至少执行一轮 4×32K→256 预热。
 
 ## 验证命令
 
@@ -174,7 +177,8 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest \
   -k adaptive_long_prefill
 .venv/bin/python -m pytest \
   tests/benchmarks/test_deepseek_v4_concurrent_longctx.py -q
+.venv/bin/python -m pytest tests/model_executor/test_jit_warmup.py -q
 ```
 
-结果分别为 5/5、2/2、2/2 通过。实机 JSON 与服务日志位于 gitignored 的
+结果分别为 5/5、2/2、2/2、13/13 通过。实机 JSON 与服务日志位于 gitignored 的
 `profiles/deepseek_v4/pp3-4x32k-scheduler-20260819/`。

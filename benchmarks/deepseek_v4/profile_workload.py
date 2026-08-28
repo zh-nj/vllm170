@@ -10,7 +10,6 @@ import json
 import math
 import os
 import random
-import re
 import subprocess
 import time
 import urllib.error
@@ -18,6 +17,8 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 WORDS = (
     "system",
@@ -355,7 +356,7 @@ def build_result(
         "temperature": args.temperature,
         "top_p": args.top_p,
         "dspark_exact_topk": bool(
-            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "0"))
+            int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK", "1"))
         ),
         "dspark_q1_audit": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT", "0"))

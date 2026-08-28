@@ -291,14 +291,14 @@ def test_fast_plan_decode_matches_full_plan(
     not current_platform.is_device_capability(80),
     reason="Native FlashInfer speculative decode CUDA graphs target SM80.",
 )
+@pytest.mark.parametrize("query_len", [4, 6], ids=["mtp3", "mtp5"])
 @torch.inference_mode
-def test_fast_plan_decode_multi_token_matches_reference() -> None:
+def test_fast_plan_decode_multi_token_matches_reference(query_len: int) -> None:
     from vllm.v1.attention.backends.flashinfer import fast_plan_decode
 
     torch.set_default_device("cuda")
     set_random_seed(0)
     kv_lens = [128, 68]
-    query_len = 4
     block_size = 16
     num_seqs = len(kv_lens)
     num_query_heads, num_kv_heads = 8, 2
@@ -346,6 +346,110 @@ def test_fast_plan_decode_multi_token_matches_reference() -> None:
 
     torch.testing.assert_close(warmup_output, ref_output, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(fast_output, ref_output, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="Native FlashInfer non-causal CUDA graphs target SM80.",
+)
+@torch.inference_mode
+def test_noncausal_prefill_cudagraph_matches_eager_with_padded_batch() -> None:
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+    batch_size = 2
+    query_len = 7
+    block_size = 16
+    num_query_heads, num_kv_heads = 8, 2
+    head_size = 128
+    dtype = torch.bfloat16
+    kv_lens = [128, 96]
+
+    query = torch.randn(
+        batch_size * query_len,
+        num_query_heads,
+        head_size,
+        dtype=dtype,
+    )
+    key_value_cache = torch.randn(
+        NUM_BLOCKS,
+        2,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=dtype,
+    )
+    kv_indptr, kv_indices, kv_last_page_lens, _ = _make_paged_kv_metadata(
+        kv_lens, block_size, NUM_BLOCKS
+    )
+    query_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cpu") * query_len
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(batch_size + 1, dtype=torch.int32),
+        paged_kv_indptr_buf=torch.empty(batch_size + 1, dtype=torch.int32),
+        paged_kv_indices_buf=torch.empty(NUM_BLOCKS, dtype=torch.int32),
+        paged_kv_last_page_len_buf=torch.empty(batch_size, dtype=torch.int32),
+        backend="fa2",
+    )
+    plan_kwargs = dict(
+        num_qo_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_size,
+        page_size=block_size,
+        causal=False,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=dtype,
+    )
+    wrapper.plan(
+        query_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        **plan_kwargs,
+    )
+    output = torch.empty_like(query)
+    wrapper.run(query, key_value_cache, out=output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(query, key_value_cache, out=output)
+
+    padded_query_indptr = torch.tensor(
+        [0, query_len, query_len], dtype=torch.int32, device="cpu"
+    )
+    padded_kv_indptr = torch.tensor(
+        [0, kv_indptr[1], kv_indptr[1]], dtype=torch.int32, device="cpu"
+    )
+    padded_last_page_lens = torch.tensor(
+        [kv_last_page_lens[0], 0], dtype=torch.int32, device="cpu"
+    )
+    wrapper.plan(
+        padded_query_indptr,
+        padded_kv_indptr,
+        kv_indices[: kv_indptr[1]],
+        padded_last_page_lens,
+        **plan_kwargs,
+    )
+    query.normal_()
+    graph.replay()
+
+    eager_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    eager_wrapper.plan(
+        torch.tensor([0, query_len], dtype=torch.int32, device="cpu"),
+        kv_indptr[:2],
+        kv_indices[: kv_indptr[1]],
+        kv_last_page_lens[:1],
+        **plan_kwargs,
+    )
+    reference = eager_wrapper.run(query[:query_len], key_value_cache)
+
+    torch.testing.assert_close(output[:query_len], reference, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("kv_lens", [[1328, 18, 463], [1, 54, 293, 70]])

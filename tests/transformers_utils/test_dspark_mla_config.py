@@ -60,6 +60,32 @@ def _write_target_config(path):
     (path / "config.json").write_text(json.dumps(config))
 
 
+def _write_specforge_qwen_dspark_config(path):
+    path.mkdir()
+    config = {
+        "architectures": ["DSparkDraftModel"],
+        "model_type": "qwen3",
+        "hidden_size": 5120,
+        "intermediate_size": 10240,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 248320,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1e-6,
+        "block_size": 7,
+        "markov_rank": 256,
+        "dflash_config": {
+            "attention_mode": "gqa",
+            "mask_token_id": 248077,
+            "target_layer_ids": [4, 16, 28, 40, 52],
+        },
+        "torch_dtype": "bfloat16",
+    }
+    (path / "config.json").write_text(json.dumps(config))
+
+
 def test_dspark_mla_config_loads_from_local_json(tmp_path):
     draft_path = tmp_path / "draft"
     _write_dspark_config(draft_path)
@@ -142,6 +168,35 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"
     assert speculative_config.draft_model_config.use_mla
+
+
+def test_specforge_qwen_dspark_uses_native_qwen_loader(tmp_path):
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_target_config(target_path)
+    _write_specforge_qwen_dspark_config(draft_path)
+    target_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
+    )
+
+    speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=7,
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    draft_config = speculative_config.draft_model_config
+    assert draft_config.architectures == ["Qwen3DSparkModel"]
+    assert draft_config.hf_config.model_type == "qwen3"
+    assert draft_config.hf_config.dflash_config["target_layer_ids"] == [
+        4,
+        16,
+        28,
+        40,
+        52,
+    ]
 
 
 def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):

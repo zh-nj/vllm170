@@ -36,6 +36,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+    gather_initial_states,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1006,6 +1009,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ``BT = chunk_size`` (64).  A single warmup pass with T = 64
         is sufficient to populate the autotuner cache.
 
+        The state-gather kernel is warmed here as well because the profile
+        path returns before the real prefill state cache is available.
+
         The decode path uses ``gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule``
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
@@ -1047,7 +1053,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         v = v.unsqueeze(0)
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
-        state = torch.zeros(
+        state_cache = torch.zeros(
             1,
             num_v_heads,
             self.head_v_dim,
@@ -1055,6 +1061,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=device,
             dtype=state_dtype,
         )
+        state_indices = torch.zeros(1, device=device, dtype=torch.int32)
+        has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
+        state = state_cache
         cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
 
         # CuteDSL kernels require metadata
@@ -1068,6 +1077,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
 
         try:
+            state = gather_initial_states(
+                state_cache,
+                state_indices,
+                has_initial_state,
+            )
             self.chunk_gated_delta_rule(
                 q=q,
                 k=k,
@@ -1084,8 +1098,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         except Exception:
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
+                "layer %s. First inference may trigger JIT or "
+                "autotuning.",
                 T,
                 self.prefix,
                 exc_info=True,
@@ -1107,6 +1121,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g,
                 beta,
                 state,
+                state_cache,
+                state_indices,
+                has_initial_state,
                 cu_seqlens,
                 chunk_indices,
                 chunk_offsets,
@@ -1430,8 +1447,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            initial_state = gather_initial_states(
+                ssm_state,
+                prefill_state_indices,
+                prefill_has_initial_state,
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,

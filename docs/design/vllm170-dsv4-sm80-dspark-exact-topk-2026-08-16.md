@@ -13,8 +13,8 @@ logits 上存在少量集合漏选。生产启动器改为仅在以下条件同�
 - `topk_tokens=512`；
 - `VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK=1`。
 
-其余 decode shape 继续使用原 cooperative/persistent 路由。该开关在通用环境定义中
-默认关闭，在 CMP170HX PP3 启动器中默认开启，可显式设为 `0` 回滚。
+其余 decode shape 继续使用原 cooperative/persistent 路由。该开关在项目环境定义中
+默认开启，启动器无需重复设置；可显式设为 `0` 回滚。
 
 ## 真实 logits 正确性审计
 

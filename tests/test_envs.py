@@ -35,6 +35,7 @@ def test_cmp170hx_project_environment_defaults() -> None:
         "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": True,
         "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128": True,
         "VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT": True,
+        "VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK": True,
         "VLLM_DEEPSEEK_V4_SPECIALIZED_ROUTER": True,
         "VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A": True,
         "VLLM_MARLIN_MOE_BLOCK_SIZE": 48,

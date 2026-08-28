@@ -7,12 +7,17 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import torch
 
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
     WarmupIntRange,
     get_ast_full_name,
     zip_inputs,
+)
+from vllm.model_executor.warmup.kernel_warmup import (
+    _warmup_spec_decode_triton_kernels,
+    _warmup_v2_spec_decode_triton_kernels,
 )
 
 
@@ -37,6 +42,71 @@ def _config(
         name=name,
         vectorized=vectorized,
     )
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        pytest.param(
+            SimpleNamespace(speculative_config=SimpleNamespace()),
+            id="runner-without-rejection-sampler",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(),
+                rejection_sampler=None,
+            ),
+            id="non-sampling-pipeline-rank",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(),
+                rejection_sampler=SimpleNamespace(),
+            ),
+            id="v2-runner-without-legacy-input-batch",
+        ),
+    ],
+)
+def test_spec_decode_warmup_skips_unsupported_runner_state(
+    runner: SimpleNamespace,
+) -> None:
+    _warmup_spec_decode_triton_kernels(cast(Any, runner))
+
+
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_v2_spec_decode_warmup_uses_runtime_shape_hooks(method: str) -> None:
+    calls = []
+    rejection_sampler = SimpleNamespace(
+        warmup=lambda **kwargs: calls.append(("rejection", kwargs))
+    )
+    speculator = SimpleNamespace(
+        warmup_prepare_inputs=lambda: calls.append(("dflash", {}))
+    )
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            use_dflash=lambda: method == "dflash",
+            use_dspark=lambda: method == "dspark",
+        ),
+        rejection_sampler=rejection_sampler,
+        vocab_size=262144,
+        model_config=SimpleNamespace(dtype=torch.float16),
+        max_num_reqs=4,
+        speculator=speculator,
+    )
+
+    _warmup_v2_spec_decode_triton_kernels(cast(Any, runner))
+
+    assert calls == [
+        (
+            "rejection",
+            {
+                "vocab_size": 262144,
+                "dtype": torch.float16,
+                "max_num_reqs": 4,
+            },
+        ),
+        ("dflash", {}),
+    ]
 
 
 class ToyKernel(VllmJitKernel["ToyKernel.CompileKey"]):

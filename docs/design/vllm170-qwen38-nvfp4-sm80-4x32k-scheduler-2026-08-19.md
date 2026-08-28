@@ -157,3 +157,127 @@ The targeted scheduler tests passed 3/3 and the benchmark tests passed 2/2.
 The complete scheduler file passed 103 tests; 35 multimodal tests could not
 resolve `llava-hf/llava-1.5-7b-hf` in the offline environment and failed before
 constructing a scheduler.
+
+## NVFP4 target with Qwen3.8 DSpark-7
+
+`/media/z/data6/models/Qwen3.8-27B-DSpark` is a five-layer BF16 Qwen GQA
+drafter with a seven-token block. Its published config uses the generic
+remote-code architecture name `DSparkDraftModel`; vLLM previously interpreted
+that name as the DeepSeek-V4 drafter and failed while looking for `hc_mult`.
+The config compatibility fix maps only generic Qwen3 DSpark configs to the
+native `Qwen3DSparkModel` loader. The NVFP4 target then loads through
+`MarlinNvFp4LinearKernel`; target and draft attention both select FlashInfer.
+
+The following greedy runs use the same scheduler settings as above, DSpark-7,
+FP8 KV cache, exact binary 1K/32K/128K prompts, and 256 returned tokens. The
+target-only comparison uses the automatically selected legacy runner while
+DSpark requires the V2 runner, so the deltas are operational comparisons, not
+an isolated drafter-only microbenchmark. The first 1K single-request DSpark
+run also contains cold Triton JIT and is excluded from steady-state decisions.
+
+| shape | mode | prefill tok/s | mixed decode tok/s | tail decode tok/s | wall s | mean accepted | quality |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4x1K | target only | 2,102.90 | 182.41 | 203.61 | 6.96 | - | 4/4 |
+| 4x1K | DSpark-7 draft eager | 1,965.53 | 196.14 | 197.53 | 7.24 | 2.66 | 4/4 |
+| 1x32K | target only | 1,858.83 | 51.51 | 51.51 | 22.58 | - | 1/1 |
+| 1x32K | DSpark-7 draft eager | 1,801.03 | 40.00 | 40.00 | 24.57 | 1.83 | 1/1 |
+| 1x32K | DSpark-7 FULL graph | 1,799.79 | 53.79 | 53.79 | 22.95 | 2.15 | 1/1 |
+| 4x32K | target only | 1,849.42 | 138.78 | 165.42 | 76.94 | - | 4/4 |
+| 4x32K | DSpark-7 draft eager | 1,794.91 | 117.02 | 118.60 | 81.40 | 1.89 | 4/4 |
+| 4x32K | DSpark-7 FULL graph | 1,790.01 | 136.03 | 133.80 | 80.52 | 1.91 | 4/4 |
+| 1x128K | target only | 1,250.34 | 44.08 | 44.08 | 110.61 | - | 1/1 |
+| 1x128K | DSpark-7 draft eager | 1,223.70 | 39.20 | 39.20 | 113.62 | 1.95 | 1/1 |
+| 4x128K | DSpark-7 draft eager | 1,191.29 | 69.38 | 96.16 | 450.26 | 2.19 | 4/4 |
+
+The 4x128K DSpark run completed with a 435.52-440.10 second TTFT range and
+peaked at approximately 99.4% KV-cache use. The requested target-only 4x128K
+comparison was cancelled and is not reported as a completed result.
+
+Greedy DSpark and target-only output hashes matched for all 1K and 32K probes.
+At 128K the wording diverged after the correct answer, while both paths still
+recovered the passphrase with no cross-request leakage. This is consistent with
+the different target runner paths reaching a close-logit branch; it is not
+evidence of a failed needle lookup.
+
+FlashInfer non-causal draft FULL graph support is now wired for SM80. The
+metadata builder owns stable CUDA-side indptr, index, and last-page buffers for
+each uniform `(batch size, draft length)` capture shape. The graph wrapper does
+not request `fixed_split_size`: FlashInfer rejects fixed split planning in CUDA
+graph mode because its padded batch contract cannot be preserved. Split-KV
+planning remains enabled for the graph-specific wrapper, while eager prefill
+keeps its existing plan settings.
+
+The real NVFP4 plus DSpark-7 service captured all four draft FULL graphs and all
+four target FULL graphs for combined capture sizes
+`[7, 8, 14, 16, 21, 24, 28, 32]`. Both 32K replay probes completed without a
+graph or attention error. At 4x32K, where mean accepted length stayed nearly
+constant at 1.89 versus 1.91, FULL graph reduced the measured round cost from
+15.50 to 13.59 ms, increased mixed aggregate decode from 117.02 to 136.03 tok/s
+(+16.25%), and increased tail aggregate decode from 118.60 to 133.80 tok/s
+(+12.81%). Prefill remained flat within 0.3%, as expected. The larger 1x32K
+decode gain also includes an acceptance-length change, but its round cost still
+fell from 45.87 to 39.84 ms.
+
+Validation for this path:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+  .venv/bin/python -m pytest \
+  tests/v1/attention/test_flashinfer_dcp_spec_reorder.py -q
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+  .venv/bin/python -m pytest tests/kernels/attention/test_flashinfer.py -q \
+  -k 'fast_plan_decode_multi_token_matches_reference or noncausal_prefill_cudagraph_matches_eager_with_padded_batch'
+```
+
+The unit suite passed 7/7 and the SM80 kernel selection passed 3/3: MTP3, MTP5,
+and the non-causal replay comparison. The replay test captures a two-request
+non-causal graph, replans it with one real request and one padded request, and
+compares the real output with eager FlashInfer.
+
+### FP8 target acceptance comparison
+
+The same DSpark-7, scheduler, FP8 KV cache, FULL graph shapes, greedy seed 170,
+exact 32K prompt, and 256-token output were also tested with
+`Qwen3.8-27B-FP8`. The FP8 target loaded through
+`MarlinFP8ScaledMMLinearKernel`; FlashInfer captured four target and four draft
+FULL graphs.
+
+| shape | target | prefill tok/s | aggregate decode tok/s | ms/round | mean accepted | draft-token acceptance | quality |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1x32K | NVFP4 | 1,799.79 | 53.79 | 39.84 | 2.151 | 16.45% | 1/1 |
+| 1x32K | FP8 | 1,725.42 | 56.72 | 42.01 | 2.411 | 20.16% | 1/1 |
+| 4x32K | NVFP4 | 1,790.01 | 136.03 | 13.59 | 1.905 | 12.93% | 4/4 |
+| 4x32K | FP8 | 1,709.91 | 135.37 | 15.79 | 2.209 | 17.27% | 4/4 |
+
+The target format materially changes proposal agreement. FP8 raises mean
+accepted length by 12.08% at 1x32K and 15.94% at 4x32K; draft-token acceptance
+rises by 3.71 and 4.34 percentage points. At 4x32K, position-wise acceptance
+changes from `[72.25, 11.36, 2.79, 1.68, 1.30, 0.56, 0.56]%` for NVFP4 to
+`[66.24, 20.00, 12.04, 8.17, 6.45, 4.09, 3.87]%` for FP8. The first proposal
+is accepted less often, but FP8 preserves agreement much farther into the
+seven-token block.
+
+That acceptance improvement does not produce a 4x throughput gain on SM80.
+FP8 weight-only Marlin increases the measured round cost by 16.17% and reduces
+prefill by 4.48%, leaving aggregate decode 0.49% below NVFP4. All five needle
+probes passed with zero cross-request leakage. The FP8 checkpoint lacks a KV
+q scaling factor, and vLLM reported uncalibrated q/prob fallback values of 1.0;
+this is an accuracy caveat for both semantic and acceptance interpretation.
+
+Neither DSpark pairing is recommended for production yet. The FP8 target is a
+better semantic match for the documented drafter, but mean accepted length is
+still only 2.21 at 4x32K. The established NVFP4 MTP5 path reaches 3.79 and
+approximately 265-276 mixed aggregate decode tok/s, versus 2.21 and 135.37
+tok/s for FP8 plus FULL-graph DSpark-7.
+
+The JIT warmup gap is now closed. V2 runner startup warms the runtime-dtype
+rejection path and both DFlash and DSpark input preparation. The latter reuses
+the initialized block-table layout and compiles block sizes 16, 32, 64, 128,
+and 256 before the JIT monitor is activated. A fresh-cache CMP 170HX run with
+the default `enable_jit_warmup=true` and `--jit-monitor-mode error` completed
+both 1x1K and 4x1K requests without request-time compilation. Their measured
+aggregate decode rates were 85.69 and 176.70 tok/s, respectively. Production
+commands must not include
+`--kernel-config '{"enable_jit_warmup":false}'`; a normal readiness probe is
+still recommended, but same-shape traffic warmup is no longer required to avoid
+these speculative-kernel JITs.

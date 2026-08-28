@@ -156,6 +156,83 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    @torch.inference_mode()
+    def warmup_prepare_inputs(self) -> None:
+        """Compile the DFlash input-preparation variants used during serving."""
+        if self.draft_kv_cache_group_id < 0:
+            return
+        group_id = self.draft_kv_cache_group_id
+        group_index = self.draft_kv_cache_group_ids.index(group_id)
+        query_slot_mapping = self.block_tables.slot_mappings[group_id]
+        context_positions = self.context_positions
+        context_slot_mapping = self._context_slot_mappings[group_index]
+        block_table = self.block_tables.input_block_tables[group_id]
+        block_size = self.block_tables.kernel_block_sizes[group_id]
+        sample_count = self.max_num_reqs * self.num_speculative_steps
+        seeds = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
+        last_sampled = torch.zeros_like(seeds)
+        next_prefill_tokens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        num_sampled = torch.ones_like(next_prefill_tokens)
+        num_rejected = torch.zeros_like(next_prefill_tokens)
+        input_temperature = torch.zeros_like(self.temperature)
+        input_seeds = torch.zeros_like(seeds)
+        idx_mapping = torch.arange(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        for block_tokens in (16, 32, 64, 128, 256):
+            context_tokens_per_req = max(1, block_tokens - self.num_query_per_req)
+            num_context_tokens = self.max_num_reqs * context_tokens_per_req
+            target_positions = torch.arange(
+                context_tokens_per_req,
+                dtype=torch.int64,
+                device=self.device,
+            ).repeat(self.max_num_reqs)
+            target_query_start_loc = (
+                torch.arange(
+                    self.max_num_reqs + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                * context_tokens_per_req
+            )
+            _prepare_dflash_inputs_kernel[(self.max_num_reqs, 1)](
+                self.input_buffers.input_ids,
+                self.input_buffers.positions,
+                self.input_buffers.query_start_loc,
+                self.input_buffers.seq_lens,
+                query_slot_mapping,
+                context_positions[:num_context_tokens],
+                context_slot_mapping[:num_context_tokens],
+                self.sample_indices[:sample_count],
+                self.sample_pos[:sample_count],
+                self.sample_idx_mapping[:sample_count],
+                self.temperature,
+                seeds,
+                target_positions,
+                target_query_start_loc,
+                idx_mapping,
+                last_sampled,
+                next_prefill_tokens,
+                num_sampled,
+                num_rejected,
+                input_temperature,
+                input_seeds,
+                block_table,
+                block_table.stride(0),
+                self.parallel_drafting_token_id,
+                block_size,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
+                PAD_SLOT_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=block_tokens,
+            )
+
     def load_draft_model(
         self,
         target_model: nn.Module,
