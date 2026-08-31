@@ -1317,6 +1317,12 @@ def test_project_kv_cache_groups_to_worker():
     assert isinstance(proj_spec, UniformTypeKVCacheSpecs)
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups_uniform, {"layer4": spec_a}
+    )
+    assert projected[0].layer_names == []
+    assert projected[0].kv_cache_spec is spec_a
+
 
 @pytest.mark.parametrize(
     "layer_type,dcp_size,expected_width",

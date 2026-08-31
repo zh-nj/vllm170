@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU-resident Qwen4Exp position-learning enhancement layers."""
+"""Qwen4Exp position-learning enhancement layers."""
 
 import math
 from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -125,9 +127,12 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    embedding_dtype: str | None = None,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
 
+    if embedding_dtype in {"float8_e4m3fn", "float8_e4m3fnuz"}:
+        return Qwen4ExpPLEFp8EmbeddingMethod()
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:
@@ -308,16 +313,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = PLEVocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
-        )
+        self.cpu_offload = envs.VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD
+        if (
+            self.cpu_offload
+            and get_current_vllm_config().parallel_config.tensor_parallel_size != 1
+        ):
+            raise NotImplementedError("CPU-offloaded PLE requires TP size 1")
+        embedding_device = torch.device("cpu") if self.cpu_offload else nullcontext()
+        with embedding_device:
+            self.ngram_embedding = PLEVocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config,
+                    f"{prefix}.ngram_embedding",
+                    config.ple_embedding_dtype,
+                ),
+            )
+        if self.cpu_offload:
+            for parameter in self.ngram_embedding.parameters():
+                parameter._vllm_skip_device_loading_context = True
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -453,7 +471,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids,
             self.layer_name,
         )
-        return self.ngram_embedding(ngram_ids).flatten(-2)
+        if self.cpu_offload:
+            embeddings = self.ngram_embedding(ngram_ids.cpu())
+            embeddings = embeddings.to(input_ids.device)
+        else:
+            embeddings = self.ngram_embedding(ngram_ids)
+        return embeddings.flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -620,9 +643,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         weight_scale = self._get_embedding_weight_scale()
         if weight_scale is None:
             raise RuntimeError("FP8 PLE embedding is missing its global scale")
-        if weight_scale.device != embeddings.device:
-            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
-        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
+        return embeddings.to(output_dtype) * weight_scale.to(
+            device=embeddings.device, dtype=output_dtype
+        )
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:

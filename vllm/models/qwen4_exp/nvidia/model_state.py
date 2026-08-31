@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -26,18 +28,34 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        if not config.ple_layer_ids:
+            self.uses_ngram_embedding = False
+            self.ngram_context_len = 0
+            self.ngram_eos_token_id = 0
+            return
+
+        pp_group = get_pp_group()
+        start_layer, end_layer = get_pp_indices(
+            int(config.num_hidden_layers),
+            pp_group.rank_in_group,
+            len(pp_group.ranks),
+        )
+        local_ple_layer_ids = [
+            int(layer_id)
+            for layer_id in config.ple_layer_ids
+            if start_layer <= int(layer_id) - 1 < end_layer
+        ]
+        self.uses_ngram_embedding = bool(local_ple_layer_ids)
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        if not pp_group.is_first_rank:
             raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
+                "N-gram PLE layers must be assigned to the first pipeline "
+                "rank because only that rank receives raw input token IDs; "
+                f"local PLE layer IDs: {local_ple_layer_ids}."
             )
 
         self.ngram_context_len = int(config.ngram_size) - 1

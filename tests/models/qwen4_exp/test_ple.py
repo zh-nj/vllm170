@@ -12,6 +12,7 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -266,6 +267,72 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
 
     quant_config.ignored_layers = [f"{prefix}.shard_0"]
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
+
+
+def test_ple_explicit_fp8_dtype_overrides_global_quantization() -> None:
+    method = _get_ple_embedding_quant_method(
+        None,
+        "model.layers.1.ple.ple_embedding.ngram_embedding",
+        "float8_e4m3fn",
+    )
+
+    assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+
+
+def test_ple_cpu_offload_constructs_embedding_on_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=1)
+        ),
+    )
+    config = SimpleNamespace(
+        ngram_size=2,
+        heads_per_ngram=1,
+        eos_token_id=3,
+        vocab_size=64,
+        split_ngram_parts=2,
+        seed=1234,
+        ngram_vocab_size_base=5,
+        make_ngram_vocab_size_divisible_by=1,
+        ple_embedding_dtype="float8_e4m3fn",
+    )
+
+    with torch.device("meta"):
+        module = Qwen4ExpNGramEmbedding(
+            config,
+            embedding_dim=4,
+            ple_dense_layer_id=0,
+            max_total_tokens=8,
+            max_num_reqs=2,
+            prefix="model.layers.1.ple.ple_embedding",
+            layer_name="model.layers.1.ple",
+            params_dtype=torch.bfloat16,
+        )
+
+    assert module.cpu_offload
+    assert module.ngram_embedding.weight.device.type == "cpu"
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    assert module.ngram_embedding.weight_scale.device.type == "cpu"
+    assert module.ngram_embedding.weight._vllm_skip_device_loading_context
+    assert module.ngram_embedding.weight_scale._vllm_skip_device_loading_context
+    assert module.layer_multipliers.device.type == "meta"
+
+    with device_loading_context(module.ngram_embedding, torch.device("meta")):
+        assert module.ngram_embedding.weight.device.type == "cpu"
+        assert module.ngram_embedding.weight_scale.device.type == "cpu"
 
 
 def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> None:

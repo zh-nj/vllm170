@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -116,10 +117,7 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
 
 
 @pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
+def test_qwen4_exp_allows_pipeline_parallel(ple_layer_ids) -> None:
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
@@ -133,13 +131,7 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
     with patch.object(
         Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
-            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
@@ -198,3 +190,60 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize(
+    ("pp_rank", "ple_layer_ids", "uses_ngram_embedding", "raises"),
+    [
+        (0, [2], True, False),
+        (1, [2], False, False),
+        (1, [25], True, True),
+    ],
+)
+def test_qwen4_exp_model_state_limits_ple_to_first_pp_rank(
+    pp_rank: int,
+    ple_layer_ids: list[int],
+    uses_ngram_embedding: bool,
+    raises: bool,
+) -> None:
+    def init_base_state(state, vllm_config, model, encoder_cache, device) -> None:
+        state.model_config = vllm_config.model_config
+        state.max_num_reqs = 4
+        state.device = device
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=ple_layer_ids,
+                num_hidden_layers=48,
+                ngram_size=3,
+                eos_token_id=99,
+            ),
+        ),
+    )
+    pp_group = SimpleNamespace(
+        ranks=[0, 1],
+        rank_in_group=pp_rank,
+        is_first_rank=pp_rank == 0,
+    )
+    error_context = (
+        pytest.raises(RuntimeError, match="first pipeline rank")
+        if raises
+        else nullcontext()
+    )
+    with (
+        patch.object(MambaHybridModelState, "__init__", init_base_state),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model_state.get_pp_group",
+            return_value=pp_group,
+        ),
+        error_context,
+    ):
+        model_state = Qwen4ExpModelState(
+            vllm_config,
+            torch.nn.Identity(),
+            None,
+            torch.device("cpu"),
+        )
+    if not raises:
+        assert model_state.uses_ngram_embedding is uses_ngram_embedding

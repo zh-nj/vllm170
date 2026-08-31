@@ -163,7 +163,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
-        if p.device.type == "cpu":
+        if p.device.type == "cpu" and not getattr(
+            p, "_vllm_skip_device_loading_context", False
+        ):
             cpu_params.add(name)
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):

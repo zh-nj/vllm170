@@ -36,6 +36,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         hc_lowrank: int = 320,
         ple_layer_ids: list[int] | None = None,
         ple_embed_dim: int | None = None,
+        ple_embedding_dtype: str | None = None,
         ple_conv_kernel_size: int = 4,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
@@ -79,6 +80,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_embed_dim = (
             self.hidden_size if ple_embed_dim is None else ple_embed_dim
         )
+        self.ple_embedding_dtype = ple_embedding_dtype
         self.ple_conv_kernel_size = ple_conv_kernel_size
         self.ngram_size = ngram_size
         self.heads_per_ngram = heads_per_ngram
