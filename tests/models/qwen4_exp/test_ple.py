@@ -378,6 +378,47 @@ def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> Non
     assert torch.equal(output, torch.full_like(output, 2))
 
 
+def test_cpu_ple_embedding_custom_op_copies_lookup_to_output(monkeypatch) -> None:
+    class RuntimeEmbedding(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            weight = torch.arange(24, dtype=torch.bfloat16).reshape(8, 3)
+            self.weight = nn.Parameter(
+                weight.to(torch.float8_e4m3fn), requires_grad=False
+            )
+            self.weight_scale = nn.Parameter(
+                torch.tensor([0.5], dtype=torch.bfloat16), requires_grad=False
+            )
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return F.embedding(input_ids, self.weight)
+
+    class RuntimeNGramEmbedding(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ngram_embedding = RuntimeEmbedding()
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = RuntimeNGramEmbedding()
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+    )
+    ngram_ids = torch.tensor([[1, 2], [3, 4]])
+    output = torch.empty(2, 2, 3, dtype=torch.bfloat16)
+
+    ple_layer_module.qwen4_exp_cpu_ple_embedding(
+        ngram_ids,
+        output,
+        "ple",
+    )
+
+    expected = layer.ple_embedding.ngram_embedding(ngram_ids).to(torch.bfloat16) * 0.5
+    torch.testing.assert_close(output, expected)
+
+
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
     module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(module)

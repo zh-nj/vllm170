@@ -1770,7 +1770,6 @@ def _get_packed_kv_cache_groups(
         groups,
         use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
     )
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
@@ -1784,6 +1783,45 @@ def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _get_qwen4_exp_mtp_layer_names(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> set[str]:
+    """Return Qwen4Exp native-MTP attention layers from their model path."""
+    spec_config = vllm_config.speculative_config
+    model_config = vllm_config.model_config
+    if (
+        spec_config is None
+        or spec_config.method != "mtp"
+        or model_config is None
+        or model_config.hf_config.model_type not in {"qwen4_exp", "qwen4_exp_text"}
+    ):
+        return set()
+
+    text_config = model_config.hf_text_config
+    start_layer = getattr(text_config, "num_hidden_layers", None)
+    num_layers = getattr(text_config, "mtp_num_hidden_layers", None)
+    if (
+        not isinstance(start_layer, int)
+        or isinstance(start_layer, bool)
+        or not isinstance(num_layers, int)
+        or isinstance(num_layers, bool)
+        or num_layers <= 0
+    ):
+        return set()
+
+    markers = tuple(
+        f"mtp.layers.{layer_idx}."
+        for layer_idx in range(start_layer, start_layer + num_layers)
+    )
+    return {
+        layer_name
+        for layer_name in kv_cache_spec
+        if layer_name.startswith(markers)
+        or any(f".{marker}" in layer_name for marker in markers)
+    }
+
+
 def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1792,7 +1830,7 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Two detection rules, in order of preference:
+    Three detection rules, in order of preference:
 
     1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
@@ -1801,7 +1839,10 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for DeepseekV4, whose MTP block reuses
+    2. Model-scoped name fallback for Qwen4Exp native MTP. Its standalone
+       draft model registers attention under ``mtp.layers.<absolute index>``;
+       the valid index range comes from the target text config.
+    3. Model-scoped positional fallback for DeepseekV4, whose MTP block reuses
        the target's own decoder layer and so carries no spec marker. Its draft
        attention layer is always the last registered layer, so flag whichever
        group holds it. This rule is only valid where the groups partition
@@ -1828,6 +1869,12 @@ def _annotate_eagle_groups(
             for spec in iter_layer_specs(group.kv_cache_spec)
         ):
             group.is_eagle_group = True
+
+    qwen4_exp_mtp_layers = _get_qwen4_exp_mtp_layer_names(vllm_config, kv_cache_spec)
+    if qwen4_exp_mtp_layers:
+        for group in kv_cache_groups:
+            if qwen4_exp_mtp_layers.intersection(group.layer_names):
+                group.is_eagle_group = True
 
     if not use_deepseek_v4_fallback:
         return
@@ -1890,6 +1937,8 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    warn_on_unannotated_eagle_mamba: bool = True,
 ) -> list[KVCacheGroupSpec]:
     """
     Split the layers in the model into groups with the same KV cache spec.
@@ -1897,6 +1946,8 @@ def get_kv_cache_groups(
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
+        warn_on_unannotated_eagle_mamba: Warn if a complete model spec cannot
+            identify its draft group. Disable for PP-local profiling specs.
 
     Returns:
         The generated KVCacheGroups
@@ -1936,6 +1987,8 @@ def get_kv_cache_groups(
         packed_groups += [
             KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
         ]
+        if warn_on_unannotated_eagle_mamba:
+            _warn_if_unannotated_eagle_mamba(vllm_config, packed_groups)
         return packed_groups
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
@@ -1970,7 +2023,8 @@ def get_kv_cache_groups(
             groups.append(KVCacheGroupSpec([name], aligned))
 
     _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
+    if warn_on_unannotated_eagle_mamba:
+        _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 

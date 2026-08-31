@@ -6596,7 +6596,11 @@ class GPUModelRunner(
 
         kv_cache_spec = self.get_kv_cache_spec()
         KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
-        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        kv_cache_groups = get_kv_cache_groups(
+            self.vllm_config,
+            kv_cache_spec,
+            warn_on_unannotated_eagle_mamba=False,
+        )
         # the minimum number of blocks required is 1 block *per sequence*
         min_blocks = (
             min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)

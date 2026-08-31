@@ -3367,12 +3367,65 @@ def test_unidentifiable_draft_with_mamba_warns(caplog_vllm):
     assert "Mamba groups" in caplog_vllm.text
 
 
+def test_partial_pp_spec_can_suppress_unidentifiable_draft_warning(caplog_vllm):
+    get_kv_cache_groups(
+        _spec_decode_grouping_config(),
+        _hybrid_specs_with_draft(draft=False),
+        warn_on_unannotated_eagle_mamba=False,
+    )
+
+    assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
 def test_no_warning_when_draft_group_is_identified(caplog_vllm):
     get_kv_cache_groups(
         _spec_decode_grouping_config(), _hybrid_specs_with_draft(draft=True)
     )
 
     assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
+def _qwen4_exp_specs():
+    full = new_kv_cache_spec(block_size=64, num_kv_heads=1, head_size=128)
+    return {
+        "model.layers.0.linear_attn": new_mamba_spec(
+            block_size=64, mamba_cache_mode="align"
+        ),
+        "model.layers.47.self_attn.attn": full,
+        "mtp.layers.48.self_attn.attn": full,
+    }
+
+
+def test_qwen4_exp_mtp_group_annotated_by_layer_range(caplog_vllm):
+    config = _spec_decode_grouping_config(method="mtp", model_type="qwen4_exp")
+    config.model_config.hf_text_config = SimpleNamespace(
+        num_hidden_layers=48,
+        mtp_num_hidden_layers=1,
+    )
+
+    groups = get_kv_cache_groups(config, _qwen4_exp_specs())
+
+    flagged = [group for group in groups if group.is_eagle_group]
+    assert len(flagged) == 1
+    assert "mtp.layers.48.self_attn.attn" in flagged[0].layer_names
+    assert not any(
+        group.is_eagle_group
+        for group in groups
+        if "model.layers.0.linear_attn" in group.layer_names
+    )
+    assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
+def test_qwen4_exp_mtp_layer_name_requires_matching_model():
+    config = _spec_decode_grouping_config(method="mtp", model_type="other")
+    config.model_config.hf_text_config = SimpleNamespace(
+        num_hidden_layers=48,
+        mtp_num_hidden_layers=1,
+    )
+
+    groups = get_kv_cache_groups(config, _qwen4_exp_specs())
+
+    assert not any(group.is_eagle_group for group in groups)
 
 
 def _deepseek_v4_specs(model_version="deepseek_v4"):

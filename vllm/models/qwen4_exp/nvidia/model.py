@@ -887,14 +887,17 @@ class Qwen4ExpForConditionalGeneration(
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
             self._init_video_pruning(multimodal_config)
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
-
-            with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.visual = Qwen3_VisionTransformer(
-                    config.vision_config,
-                    norm_eps=config.text_config.rms_norm_eps,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
-                )
+            if get_pp_group().is_first_rank:
+                with self._mark_tower_model(vllm_config, {"image", "video"}):
+                    self.visual = Qwen3_VisionTransformer(
+                        config.vision_config,
+                        norm_eps=config.text_config.rms_norm_eps,
+                        quant_config=quant_config,
+                        prefix=maybe_prefix(prefix, "visual"),
+                    )
+            else:
+                self.visual = StageMissingLayer("vision_tower")
+                self._tower_model_names = []
 
         self.use_deepstack = (
             not self.language_model_only
@@ -1013,7 +1016,9 @@ class Qwen4ExpForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None},
-            orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
+            orig_to_new_prefix={"visual.": None}
+            if isinstance(self.visual, StageMissingLayer)
+            else {},
         )
         loader = AutoWeightsLoader(
             self,

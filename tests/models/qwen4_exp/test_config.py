@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
@@ -46,7 +47,59 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
-def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
+def test_qwen4_exp_loads_vision_tower_only_on_first_pp_rank() -> None:
+    from vllm.model_executor.models.utils import StageMissingLayer
+    from vllm.models.qwen4_exp.nvidia.model import (
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    class DummyLanguageModel(torch.nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.model = SimpleNamespace(layers=[])
+            self.make_empty_intermediate_tensors = None
+
+    multimodal_config = SimpleNamespace(
+        language_model_only=False,
+        mm_encoder_only=False,
+        mm_encoder_tp_mode="weights",
+    )
+    model_config = SimpleNamespace(
+        hf_config=Qwen4ExpConfig(text_config=_text_config(ple_layer_ids=[])),
+        multimodal_config=multimodal_config,
+        get_multimodal_config=lambda: multimodal_config,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        quant_config=None,
+    )
+    pp_group = SimpleNamespace(is_first_rank=False)
+
+    with (
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch.object(
+            Qwen4ExpForConditionalGeneration,
+            "_init_video_pruning",
+        ),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model.cached_tokenizer_from_config",
+            return_value=None,
+        ),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model.Qwen4ExpForCausalLM",
+            DummyLanguageModel,
+        ),
+    ):
+        model = Qwen4ExpForConditionalGeneration(vllm_config=vllm_config)
+
+    assert isinstance(model.visual, StageMissingLayer)
+    assert model._tower_model_names == []
+
+
+def test_qwen4_exp_mtp_runs_locally_on_last_target_pp_rank() -> None:
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,
     )
@@ -56,6 +109,11 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     model.hc_count = 2
     model.hidden_size = 4
     model.num_mtp_layers = 1
+    model.embed_tokens = torch.nn.Embedding(2, 4)
+    model.pre_fc_norm_embedding = torch.nn.Identity()
+    model.pre_fc_norm_hidden = torch.nn.Identity()
+    model.fc_embedding = torch.nn.Identity()
+    model.fc_hidden = torch.nn.Identity()
     model.layers = [
         lambda **kwargs: (
             kwargs["hidden_states"],
@@ -71,23 +129,28 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
         ),
     )
     multi_hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    input_ids = torch.tensor([0, 1])
+    expected_multi_hidden = (
+        multi_hidden.unflatten(-1, (2, 4)) + model.embed_tokens(input_ids).unsqueeze(-2)
+    ).flatten(-2)
     pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
 
     with patch(
         "vllm.models.qwen4_exp.nvidia.mtp.get_pp_group",
         return_value=pp_group,
+        create=True,
     ):
         sample_hidden, returned_multi_hidden = model.forward(
-            input_ids=None,
+            input_ids=input_ids,
             positions=torch.arange(2),
-            intermediate_tensors={"hidden_states": multi_hidden},
+            hidden_states=multi_hidden,
         )
 
     torch.testing.assert_close(
         sample_hidden,
-        multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
+        expected_multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
     )
-    assert returned_multi_hidden is multi_hidden
+    torch.testing.assert_close(returned_multi_hidden, expected_multi_hidden)
 
 
 @pytest.mark.parametrize("wrapped_config", [False, True])
@@ -132,6 +195,39 @@ def test_qwen4_exp_allows_pipeline_parallel(ple_layer_ids) -> None:
         Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
     ):
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "expected_mode"),
+    [
+        (None, CUDAGraphMode.PIECEWISE),
+        (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.PIECEWISE),
+        (CUDAGraphMode.NONE, CUDAGraphMode.NONE),
+    ],
+)
+def test_qwen4_exp_cpu_ple_uses_piecewise_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_mode: CUDAGraphMode | None,
+    expected_mode: CUDAGraphMode,
+) -> None:
+    monkeypatch.setenv("VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD", "1")
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(cudagraph_mode=configured_mode),
+    )
+
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.compilation_config.cudagraph_mode == expected_mode
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

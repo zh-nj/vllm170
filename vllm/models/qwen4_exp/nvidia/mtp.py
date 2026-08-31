@@ -21,7 +21,6 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -37,7 +36,6 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     WeightsMapper,
     get_draft_quant_config,
     make_empty_intermediate_tensors_factory,
@@ -277,36 +275,27 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
-        if get_pp_group().is_first_rank:
-            assert hidden_states is not None
-            if inputs_embeds is None:
-                assert input_ids is not None
-                inputs_embeds = self.embed_input_ids(input_ids)
-            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            inputs_embeds = self.fc_embedding(inputs_embeds)
+        # The speculator is instantiated only on the target model's last PP
+        # rank, where its single MTP layer runs as a local PP=1 model.
+        assert hidden_states is not None
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embed_input_ids(input_ids)
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        inputs_embeds = self.fc_embedding(inputs_embeds)
 
-            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-            # the main model truly emits the pre-final-mixer multi stream
-            # on the first step; subsequent steps reuse the prior draft
-            # step's multi stream).
-            num_tokens = hidden_states.shape[0]
-            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                num_tokens, hc_count, hidden_size
-            )
-            hidden_states = self.fc_hidden(hidden_states)
-            # Add the embedding residual to every branch, then fold back
-            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-            hidden_states = hidden_states.flatten(-2)
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
+        num_tokens = hidden_states.shape[0]
+        hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+            num_tokens, hc_count, hidden_size
+        )
+        hidden_states = self.fc_hidden(hidden_states)
+        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+        hidden_states = hidden_states.flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -319,15 +308,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             query_start_loc=None,
             ngram_context=None,
         )
-        if not get_pp_group().is_last_rank:
-            # As in the target model, PP carries a materialized tensor rather
-            # than the delayed hidden/output/injection tuple.
-            hidden_states = layer.mlp_hyper_connection.combine(
-                hidden_states, block_output, injection
-            )
-            return IntermediateTensors({"hidden_states": hidden_states})
-
-        # Last PP rank finalize. Keep both:
+        # Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
         #       for the next draft step (zero extra compute, just kept).
@@ -397,17 +378,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = PPMissingLayer()
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

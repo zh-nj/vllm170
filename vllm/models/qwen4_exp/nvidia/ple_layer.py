@@ -278,6 +278,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"{embedding_dim} % {self.ngram_heads} != 0"
             )
         self.head_dim = embedding_dim // self.ngram_heads
+        self.output_dtype = params_dtype or torch.get_default_dtype()
         self.eos_token_id = int(config.eos_token_id)
         self.unigram_vocab_size = int(config.vocab_size)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
@@ -472,8 +473,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.layer_name,
         )
         if self.cpu_offload:
-            embeddings = self.ngram_embedding(ngram_ids.cpu())
-            embeddings = embeddings.to(input_ids.device)
+            embeddings = ngram_ids.new_empty(
+                (*ngram_ids.shape, self.head_dim),
+                dtype=self.output_dtype,
+            )
+            torch.ops.vllm.qwen4_exp_cpu_ple_embedding(
+                ngram_ids,
+                embeddings,
+                self.layer_name,
+            )
         else:
             embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.flatten(-2)
@@ -1238,6 +1246,26 @@ def qwen4_exp_compute_ple_ngram_ids_fake(
     return
 
 
+def qwen4_exp_cpu_ple_embedding(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the CPU PLE lookup and H2D copy outside piecewise graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    embeddings = layer.ple_embedding.ngram_embedding(ngram_ids.cpu())
+    embeddings = layer._dequantize_embeddings(embeddings, output.dtype)
+    output.copy_(embeddings)
+
+
+def qwen4_exp_cpu_ple_embedding_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1261,6 +1289,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_compute_ple_ngram_ids,
     mutates_args=["output"],
     fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_cpu_ple_embedding",
+    op_func=qwen4_exp_cpu_ple_embedding,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_cpu_ple_embedding_fake,
 )
 
 

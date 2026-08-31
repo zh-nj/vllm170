@@ -1022,6 +1022,7 @@ class SpecDecodeBaseProposer:
                     "DeepSeekMTPModel",
                     "DeepseekV32MTPModel",
                     "KimiK3MTPModel",
+                    "Qwen4ExpMTP",
                 }.intersection(architectures)
             )
         return self.method not in ("mtp", "draft_model", "dflash")

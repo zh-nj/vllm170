@@ -79,6 +79,7 @@ def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():
     [
         ("DeepSeekMTPModel", True),
         ("KimiK3MTPModel", True),
+        ("Qwen4ExpMTP", True),
         ("MiniMaxM3ForCausalLM", False),
     ],
 )
