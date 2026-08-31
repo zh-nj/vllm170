@@ -2,12 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
-from vllm.config.speculative import verify_dspark_pp_layout
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
 
@@ -20,8 +18,8 @@ def _write_dspark_config(path, **overrides):
         "hidden_size": 7168,
         "intermediate_size": 14336,
         "num_hidden_layers": 5,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 64,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
         "q_lora_rank": 1536,
         "kv_lora_rank": 512,
         "qk_nope_head_dim": 128,
@@ -125,9 +123,20 @@ def test_dspark_mla_rejects_unsupported_checkpoint_options(tmp_path, overrides):
         get_config(draft_path, trust_remote_code=False)
 
 
-def test_dspark_mla_uses_latent_kv_geometry(tmp_path):
+@pytest.mark.parametrize(
+    ("num_attention_heads", "expected_local_heads"),
+    [(64, 8), (96, 12)],
+    ids=["released-64-head", "block5-96-head"],
+)
+def test_dspark_mla_uses_latent_kv_geometry(
+    tmp_path, num_attention_heads, expected_local_heads
+):
     draft_path = tmp_path / "draft"
-    _write_dspark_config(draft_path)
+    _write_dspark_config(
+        draft_path,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_attention_heads,
+    )
     model_config = ModelConfig(
         model=str(draft_path),
         tokenizer_mode="skip",
@@ -144,7 +153,7 @@ def test_dspark_mla_uses_latent_kv_geometry(tmp_path):
         tensor_parallel_size=8, distributed_executor_backend="external_launcher"
     )
     assert model_config.get_num_kv_heads(parallel_config) == 1
-    assert model_config.get_num_attention_heads(parallel_config) == 8
+    assert model_config.get_num_attention_heads(parallel_config) == expected_local_heads
     assert model_config.get_num_experts() == 0
 
 
@@ -168,101 +177,3 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"
     assert speculative_config.draft_model_config.use_mla
-
-
-def test_specforge_qwen_dspark_uses_native_qwen_loader(tmp_path):
-    target_path = tmp_path / "target"
-    draft_path = tmp_path / "draft"
-    _write_target_config(target_path)
-    _write_specforge_qwen_dspark_config(draft_path)
-    target_config = ModelConfig(
-        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
-    )
-
-    speculative_config = SpeculativeConfig(
-        model=str(draft_path),
-        method="dspark",
-        num_speculative_tokens=7,
-        target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
-    )
-
-    draft_config = speculative_config.draft_model_config
-    assert draft_config.architectures == ["Qwen3DSparkModel"]
-    assert draft_config.hf_config.model_type == "qwen3"
-    assert draft_config.hf_config.dflash_config["target_layer_ids"] == [
-        4,
-        16,
-        28,
-        40,
-        52,
-    ]
-
-
-def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
-    target_path = tmp_path / "target"
-    draft_path = tmp_path / "draft"
-    _write_target_config(target_path)
-    _write_dspark_config(draft_path)
-    target_config = ModelConfig(
-        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
-    )
-
-    with pytest.raises(ValueError, match="does not currently support decode context"):
-        SpeculativeConfig(
-            model=str(draft_path),
-            method="dspark",
-            num_speculative_tokens=8,
-            target_model_config=target_config,
-            target_parallel_config=ParallelConfig(
-                tensor_parallel_size=2,
-                decode_context_parallel_size=2,
-                distributed_executor_backend="external_launcher",
-            ),
-        )
-
-
-def test_dspark_pp_accepts_aux_layers_on_last_partition():
-    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(dspark_target_layer_ids=[40, 41, 42])
-    )
-    parallel = SimpleNamespace(pipeline_parallel_size=3)
-
-    verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]
-
-
-def test_draft_parallel_config_recomputes_world_size():
-    target = ParallelConfig(
-        pipeline_parallel_size=3,
-        distributed_executor_backend="external_launcher",
-    )
-
-    draft = SpeculativeConfig.create_draft_parallel_config(target, 1, 1)
-
-    assert draft.pipeline_parallel_size == 1
-    assert draft.tensor_parallel_size == 1
-    assert draft.world_size == 1
-
-
-def test_dspark_pp_rejects_aux_layers_on_remote_partition():
-    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(dspark_target_layer_ids=[14, 41, 42])
-    )
-    parallel = SimpleNamespace(pipeline_parallel_size=3)
-
-    with pytest.raises(ValueError, match="outside its layer partition"):
-        verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]
-
-
-def test_dspark_pp_respects_manual_layer_partition(monkeypatch):
-    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "15,15,13")
-    target = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43))
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(dspark_target_layer_ids=[29, 41, 42])
-    )
-    parallel = SimpleNamespace(pipeline_parallel_size=3)
-
-    with pytest.raises(ValueError, match=r"partition \[30, 43\)"):
-        verify_dspark_pp_layout(target, draft, parallel)  # type: ignore[arg-type]

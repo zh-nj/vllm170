@@ -46,10 +46,6 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import ColumnParallelLinear
-from vllm.models.deepseek_v4.amd.rocm import build_swa_ragged_indices_direct
-from vllm.models.deepseek_v4.ampere.attention import (
-    DeepseekV4AmpereMLASparseBackend,
-)
 from vllm.platforms import current_platform
 
 if not current_platform.is_cuda():
@@ -59,6 +55,7 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
 )
@@ -122,6 +119,9 @@ def _run_sparse_backend_vs_sdpa(
     num_heads: int,
     device: torch.device,
     force_future_dominance: bool = False,
+    qk_nope_head_dim: int = 128,
+    v_head_dim: int = 128,
+    stale_cpu_query_lens: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run a sparse-MLA backend with the given per-token indices and compute a
     dense per-token SDPA reference over the SAME indices.
@@ -149,9 +149,7 @@ def _run_sparse_backend_vs_sdpa(
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
 
     kv_lora_rank = 512
-    qk_nope_head_dim = 128
     qk_rope_head_dim = 64
-    v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
 
     max_seqlen = max(seq_lens)
@@ -294,6 +292,16 @@ def _run_sparse_backend_vs_sdpa(
     common_attn_metadata = create_common_attn_metadata(
         batch_spec, block_size, device, arange_block_indices=True
     )
+    if stale_cpu_query_lens is not None:
+        # Adaptive verification updates only device boundaries; the stale CPU
+        # copy proves token_to_req_indices consumes the device layout.
+        assert len(stale_cpu_query_lens) == len(query_lens)
+        cpu_query_start_loc = [0]
+        for query_len in stale_cpu_query_lens:
+            cpu_query_start_loc.append(cpu_query_start_loc[-1] + query_len)
+        common_attn_metadata.query_start_loc_cpu = torch.tensor(
+            cpu_query_start_loc, dtype=torch.int32
+        )
     kv_cache = create_and_prepopulate_kv_cache(
         kv_c_contexts=kv_c_contexts,
         k_pe_contexts=k_pe_contexts,
@@ -413,189 +421,50 @@ def _skip_if_backend_unavailable(backend_cls, kv_cache_dtype: str, block_size: i
             pytest.skip("FlashInferMLASparseTRTLLMBackend requires SM 10.x capability")
 
 
-def _skip_if_ampere_backend_unavailable() -> None:
-    capability = current_platform.get_device_capability()
-    if capability is None or not (
-        DeepseekV4AmpereMLASparseBackend.supports_compute_capability(capability)
-    ):
-        pytest.skip("TRITON_MLA_SPARSE_DSV4 requires SM 8.x capability")
-
-
-def _build_ampere_noncausal_ragged(
-    *,
-    window: int,
-    query_len: int,
-    index_width: int,
-    prefix_len: int,
-    block_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
-    seq_len = prefix_len + query_len
-    query_start_loc = torch.tensor(
-        [0, query_len], dtype=torch.int32, device=device
-    )
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    token_to_req_indices = torch.zeros(query_len, dtype=torch.int32, device=device)
-    is_valid_token = torch.ones(query_len, dtype=torch.bool, device=device)
-    num_blocks = cdiv(seq_len, block_size)
-    block_table = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
-    ).unsqueeze(0)
-    swa_lens = torch.empty(query_len, dtype=torch.int32, device=device)
-    ragged_indices_buffer = torch.empty(
-        query_len * index_width, dtype=torch.int32, device=device
-    )
-    ragged_indptr_buffer = torch.empty(
-        query_len + 1, dtype=torch.int32, device=device
+def test_flashinfer_sparse_mla_adaptive_varlen_matches_sdpa(
+    default_vllm_config,
+    dist_init,
+    workspace_init,
+):
+    """Adaptive request boundaries must drive SM100 sparse index conversion."""
+    backend_cls = FlashInferMLASparseTRTLLMBackend
+    _skip_if_backend_unavailable(backend_cls, "fp8", 64)
+    assert (
+        backend_cls.get_builder_cls().get_cudagraph_support(None, None)
+        == AttentionCGSupport.ALWAYS
     )
 
-    ragged_indices, ragged_indptr = build_swa_ragged_indices_direct(
-        num_decode_tokens=query_len,
-        window_size=window,
-        index_width=index_width,
-        non_causal=True,
-        query_start_loc=query_start_loc,
-        seq_lens=seq_lens,
-        token_to_req_indices=token_to_req_indices,
-        is_valid_token=is_valid_token,
-        block_table=block_table,
-        block_size=block_size,
-        swa_lens=swa_lens,
-        ragged_indices_buffer=ragged_indices_buffer,
-        ragged_indptr_buffer=ragged_indptr_buffer,
-    )
-    lo = max(prefix_len - window, 0)
-    rows = [list(range(lo, seq_len)) for _ in range(query_len)]
-    return ragged_indices, ragged_indptr, swa_lens, rows
-
-
-@pytest.mark.parametrize("config_name", list(_DSPARK_CONFIGS.keys()))
-def test_dspark_noncausal_ampere_direct_ragged_indices(config_name) -> None:
-    """SM80 metadata must include the complete future-pointing draft block."""
-    _skip_if_ampere_backend_unavailable()
-    window, query_len, index_width = _DSPARK_CONFIGS[config_name]
     device = torch.device(DEVICE_TYPE)
-    prefix_len = window + 11
-    block_size = 256
-
-    ragged_indices, ragged_indptr, swa_lens, rows = (
-        _build_ampere_noncausal_ragged(
-            window=window,
-            query_len=query_len,
-            index_width=index_width,
-            prefix_len=prefix_len,
-            block_size=block_size,
-            device=device,
-        )
-    )
-    expected_lens = torch.full(
-        (query_len,), window + query_len, dtype=torch.int32, device=device
-    )
-    expected_indptr = torch.arange(
-        query_len + 1, dtype=torch.int32, device=device
-    ) * (window + query_len)
-    expected_indices = torch.tensor(
-        [slot for row in rows for slot in row], dtype=torch.int32, device=device
+    seq_lens = [257, 270, 265, 276]
+    query_lens = [1, 7, 3, 5]
+    sparse_indices = _build_dspark_noncausal_indices(
+        seq_lens,
+        query_lens,
+        window=128,
+        topk_width=256,
+        device=device,
     )
 
-    torch.testing.assert_close(swa_lens, expected_lens)
-    torch.testing.assert_close(ragged_indptr, expected_indptr)
+    backend_output, sdpa_reference, _ = _run_sparse_backend_vs_sdpa(
+        backend_cls,
+        seq_lens,
+        query_lens,
+        sparse_indices,
+        "fp8",
+        64,
+        16,
+        device,
+        qk_nope_head_dim=192,
+        v_head_dim=256,
+        stale_cpu_query_lens=[4, 4, 4, 4],
+    )
+
     torch.testing.assert_close(
-        ragged_indices[: expected_indices.numel()], expected_indices
+        backend_output,
+        sdpa_reference,
+        rtol=0.065,
+        atol=0.05,
     )
-    assert rows[0][-1] > prefix_len
-
-
-@torch.inference_mode()
-def test_dspark_noncausal_ampere_triton_matches_reference() -> None:
-    """SM80 production decode must attend to future draft-token slots."""
-    _skip_if_ampere_backend_unavailable()
-    from tests.kernels.attention.test_rocm_triton_attn_dsv4 import (
-        HEAD_DIM,
-        NOPE_HEAD_DIM,
-        ROPE_HEAD_DIM,
-        _pack_fp8_ds_mla_cache,
-        _ref_sparse_decode_ragged,
-    )
-    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-        rocm_sparse_attn_decode,
-    )
-
-    device = torch.device(DEVICE_TYPE)
-    torch.manual_seed(7)
-    window, query_len, index_width = _DSPARK_CONFIGS["small_block"]
-    prefix_len = window + 11
-    seq_len = prefix_len + query_len
-    block_size = 256
-    num_heads = 64
-    ragged_indices, ragged_indptr, swa_lens, rows = (
-        _build_ampere_noncausal_ragged(
-            window=window,
-            query_len=query_len,
-            index_width=index_width,
-            prefix_len=prefix_len,
-            block_size=block_size,
-            device=device,
-        )
-    )
-
-    q = torch.rand(
-        query_len, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-    )
-    kv = torch.rand(seq_len, HEAD_DIM, dtype=torch.bfloat16, device=device)
-    kv[-1] = kv[-1] * 4.0 + 2.0
-    use_fnuz = current_platform.is_fp8_fnuz()
-    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=use_fnuz)
-    output = torch.empty_like(q)
-    scale = HEAD_DIM**-0.5
-
-    rocm_sparse_attn_decode(
-        q=q,
-        kv_cache=None,
-        swa_k_cache=cache,
-        swa_only=True,
-        topk_indices=None,
-        topk_lens=None,
-        swa_indices=torch.empty(
-            query_len, 1, 0, dtype=torch.int32, device=device
-        ),
-        swa_lens=swa_lens,
-        swa_ragged_indices=ragged_indices,
-        swa_ragged_indptr=ragged_indptr,
-        topk_ragged_indices=None,
-        topk_ragged_indptr=None,
-        attn_sink=None,
-        scale=scale,
-        head_dim=HEAD_DIM,
-        nope_head_dim=NOPE_HEAD_DIM,
-        rope_head_dim=ROPE_HEAD_DIM,
-        output=output,
-    )
-    expected = _ref_sparse_decode_ragged(
-        q=q,
-        main_cache=cache,
-        main_rows=rows,
-        scale=scale,
-        attn_sink=None,
-        block_size=block_size,
-        main_use_fnuz=use_fnuz,
-    )
-    causal_rows = [
-        list(range(max(prefix_len - window, 0), prefix_len + query_idx + 1))
-        for query_idx in range(query_len)
-    ]
-    causal = _ref_sparse_decode_ragged(
-        q=q,
-        main_cache=cache,
-        main_rows=causal_rows,
-        scale=scale,
-        attn_sink=None,
-        block_size=block_size,
-        main_use_fnuz=use_fnuz,
-    )
-
-    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-    assert (output - causal).abs().max().item() > 0.1
 
 
 @pytest.mark.parametrize(

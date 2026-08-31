@@ -23,12 +23,8 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from vllm import envs
@@ -36,203 +32,11 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.phase_profile import phase_profile_stage
-from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
-
-_Q1_MARKOV_SCALE_AUDIT = (
-    ("000", 0.0),
-    ("050", 0.5),
-    ("075", 0.75),
-    ("100", 1.0),
-    ("125", 1.25),
-    ("150", 1.5),
-)
-
-
-def _get_q1_drafter_audit_eligible_rows(input_batch: InputBatch) -> np.ndarray:
-    completes_prefill = (
-        input_batch.num_computed_prefill_tokens_np
-        + input_batch.num_scheduled_tokens
-        >= input_batch.prefill_len_np
-    )
-    return ~input_batch.is_prefilling_np | completes_prefill
-
-
-def _collect_q1_drafter_audit_records(
-    base_logits: torch.Tensor,
-    markov_bias: torch.Tensor,
-    final_logits: torch.Tensor,
-    draft_ids: torch.Tensor,
-    previous_ids: torch.Tensor,
-    positions: torch.Tensor,
-    temperatures: torch.Tensor,
-    eligible_rows: torch.Tensor,
-    max_rows: int,
-) -> list[dict[str, bool | float | int]]:
-    """Collect bounded greedy q1 records before target verification."""
-    if max_rows <= 0:
-        return []
-    valid_rows = torch.nonzero(
-        (temperatures == 0) & eligible_rows, as_tuple=False
-    ).flatten()[:max_rows]
-    if valid_rows.numel() == 0:
-        return []
-
-    base_native = base_logits.index_select(0, valid_rows)
-    bias_native = markov_bias.index_select(0, valid_rows)
-    final_native = final_logits.index_select(0, valid_rows)
-    scale_top_ids = [
-        (base_native + bias_native * scale).argmax(dim=-1).to(torch.int64)
-        for _, scale in _Q1_MARKOV_SCALE_AUDIT
-    ]
-    base = base_native.to(torch.float32)
-    bias = bias_native.to(torch.float32)
-    final = final_native.to(torch.float32)
-    selected = draft_ids.index_select(0, valid_rows).to(torch.int64)
-
-    base_top_values, base_top_ids = torch.topk(base, k=2, dim=-1)
-    bias_top_values, bias_top_ids = torch.topk(bias, k=2, dim=-1)
-    final_top_values, final_top_ids = torch.topk(final, k=2, dim=-1)
-
-    selected_base = base.gather(1, selected[:, None]).squeeze(1)
-    selected_bias = bias.gather(1, selected[:, None]).squeeze(1)
-    selected_final = final.gather(1, selected[:, None]).squeeze(1)
-    selected_base_rank = 1 + (base > selected_base[:, None]).sum(dim=1)
-    selected_base_rank_end = (base >= selected_base[:, None]).sum(dim=1)
-
-    base_top1_ids = base_top_ids[:, 0]
-    base_top1_bias = bias.gather(1, base_top1_ids[:, None]).squeeze(1)
-    base_top1_final = final.gather(1, base_top1_ids[:, None]).squeeze(1)
-    base_top1_final_rank = 1 + (final > base_top1_final[:, None]).sum(dim=1)
-    base_top1_final_rank_end = (final >= base_top1_final[:, None]).sum(dim=1)
-
-    integer_rows = torch.stack(
-        (
-            valid_rows.to(torch.int64),
-            positions.index_select(0, valid_rows).to(torch.int64),
-            previous_ids.index_select(0, valid_rows).to(torch.int64),
-            selected,
-            base_top_ids[:, 0].to(torch.int64),
-            base_top_ids[:, 1].to(torch.int64),
-            bias_top_ids[:, 0].to(torch.int64),
-            bias_top_ids[:, 1].to(torch.int64),
-            final_top_ids[:, 0].to(torch.int64),
-            final_top_ids[:, 1].to(torch.int64),
-            selected_base_rank.to(torch.int64),
-            selected_base_rank_end.to(torch.int64),
-            base_top1_final_rank.to(torch.int64),
-            base_top1_final_rank_end.to(torch.int64),
-            *scale_top_ids,
-        ),
-        dim=1,
-    ).cpu()
-    float_rows = torch.stack(
-        (
-            temperatures.index_select(0, valid_rows).to(torch.float32),
-            selected_base,
-            selected_bias,
-            selected_final,
-            base_top_values[:, 0],
-            base_top_values[:, 1],
-            base_top_values[:, 0] - base_top_values[:, 1],
-            bias_top_values[:, 0],
-            bias_top_values[:, 1],
-            final_top_values[:, 0],
-            final_top_values[:, 1],
-            final_top_values[:, 0] - final_top_values[:, 1],
-            base_top1_bias,
-            base_top1_final,
-        ),
-        dim=1,
-    ).cpu()
-
-    records: list[dict[str, bool | float | int]] = []
-    for integer_row, float_row in zip(
-        integer_rows.tolist(), float_rows.tolist(), strict=True
-    ):
-        (
-            request_index,
-            position,
-            previous_token_id,
-            draft_token_id,
-            base_top1_id,
-            base_top2_id,
-            bias_top1_id,
-            bias_top2_id,
-            final_top1_id,
-            final_top2_id,
-            draft_base_rank,
-            draft_base_rank_end,
-            base_top1_final_rank,
-            base_top1_final_rank_end,
-            *markov_scale_top1_ids,
-        ) = integer_row
-        (
-            temperature,
-            draft_base_logit,
-            draft_bias,
-            draft_final_logit,
-            base_top1_logit,
-            base_top2_logit,
-            base_top2_margin,
-            bias_top1_logit,
-            bias_top2_logit,
-            final_top1_logit,
-            final_top2_logit,
-            final_top2_margin,
-            base_top1_bias,
-            base_top1_final_logit,
-        ) = float_row
-        record: dict[str, bool | float | int] = {
-            "request_index": request_index,
-            "position": position,
-            "predicted_position": position + 1,
-            "previous_token_id": previous_token_id,
-            "draft_token_id": draft_token_id,
-            "base_top1_id": base_top1_id,
-            "base_top2_id": base_top2_id,
-            "bias_top1_id": bias_top1_id,
-            "bias_top2_id": bias_top2_id,
-            "final_top1_id": final_top1_id,
-            "final_top2_id": final_top2_id,
-            "draft_base_rank": draft_base_rank,
-            "draft_base_rank_end": draft_base_rank_end,
-            "base_top1_final_rank": base_top1_final_rank,
-            "base_top1_final_rank_end": base_top1_final_rank_end,
-            "temperature": temperature,
-            "draft_base_logit": draft_base_logit,
-            "draft_bias": draft_bias,
-            "draft_final_logit": draft_final_logit,
-            "base_top1_logit": base_top1_logit,
-            "base_top2_logit": base_top2_logit,
-            "base_top2_margin": base_top2_margin,
-            "bias_top1_logit": bias_top1_logit,
-            "bias_top2_logit": bias_top2_logit,
-            "final_top1_logit": final_top1_logit,
-            "final_top2_logit": final_top2_logit,
-            "final_top2_margin": final_top2_margin,
-            "base_top1_bias": base_top1_bias,
-            "base_top1_final_logit": base_top1_final_logit,
-            "markov_changed_argmax": base_top1_id != final_top1_id,
-            "sample_matches_final_top1": draft_token_id == final_top1_id,
-            "sample_matches_final_max": draft_final_logit == final_top1_logit,
-        }
-        record.update(
-            {
-                f"markov_scale_{label}_top1_id": top1_id
-                for (label, _), top1_id in zip(
-                    _Q1_MARKOV_SCALE_AUDIT,
-                    markov_scale_top1_ids,
-                    strict=True,
-                )
-            }
-        )
-        records.append(record)
-    return records
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -270,30 +74,17 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
-        self.draft_confidence = (
-            torch.empty(
-                self.max_num_reqs,
-                self.num_speculative_steps,
-                dtype=torch.float32,
-                device=device,
-            )
-            if envs.VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT
-            else None
+        self._draft_topk: int | None = getattr(
+            self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
-        self._q1_drafter_audit_samples = 0
-        self._q1_drafter_audit_sample_limit = (
-            max(0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES)
-            if envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT
-            else 0
+
+        self.draft_token_confidence_probs = torch.empty_like(
+            self.draft_tokens, dtype=torch.float32
         )
-        self._q1_drafter_decode_mask = (
-            torch.empty(self.max_num_reqs, dtype=torch.bool, device=device)
-            if self._q1_drafter_audit_sample_limit > 0
-            else None
+        self.enable_adaptive_verification = (
+            self.speculative_config.enable_adaptive_verification
         )
-        self._reference_dump_path = (
-            envs.VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH
-        )
+        self._reference_dump_path = envs.VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH
         self._reference_dump_active = False
         self._reference_dump_written = False
         self._reference_dump: dict[str, Any] | None = None
@@ -391,49 +182,53 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
+        if self.enable_adaptive_verification and model.model.confidence_head is None:
+            raise ValueError(
+                "Adaptive verification needs a DSpark checkpoint with a confidence "
+                "head, and this one has none. Pass "
+                "enable_adaptive_verification=false in the speculative config to verify"
+                " a fixed number of drafts instead."
+            )
         return model
 
-    def _audit_q1_drafter(
+    def _sample_logits(
         self,
-        base_logits: torch.Tensor,
-        markov_bias: torch.Tensor,
-        final_logits: torch.Tensor,
-        draft_ids: torch.Tensor,
-        previous_ids: torch.Tensor,
-        positions: torch.Tensor,
-        temperatures: torch.Tensor,
-        eligible_rows: torch.Tensor,
-    ) -> None:
-        remaining = (
-            self._q1_drafter_audit_sample_limit - self._q1_drafter_audit_samples
+        logits: torch.Tensor,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+        if self.draft_logits is None:
+            return self.model.map_draft_to_target(logits.argmax(dim=-1))
+
+        # Probabilistic sampling and rejection operate in target-vocabulary
+        # space. A reduced draft vocabulary is scattered into its target rows.
+        if self._d2t_scatter_index is not None:
+            assert self._draft_scatter_buf is not None
+            buf = self._draft_scatter_buf[: logits.shape[0]]
+            buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
+            logits = buf
+
+        # sample_pos is the predicted token's position P. Sampling keys a draw
+        # by the position before the sampled token, P-1.
+        return gumbel_sample(
+            logits,
+            idx_map,
+            self.temperature,
+            self.seeds,
+            sample_pos - 1,
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=self.draft_logits,
+            logits_cache_col=self._step_cols[step],
+            use_fp64=self.use_fp64_gumbel,
         )
-        if remaining <= 0 or self._d2t_scatter_index is not None:
-            return
-        control_path = envs.VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH
-        if control_path and not os.path.exists(control_path):
-            return
-        if torch.cuda.is_current_stream_capturing():
-            return
-        records = _collect_q1_drafter_audit_records(
-            base_logits,
-            markov_bias,
-            final_logits,
-            draft_ids,
-            previous_ids,
-            positions,
-            temperatures,
-            eligible_rows,
-            remaining,
-        )
-        for record in records:
-            record["sample_index"] = self._q1_drafter_audit_samples
-            logger.info(
-                "DSpark q1 drafter audit: %s",
-                json.dumps(record, sort_keys=True),
-            )
-            self._q1_drafter_audit_samples += 1
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if self._draft_topk is not None:
+            self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -456,6 +251,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_markov_embeds = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -463,138 +259,74 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
-            with phase_profile_stage(
-                "draft.markov_bias", prev, flow="dspark", extra={"draft_step": i}
-            ):
-                markov_embed = self.model.markov_embed(prev)
-                bias = self.model.markov_bias(markov_embed)
-                logits_i = base_logits[:, i] + bias
-                if self.draft_confidence is not None:
-                    self.draft_confidence[:num_reqs, i] = (
-                        self.model.compute_draft_confidence(
-                            sample_hidden_by_step[:, i], markov_embed
-                        )
-                    )
-            if self._reference_dump_active:
-                assert self._reference_dump is not None
-                self._reference_dump["draft_previous_ids"].append(
-                    prev.detach().to(device="cpu", copy=True)
-                )
-                self._reference_dump["draft_markov_bias"].append(
-                    bias.detach().to(device="cpu", copy=True)
-                )
-                self._reference_dump["draft_final_logits"].append(
-                    logits_i.detach().to(device="cpu", copy=True)
-                )
-            with phase_profile_stage(
-                "draft.markov_sample",
-                logits_i,
-                flow="dspark",
-                extra={"draft_step": i},
-            ):
-                if self.draft_logits is not None:
-                    # Probabilistic sampling operates in the target vocabulary.
-                    if self._d2t_scatter_index is not None:
-                        assert self._draft_scatter_buf is not None
-                        buf = self._draft_scatter_buf[:num_reqs]
-                        buf.index_copy_(
-                            1, self._d2t_scatter_index, logits_i.to(buf.dtype)
-                        )
-                        logits_i = buf
-                    draft_sampled_i = gumbel_sample(
-                        logits_i,
-                        idx_map[:, i],
-                        self.temperature,
-                        self.seeds,
-                        sample_pos[:, i] - 1,
-                        apply_temperature=True,
-                        output_processed_logits=self.draft_logits,
-                        output_processed_logits_col=self._step_cols[i],
-                        use_fp64=self.use_fp64_gumbel,
-                        rng_domain=1,
-                    )
-                else:
-                    draft_sampled_i = self.model.map_draft_to_target(
-                        logits_i.argmax(dim=-1)
-                    )
-            if i == 0 and self._q1_drafter_audit_sample_limit > 0:
-                request_temperatures = self.temperature.index_select(
-                    0, idx_map[:, i].to(torch.int64)
-                )
-                decode_mask = self._q1_drafter_decode_mask
-                assert decode_mask is not None
-                self._audit_q1_drafter(
-                    base_logits[:, i],
-                    bias,
-                    logits_i,
-                    draft_sampled_i,
-                    prev,
-                    sample_pos[:, i] - 1,
-                    request_temperatures,
-                    decode_mask[:num_reqs],
-                )
+            markov_embed = self.model.markov_embed(prev)
+            if self.enable_adaptive_verification:
+                confidence_markov_embeds.append(markov_embed)
+            bias = self.model.markov_bias(markov_embed)
+            logits_i = base_logits[:, i] + bias
+            draft_sampled_i = self._sample_logits(
+                logits_i, idx_map[:, i], sample_pos[:, i], i
+            )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-    def propose(
-        self, input_batch: InputBatch, *args: Any, **kwargs: Any
-    ) -> torch.Tensor:
-        control_path = envs.VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH
-        control_ready = not control_path or os.path.exists(control_path)
-        should_dump = (
-            bool(self._reference_dump_path)
-            and not self._reference_dump_written
-            and not kwargs.get("dummy_run", False)
-            and not torch.cuda.is_current_stream_capturing()
-            and control_ready
-        )
-        if should_dump:
-            self._reference_dump_active = True
-            self._reference_dump = {
-                "schema_version": 1,
-                "num_reqs": input_batch.num_reqs,
-                "num_target_tokens": input_batch.num_tokens,
-                "num_speculative_steps": self.num_speculative_steps,
-            }
-        if self._q1_drafter_audit_sample_limit > 0:
-            decode_mask = self._q1_drafter_decode_mask
-            assert decode_mask is not None
-            decode_mask[: input_batch.num_reqs].copy_(
-                torch.from_numpy(_get_q1_drafter_audit_eligible_rows(input_batch))
+        if self.enable_adaptive_verification:
+            confidence = self.model.compute_confidence(
+                sample_hidden,
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
-        try:
-            draft_tokens = super().propose(input_batch, *args, **kwargs)
-            if should_dump:
-                num_reqs = input_batch.num_reqs
-                num_query_tokens = num_reqs * self.num_query_per_req
-                num_target_tokens = input_batch.num_tokens
-                self._capture_reference_tensor(
-                    "context_positions",
-                    self.context_positions[:num_target_tokens],
-                )
-                self._capture_reference_tensor(
-                    "query_input_ids",
-                    self.input_buffers.input_ids[:num_query_tokens],
-                )
-                self._capture_reference_tensor(
-                    "query_positions",
-                    self.input_buffers.positions[:num_query_tokens],
-                )
-                self._capture_reference_tensor(
-                    "sample_indices",
-                    self.sample_indices[: num_reqs * self.num_speculative_steps],
-                )
-                self._capture_reference_tensor("draft_tokens", draft_tokens)
-                assert self._reference_dump is not None
-                output_path = Path(self._reference_dump_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(self._reference_dump, output_path)
-                self._reference_dump_written = True
-                logger.info("Saved DSpark reference dump to %s", output_path)
-            return draft_tokens
-        finally:
-            if should_dump:
-                self._reference_dump_active = False
+            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                num_reqs, n_spec
+            )
+
+    def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        """Apply the sequential Markov head only to top-k base-logit candidates.
+
+        Candidate selection is done once for all draft positions. At each
+        sequential step, the selected logits are corrected in place and every
+        other entry is set to ``-inf``. The normal dense sampling and rejection
+        paths then consume that truncated distribution unchanged.
+        """
+        assert self._draft_topk is not None
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = base_logits.view(num_reqs, n_spec, -1)
+        base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
+        # Reuse the dense backbone output as the normal sampler's input. Fill
+        # once for all positions, then scatter only the corrected candidates
+        # during the sequential loop.
+        base_logits.fill_(float("-inf"))
+        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_markov_embeds = []
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+
+        for i in range(n_spec):
+            markov_embed = self.model.markov_embed(prev)
+            if self.enable_adaptive_verification:
+                confidence_markov_embeds.append(markov_embed)
+            logits_i = self.model.apply_markov_bias_gathered(
+                markov_embed,
+                base_logits[:, i],
+                base_values[:, i],
+                draft_indices[:, i],
+            )
+            draft_sampled_i = self._sample_logits(
+                logits_i, idx_map[:, i], sample_pos[:, i], i
+            )
+            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            prev = draft_sampled_i
+
+        if self.enable_adaptive_verification:
+            confidence = self.model.compute_confidence(
+                sample_hidden,
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+            )
+            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                num_reqs, n_spec
+            )
 
     def _generate_draft(
         self,

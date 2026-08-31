@@ -23,10 +23,11 @@ def optional_phase_profile_stage(
     stage: str,
     ref: torch.Tensor,
     *,
+    flow: str | None = None,
     level: str = "detail",
     extra: dict[str, Any] | None = None,
 ) -> AbstractContextManager[None]:
     """Call the registered profiler or return a no-op context."""
     if _phase_profile_stage is None:
         return nullcontext()
-    return _phase_profile_stage(stage, ref, level=level, extra=extra)
+    return _phase_profile_stage(stage, ref, flow=flow, level=level, extra=extra)

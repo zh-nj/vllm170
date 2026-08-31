@@ -10,10 +10,6 @@ import torch
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
 
-class AuxStreamType(Enum):
-    Attention = 1
-
-
 class EventType(Enum):
     Main = 0
     Attention = 1

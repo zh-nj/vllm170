@@ -22,7 +22,7 @@ from vllm.exceptions import VLLMValidationError
 def test_cmp170hx_project_environment_defaults() -> None:
     expected = {
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-        "VLLM_PP_LAYER_PARTITION": "15,16,12",
+        "VLLM_PP_LAYER_PARTITION": None,
         "VLLM_PP_REUSE_RECV_BUFFER": True,
         "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": 96,
         "VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS": 1024,
@@ -77,6 +77,12 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_HOST", "10.0.0.15")
 
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
+
+
+def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_API_KEY", "sk-super-secret")
+
+    assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
@@ -291,6 +297,21 @@ class TestEnvWithChoices:
                 ValueError, match="Invalid value 'invalid' for TEST_ENV"
             ):
                 env_func()
+
+
+def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
+    env_func = environment_variables["VLLM_GDN_DECODE_KERNEL"]
+    monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
+    assert env_func() == "cuda"
+
+    for value in ("cuda", "triton"):
+        monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
+        assert env_func() == value
+
+    for value in ("fused", "invalid"):
+        monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
+        with pytest.raises(ValueError, match="VLLM_GDN_DECODE_KERNEL"):
+            env_func()
 
 
 class TestEnvListWithChoices:

@@ -16,7 +16,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.custom_op import PluggableLayer
-from vllm.model_executor.layers.batch_invariant import (
+from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.base_config import (
@@ -233,6 +233,7 @@ class VocabParallelEmbedding(PluggableLayer):
         quant_config: quant config for the layer
         prefix: full name of the layer in the state dict
         disable_tp: If true, tensor parallelism will be disabled for this layer.
+        quant_method: Preselected quantization method for model-specific layers.
     """  # noqa: E501
 
     # --8<-- [end:vocab_parallel_embedding]
@@ -248,6 +249,7 @@ class VocabParallelEmbedding(PluggableLayer):
         prefix: str = "",
         *,
         disable_tp: bool = False,
+        quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
 
@@ -281,8 +283,9 @@ class VocabParallelEmbedding(PluggableLayer):
         )
         self.embedding_dim = embedding_dim
 
-        quant_method = None
-        if quant_config is not None:
+        # Avoid overriding a preselected model-specific method with generic
+        # config-based dispatch.
+        if quant_method is None and quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
@@ -290,7 +293,7 @@ class VocabParallelEmbedding(PluggableLayer):
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
-        is_embedding_layer = type(self) is VocabParallelEmbedding
+        is_embedding_layer = not isinstance(self, ParallelLMHead)
         quant_method_implements_embedding = method_has_implemented_embedding(
             type(quant_method)
         )
@@ -501,13 +504,22 @@ class VocabParallelEmbedding(PluggableLayer):
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
         if self.tp_size > 1:
+            if output_parallel.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
+                comm_output = output_parallel.view(torch.int8)
+                comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
+                output = tensor_model_parallel_all_reduce(comm_output)
+                return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
             return tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:
-        s = f"num_embeddings={self.num_embeddings_per_partition}"
+        s = f"num_embeddings={self.num_embeddings}"
+        s += f", num_embeddings_per_partition={self.num_embeddings_per_partition}"
         s += f", embedding_dim={self.embedding_dim}"
         s += f", org_vocab_size={self.org_vocab_size}"
         s += f", num_embeddings_padded={self.num_embeddings_padded}"

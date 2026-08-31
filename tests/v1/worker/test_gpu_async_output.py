@@ -32,6 +32,8 @@ def _make_async_output_stub() -> AsyncOutput:
     output.num_sampled_tokens_np = np.array([1, 1])
     output.num_nans = None
     output.logprobs_tensors = None
+    output.sampling_mask_tensors = None
+    output.routed_experts_cpu = None
     output.prompt_logprobs_dict = {}
     output._has_fault = None
     return output
