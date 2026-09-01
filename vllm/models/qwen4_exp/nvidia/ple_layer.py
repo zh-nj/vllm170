@@ -38,6 +38,7 @@ from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -47,6 +48,15 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import PLEVocabParallelEmbedding
+from .ops.ple import (
+    can_use_fused_ple_ngram_hash,
+    can_use_fused_ple_prefill_short_conv,
+    can_use_fused_ple_spec_short_conv,
+    fused_ple_ngram_hash,
+    fused_ple_prefill_short_conv,
+    fused_ple_spec_short_conv,
+    gather_pinned_ple_embedding,
+)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -335,6 +345,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
             )
         if self.cpu_offload:
+            weight = self.ngram_embedding.weight
+            if is_pin_memory_available():
+                weight.data = torch.empty(
+                    weight.shape,
+                    dtype=weight.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
             for parameter in self.ngram_embedding.parameters():
                 parameter._vllm_skip_device_loading_context = True
         self.register_buffer(
@@ -410,18 +428,38 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
 
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs, :num_tokens]
-        packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
-        columns = (positions - query_start_loc[request_indices]).clamp(
-            0, packed.shape[1] - 1
-        )
-        packed[request_indices, columns] = input_ids
+        columns = positions - query_start_loc[request_indices]
+        if num_tokens:
+            columns.clamp_(0, num_tokens - 1)
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
 
+        if can_use_fused_ple_ngram_hash(
+            input_ids,
+            ngram_context,
+            request_indices,
+            columns,
+            self.layer_multipliers,
+            self.ngram_heads_vocab_sizes,
+            self.ngram_heads_offsets,
+        ):
+            return fused_ple_ngram_hash(
+                input_ids,
+                ngram_context,
+                request_indices,
+                columns,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                self.eos_token_id,
+            )
+
+        packed = self.padded_buffer[:num_reqs, :num_tokens]
+        packed.fill_(self.eos_token_id)
+        packed[request_indices, columns] = input_ids
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
             context, self.eos_token_id
@@ -814,19 +852,43 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
 
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
         )
         valid_state = state_indices != NULL_BLOCK_ID
-        state_indices = torch.where(
-            valid_state, state_indices, torch.zeros_like(state_indices)
-        )
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
+        )
+        has_initial = has_initial & valid_state
+        if can_use_fused_ple_prefill_short_conv(
+            x_p,
+            conv_state,
+            state_indices,
+            has_initial,
+            req_indices,
+            col_indices,
+            q_starts,
+            lengths,
+            conv_weights,
+        ):
+            return fused_ple_prefill_short_conv(
+                x_p,
+                conv_state,
+                state_indices,
+                has_initial,
+                req_indices,
+                col_indices,
+                q_starts,
+                lengths,
+                conv_weights,
+            )
+
+        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
+        packed_tokens[req_indices, col_indices] = x_p
+        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
+
+        state_indices = torch.where(
+            valid_state, state_indices, torch.zeros_like(state_indices)
         )
         if self.conv_state_len > 0:
             if conv_state.shape[0] == 0:
@@ -915,6 +977,24 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        if can_use_fused_ple_spec_short_conv(
+            x_spec,
+            conv_state,
+            spec_state_indices_tensor,
+            spec_query_start_loc,
+            num_accepted_tokens,
+            conv_weights,
+            spec_query_len,
+        ):
+            return fused_ple_spec_short_conv(
+                x_spec,
+                conv_state,
+                spec_state_indices_tensor,
+                spec_query_start_loc,
+                num_accepted_tokens,
+                conv_weights,
+                spec_query_len,
+            )
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
         # Full CUDA graphs can pad these buffers. Only the first num_reqs
@@ -1251,11 +1331,28 @@ def qwen4_exp_cpu_ple_embedding(
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """Run the CPU PLE lookup and H2D copy outside piecewise graphs."""
+    """Gather an offloaded PLE table outside piecewise graphs."""
     layer = get_forward_context().no_compile_layers[layer_name]
-    embeddings = layer.ple_embedding.ngram_embedding(ngram_ids.cpu())
-    embeddings = layer._dequantize_embeddings(embeddings, output.dtype)
-    output.copy_(embeddings)
+    embedding = layer.ple_embedding.ngram_embedding
+    weight = embedding.weight
+    if (
+        weight.is_pinned()
+        and ngram_ids.is_cuda
+        and weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    ):
+        weight_scale = layer._get_embedding_weight_scale()
+        scale = 1.0 if weight_scale is None else float(weight_scale.item())
+        gather_pinned_ple_embedding(
+            weight,
+            ngram_ids,
+            output,
+            vocab_start=embedding.shard_indices.org_vocab_start_index,
+            vocab_end=embedding.shard_indices.org_vocab_end_index,
+            scale=scale,
+        )
+        return
+    embeddings = embedding(ngram_ids.cpu())
+    output.copy_(layer._dequantize_embeddings(embeddings, output.dtype))
 
 
 def qwen4_exp_cpu_ple_embedding_fake(

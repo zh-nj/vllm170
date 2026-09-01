@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -875,19 +874,6 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise NotImplementedError(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
-        if envs.VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD and text_config.ple_layer_ids:
-            from vllm.config.compilation import CUDAGraphMode
-
-            compilation_config = vllm_config.compilation_config
-            cudagraph_mode = compilation_config.cudagraph_mode
-            if cudagraph_mode is None or cudagraph_mode.has_full_cudagraphs():
-                if cudagraph_mode is not None:
-                    logger.warning(
-                        "Qwen4Exp CPU-offloaded PLE is incompatible with full "
-                        "CUDA graphs; overriding cudagraph_mode from %s to PIECEWISE",
-                        cudagraph_mode.name,
-                    )
-                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)

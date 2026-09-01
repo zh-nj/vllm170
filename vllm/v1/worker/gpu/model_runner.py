@@ -325,7 +325,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 relay_draft_tokens=(
                     self.speculative_config is not None
-                    and self.speculative_config.method == "dspark"
+                    and self.speculative_config.method in ("dspark", "mtp")
                 ),
             )
 
@@ -1565,6 +1565,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _update_draft_tokens(
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+    ) -> None:
+        self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+        if self.pp_handler is not None:
+            self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+
     def _merge_ec_connector_no_forward(
         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
     ) -> ModelRunnerOutput:
@@ -2044,7 +2051,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            self._update_draft_tokens(input_batch, draft_tokens)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

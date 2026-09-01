@@ -123,7 +123,7 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
-    # Proposed tokens from the last rank. Present only for DSpark-over-PP.
+    # Proposed tokens from the last rank for speculative decoding over PP.
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
 
 
@@ -170,6 +170,40 @@ def _snapshot_draft_tokens_for_pp(draft_tokens: torch.Tensor) -> torch.Tensor:
     )
 
 
+def pack_speculative_pp_relay(
+    sampled_token_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    max_sample_len: int,
+) -> torch.Tensor:
+    """Pack speculative PP results into one fixed-width collective."""
+    sampled_token_ids = pad_sampled_tokens(sampled_token_ids, max_sample_len)
+    expected_draft_width = max_sample_len - 1
+    if draft_tokens.ndim != 2 or draft_tokens.shape != (
+        sampled_token_ids.shape[0],
+        expected_draft_width,
+    ):
+        raise ValueError(
+            "PP draft-token shape must be "
+            f"[{sampled_token_ids.shape[0]}, {expected_draft_width}], "
+            f"got {tuple(draft_tokens.shape)}"
+        )
+    counts = torch.stack((num_sampled, num_rejected), dim=1).to(torch.int64)
+    return torch.cat((sampled_token_ids, draft_tokens.to(torch.int64), counts), dim=1)
+
+
+def unpack_speculative_pp_relay(
+    relay: torch.Tensor, max_sample_len: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return sampled tokens, counts, and proposals from a packed PP relay."""
+    draft_end = max_sample_len * 2 - 1
+    sampled_tokens = relay[:, :max_sample_len]
+    draft_tokens = relay[:, max_sample_len:draft_end]
+    counts = relay[:, draft_end:].to(torch.int32)
+    return sampled_tokens, counts[:, 0], counts[:, 1], draft_tokens
+
+
 class PPHandler:
     """Runs the PP sampled-token broadcast/recv on a side stream so the
     default stream isn't gated by the matching peer call. Step T's recv is
@@ -196,6 +230,9 @@ class PPHandler:
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
+        self._pending_speculative_relay: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
 
         # On non-last ranks, a FIFO with one entry per in-flight step: the entry
         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
@@ -268,35 +305,43 @@ class PPHandler:
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            sampled_tokens = torch.empty(
-                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
-            )
-            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
-            draft_tokens = None
             if self.relay_draft_tokens:
-                draft_tokens = torch.empty(
+                relay = torch.empty(
                     num_reqs,
-                    self.max_sample_len - 1,
+                    self.max_sample_len * 2 + 1,
                     dtype=torch.int64,
                     device=self.device,
                 )
                 torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                    relay, src=self.last_rank, group=self.broadcast_group
                 )
+                sampled_tokens, num_sampled, num_rejected, draft_tokens = (
+                    unpack_speculative_pp_relay(relay, self.max_sample_len)
+                )
+                relay.record_stream(self.main_stream)
+                num_sampled.record_stream(self.main_stream)
+                num_rejected.record_stream(self.main_stream)
+            else:
+                sampled_tokens = torch.empty(
+                    num_reqs,
+                    self.max_sample_len,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                combined = torch.empty(
+                    2, num_reqs, dtype=torch.int32, device=self.device
+                )
+                torch.distributed.broadcast(
+                    sampled_tokens, src=self.last_rank, group=self.broadcast_group
+                )
+                torch.distributed.broadcast(
+                    combined, src=self.last_rank, group=self.broadcast_group
+                )
+                num_sampled, num_rejected = combined.unbind(dim=0)
+                draft_tokens = None
+                sampled_tokens.record_stream(self.main_stream)
+                combined.record_stream(self.main_stream)
             event = self.broadcast_stream.record_event()
-            num_sampled, num_rejected = combined.unbind(dim=0)
-            # Must record_stream since these were allocated on broadcast stream but
-            # later used on the main stream.
-            sampled_tokens.record_stream(self.main_stream)
-            combined.record_stream(self.main_stream)
-            if draft_tokens is not None:
-                draft_tokens.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -329,6 +374,16 @@ class PPHandler:
         # the collective to keep NCCL element counts identical on every rank.
         sampled_token_ids = pad_sampled_tokens(sampled_token_ids, self.max_sample_len)
 
+        if self.relay_draft_tokens:
+            if self._pending_speculative_relay is not None:
+                raise RuntimeError("Previous speculative PP relay is still pending.")
+            self._pending_speculative_relay = (
+                sampled_token_ids,
+                num_sampled,
+                num_rejected,
+            )
+            return
+
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 
@@ -349,22 +404,29 @@ class PPHandler:
     def broadcast_draft(
         self, draft_tokens: torch.Tensor, input_batch: InputBatch
     ) -> None:
-        """Relay DSpark proposals from the last rank to target PP stages."""
+        """Relay speculative proposals from the last rank to target PP stages."""
         assert self.is_last_rank
         if not self.relay_draft_tokens:
             raise RuntimeError("Draft-token relay is not enabled for this PP handler.")
         if compute_need_sampled_mask(input_batch) is None:
             return
-        expected_width = self.max_sample_len - 1
-        if draft_tokens.ndim != 2 or draft_tokens.shape[1] != expected_width:
-            raise ValueError(
-                "DSpark draft-token shape must be "
-                f"[num_reqs, {expected_width}], got {tuple(draft_tokens.shape)}"
-            )
-        draft_tokens = _snapshot_draft_tokens_for_pp(draft_tokens)
+        pending = self._pending_speculative_relay
+        if pending is None:
+            raise RuntimeError("Speculative PP relay has no sampled outputs.")
+        self._pending_speculative_relay = None
+        sampled_token_ids, num_sampled, num_rejected = pending
+        relay = pack_speculative_pp_relay(
+            sampled_token_ids,
+            draft_tokens,
+            num_sampled,
+            num_rejected,
+            self.max_sample_len,
+        )
+        if current_platform.is_xpu():
+            self.main_stream.synchronize()
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
-                draft_tokens, src=self.last_rank, group=self.broadcast_group
+                relay, src=self.last_rank, group=self.broadcast_group
             )
-            draft_tokens.record_stream(self.broadcast_stream)
+            relay.record_stream(self.broadcast_stream)

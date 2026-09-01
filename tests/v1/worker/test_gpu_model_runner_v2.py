@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -17,6 +18,22 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def test_update_draft_tokens_relays_proposals_to_earlier_pp_stages():
+    """Every PP stage must verify the exact proposals generated on the last rank."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.zeros((2, 3), dtype=torch.int64)
+    )
+    runner.pp_handler = SimpleNamespace(broadcast_draft=Mock())
+    input_batch = SimpleNamespace(idx_mapping=torch.tensor([1]))
+    draft_tokens = torch.tensor([[11, 12, 13]], dtype=torch.int64)
+
+    runner._update_draft_tokens(input_batch, draft_tokens)
+
+    assert runner.req_states.draft_tokens.tolist() == [[0, 0, 0], [11, 12, 13]]
+    runner.pp_handler.broadcast_draft.assert_called_once_with(draft_tokens, input_batch)
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

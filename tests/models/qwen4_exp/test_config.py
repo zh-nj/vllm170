@@ -200,13 +200,16 @@ def test_qwen4_exp_allows_pipeline_parallel(ple_layer_ids) -> None:
 @pytest.mark.parametrize(
     ("configured_mode", "expected_mode"),
     [
-        (None, CUDAGraphMode.PIECEWISE),
-        (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.PIECEWISE),
+        (None, None),
+        (CUDAGraphMode.FULL, CUDAGraphMode.FULL),
+        (
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
         (CUDAGraphMode.NONE, CUDAGraphMode.NONE),
     ],
 )
-def test_qwen4_exp_cpu_ple_uses_piecewise_graphs(
+def test_qwen4_exp_cpu_ple_preserves_graph_mode(
     monkeypatch: pytest.MonkeyPatch,
     configured_mode: CUDAGraphMode | None,
     expected_mode: CUDAGraphMode,

@@ -19,12 +19,19 @@ from vllm.models.qwen4_exp.common.ple import (
     copy_ple_embedding_shard_,
 )
 from vllm.models.qwen4_exp.nvidia import ple_layer as ple_layer_module
+from vllm.models.qwen4_exp.nvidia.ops.ple import (
+    fused_ple_ngram_hash,
+    fused_ple_prefill_short_conv,
+    fused_ple_spec_short_conv,
+    gather_pinned_ple_embedding,
+)
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLELayer,
     _get_ple_embedding_quant_method,
 )
+from vllm.utils.platform_utils import is_pin_memory_available
 
 
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
@@ -325,6 +332,7 @@ def test_ple_cpu_offload_constructs_embedding_on_host(
     assert module.cpu_offload
     assert module.ngram_embedding.weight.device.type == "cpu"
     assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    assert module.ngram_embedding.weight.is_pinned() == is_pin_memory_available()
     assert module.ngram_embedding.weight_scale.device.type == "cpu"
     assert module.ngram_embedding.weight._vllm_skip_device_loading_context
     assert module.ngram_embedding.weight_scale._vllm_skip_device_loading_context
@@ -417,6 +425,284 @@ def test_cpu_ple_embedding_custom_op_copies_lookup_to_output(monkeypatch) -> Non
 
     expected = layer.ple_embedding.ngram_embedding(ngram_ids).to(torch.bfloat16) * 0.5
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_pinned_ple_embedding_gathers_directly_from_host(
+    weight_dtype: torch.dtype,
+) -> None:
+    values = torch.tensor(
+        [
+            [0.25, -0.5, 1.0],
+            [2.0, 4.0, -8.0],
+            [0.125, -0.25, 0.5],
+            [16.0, -32.0, 64.0],
+        ],
+        dtype=torch.bfloat16,
+    )
+    weight = torch.empty(
+        values.shape,
+        dtype=weight_dtype,
+        device="cpu",
+        pin_memory=True,
+    )
+    weight.copy_(values.to(weight_dtype))
+    input_ids = torch.tensor([[2, 3], [5, 6]], device="cuda", dtype=torch.long)
+    output = torch.empty((2, 2, 3), device="cuda", dtype=torch.bfloat16)
+
+    gather_pinned_ple_embedding(
+        weight,
+        input_ids,
+        output,
+        vocab_start=2,
+        vocab_end=6,
+        scale=0.5,
+    )
+
+    expected = torch.zeros_like(output, device="cpu")
+    expected[0, 0] = weight[0].to(torch.bfloat16) * 0.5
+    expected[0, 1] = weight[1].to(torch.bfloat16) * 0.5
+    expected[1, 0] = weight[3].to(torch.bfloat16) * 0.5
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pinned_ple_embedding_replays_in_cuda_graph() -> None:
+    weight = torch.arange(
+        32,
+        dtype=torch.bfloat16,
+    ).reshape(8, 4)
+    pinned_weight = torch.empty_like(weight, pin_memory=True)
+    pinned_weight.copy_(weight)
+    input_ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.long)
+    output = torch.empty((1, 2, 4), device="cuda", dtype=torch.bfloat16)
+
+    gather_pinned_ple_embedding(
+        pinned_weight,
+        input_ids,
+        output,
+        vocab_start=0,
+        vocab_end=8,
+        scale=1.0,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gather_pinned_ple_embedding(
+            pinned_weight,
+            input_ids,
+            output,
+            vocab_start=0,
+            vocab_end=8,
+            scale=1.0,
+        )
+
+    input_ids.copy_(torch.tensor([[6, 7]], device="cuda"))
+    graph.replay()
+
+    torch.testing.assert_close(output.cpu(), weight[6:8].unsqueeze(0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_ple_ngram_hash_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eos_token_id = 99
+    input_ids = torch.tensor(
+        [1, eos_token_id, 2, 3, 4, 5, 6, eos_token_id, 7],
+        device="cuda",
+        dtype=torch.long,
+    )
+    query_start_loc = torch.tensor([0, 5, 9], device="cuda", dtype=torch.long)
+    ngram_context = torch.tensor(
+        [[eos_token_id, 10], [11, 12]], device="cuda", dtype=torch.long
+    )
+    positions = torch.arange(input_ids.numel(), device="cuda")
+    request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+    token_offsets = positions - query_start_loc[request_indices]
+    multipliers = torch.tensor(
+        Qwen4ExpNGramEmbedding._make_layer_multipliers(
+            ngram_size=3,
+            unigram_vocab_size=248320,
+            seed=1234,
+            ple_dense_layer_id=1,
+        ),
+        device="cuda",
+    )
+    vocab_sizes = torch.tensor(
+        [10007 + 2 * index for index in range(16)],
+        device="cuda",
+        dtype=torch.long,
+    )
+    head_offsets = F.pad(vocab_sizes.cumsum(0)[:-1], (1, 0))
+
+    reference = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(reference)
+    reference.ngram_size = 3
+    reference.heads_per_ngram = 8
+    reference.ngram_heads = 16
+    reference.eos_token_id = eos_token_id
+    reference.positions_buffer = positions
+    reference.padded_buffer = torch.empty(
+        (2, input_ids.numel()), device="cuda", dtype=torch.long
+    )
+    reference.layer_multipliers = multipliers
+    reference.ngram_heads_vocab_sizes = vocab_sizes
+    reference.ngram_heads_offsets = head_offsets
+    monkeypatch.setattr(
+        ple_layer_module, "can_use_fused_ple_ngram_hash", lambda *a: False
+    )
+    expected = reference.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+
+    actual = fused_ple_ngram_hash(
+        input_ids,
+        ngram_context,
+        request_indices,
+        token_offsets,
+        multipliers,
+        vocab_sizes,
+        head_offsets,
+        eos_token_id,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("strided_state", [False, True])
+def test_fused_ple_prefill_short_conv_matches_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    strided_state: bool,
+) -> None:
+    lengths = torch.tensor([2, 11, 19], device="cuda", dtype=torch.long)
+    query_start_loc = F.pad(lengths.cumsum(0), (1, 0))
+    request_indices = torch.repeat_interleave(torch.arange(3, device="cuda"), lengths)
+    token_offsets = torch.arange(lengths.sum(), device="cuda")
+    token_offsets -= query_start_loc[request_indices]
+    x = torch.randn((int(lengths.sum()), 10240), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((10240, 4), device="cuda", dtype=torch.bfloat16)
+    if strided_state:
+        state = torch.randn(
+            (4, 12, 10240), device="cuda", dtype=torch.bfloat16
+        ).transpose(1, 2)
+    else:
+        state = torch.randn((4, 10240, 12), device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor([1, 0, 3], device="cuda", dtype=torch.long)
+    has_initial = torch.tensor([True, False, False], device="cuda")
+
+    reference_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(reference_layer)
+    reference_layer.conv_state_len = 9
+    reference_layer.short_conv_dilation = 3
+    reference_state = state.clone()
+    metadata = ple_layer_module.PleShortConvAttentionMetadata(
+        num_prefills=3,
+        num_prefill_tokens=x.shape[0],
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_reqs=3,
+        has_initial_states_p=has_initial,
+        query_start_loc_p=query_start_loc,
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=state_indices,
+        state_indices_tensor_d=None,
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=lengths,
+        num_actual_tokens=x.shape[0],
+        max_prefill_query_len=int(lengths.max()),
+        query_start_loc=query_start_loc,
+        state_indices_tensor=state_indices,
+        non_spec_query_start_loc=query_start_loc,
+    )
+    monkeypatch.setattr(
+        ple_layer_module, "can_use_fused_ple_prefill_short_conv", lambda *args: False
+    )
+    expected = reference_layer._short_conv_dilated_prefill_batched(
+        x,
+        metadata,
+        reference_state,
+        weight,
+        state_indices,
+        num_prefills=3,
+        num_decode_tokens=0,
+        num_prefill_tokens=x.shape[0],
+    )
+
+    actual_state = state.clone()
+    actual = fused_ple_prefill_short_conv(
+        x,
+        actual_state,
+        state_indices,
+        has_initial,
+        request_indices,
+        token_offsets,
+        query_start_loc,
+        lengths,
+        weight,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("accepted_tokens", [1, 2, 3, 4])
+@pytest.mark.parametrize("strided_state", [False, True])
+def test_fused_ple_spec_short_conv_matches_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    accepted_tokens: int,
+    strided_state: bool,
+) -> None:
+    x = torch.randn((4, 10240), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((10240, 4), device="cuda", dtype=torch.bfloat16)
+    if strided_state:
+        state = torch.randn(
+            (4, 12, 10240), device="cuda", dtype=torch.bfloat16
+        ).transpose(1, 2)
+    else:
+        state = torch.randn((4, 10240, 12), device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor([2], device="cuda", dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4], device="cuda", dtype=torch.int32)
+    accepted = torch.tensor([accepted_tokens], device="cuda", dtype=torch.int32)
+
+    reference_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(reference_layer)
+    reference_layer.conv_state_len = 9
+    reference_layer.short_conv_dilation = 3
+    reference_state = state.clone()
+    monkeypatch.setattr(
+        ple_layer_module, "can_use_fused_ple_spec_short_conv", lambda *args: False
+    )
+    expected = reference_layer._short_conv_dilated_spec_batched(
+        x,
+        reference_state,
+        weight,
+        state_indices,
+        query_start_loc,
+        accepted,
+        spec_query_len=4,
+    )
+
+    actual_state = state.clone()
+    actual = fused_ple_spec_short_conv(
+        x,
+        actual_state,
+        state_indices,
+        query_start_loc,
+        accepted,
+        weight,
+        spec_query_len=4,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=0, atol=0)
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:

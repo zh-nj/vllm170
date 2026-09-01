@@ -141,6 +141,23 @@ Signed-off-by: Your Name <your.email@example.com>
 
 ---
 
+## 3. Subagent Delegation
+
+The primary agent owns planning, judgment, and final integration. Delegate
+bounded, low-risk work when coordination overhead is justified.
+
+- Prefer subagents for code search, symbol and call-site inventories, focused
+  file summaries, straightforward test additions or runs, and fully specified
+  mechanical edits.
+- Keep architecture, root-cause analysis, ambiguous or security-sensitive work,
+  substantive code changes, conflict resolution, final review, and validation
+  with the primary agent.
+- Parallelize only independent tasks; do not let agents edit overlapping files.
+- Return delegated work to the primary agent if its scope becomes ambiguous or
+  broad. The primary agent must review every subagent result before using it.
+
+---
+
 ## Domain-Specific Guides
 
 Do not modify code in these areas without first reading and following the
