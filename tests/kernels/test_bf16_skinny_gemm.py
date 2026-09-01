@@ -209,7 +209,43 @@ def test_qwen4_mtp_installer_does_not_select_sm80_hc_down(
     assert type(root.hc_down.quant_method) is qwen4_gemm.UnquantizedLinearMethod
 
 
-def test_qwen4_sm80_batched_hc_down_does_not_use_blackwell_plan(
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_qwen4_sm80_supported_hc_down_uses_custom_op(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+) -> None:
+    calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []
+
+    def custom_op(
+        output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        calls.append((output.shape, x.shape, weight.shape))
+
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_runtime_ok", lambda *args: True)
+    monkeypatch.setattr(
+        qwen4_gemm,
+        "_sm80_hc_down_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen4_exp_hc_sm80_down",
+        custom_op,
+        raising=False,
+    )
+
+    x = torch.empty((num_tokens, 10240), device="meta", dtype=torch.bfloat16)
+    weight = torch.empty((336, 10240), device="meta", dtype=torch.bfloat16)
+    output = qwen4_gemm._qwen4_exp_low_latency_gemm(x, weight)
+
+    assert output.shape == (num_tokens, 336)
+    assert calls == [(output.shape, x.shape, weight.shape)]
+
+
+def test_qwen4_sm80_unsupported_batched_hc_down_uses_linear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class UnavailableOnSm80:

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp decode GEMM selection on NVIDIA GPUs.
 
-SM80 uses an exact-shape HC down-projection kernel. Blackwell dispatch follows
-Kimi-K3 and uses the local ``(N, K)`` shape and token count. Other shapes and
-token counts use the standard linear implementation.
+SM80 uses an exact-shape HC down-projection kernel for M=1 and M=4. Blackwell
+dispatch follows Kimi-K3 and uses the local ``(N, K)`` shape and token count.
+Other shapes and token counts use the standard linear implementation.
 """
 
 import torch
@@ -138,12 +138,12 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if (
         (weight.shape[0], weight.shape[1]) == _SM80_HC_DOWN_SHAPE
-        and x.shape[0] == 1
+        and x.shape[0] in (1, 4)
         and _is_sm80()
         and _runtime_ok(x, weight)
         and _sm80_hc_down_is_available()
     ):
-        output = x.new_empty((1, _SM80_HC_DOWN_SHAPE[0]))
+        output = x.new_empty((x.shape[0], _SM80_HC_DOWN_SHAPE[0]))
         torch.ops._C.qwen4_exp_hc_sm80_down(output, x, weight)
         return output
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import partial
 from typing import Any
 
 import torch
@@ -185,7 +186,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # Capture either the fused decode loop or one decode step per graph.
         assert self.decode_cudagraph_manager is not None
         decode_fn = (
-            self._generate_fused_drafts
+            partial(
+                self._generate_fused_drafts,
+                refresh_attn_metadata=True,
+            )
             if self.use_fused_multi_step_decode
             else self._generate_draft
         )
@@ -533,6 +537,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor,
     ) -> None:
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            assert self.decode_cudagraph_manager is not None
+            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+            return
+
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
@@ -546,10 +555,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 positions,
                 batch_desc.num_tokens,
             )
-            if batch_desc.cg_mode != CUDAGraphMode.FULL:
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
             attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
                 num_reqs_padded=batch_desc.num_reqs or num_reqs,
@@ -557,11 +565,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                 step=1,
             )
-
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.decode_cudagraph_manager is not None
-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
-            return
 
         self._generate_fused_drafts(
             num_reqs,
@@ -580,6 +583,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        refresh_attn_metadata: bool = False,
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
@@ -589,6 +593,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if attn_metadata is not None
             else []
         )
+
+        if refresh_attn_metadata and attn_metadata is not None:
+            self.block_tables.compute_slot_mappings(
+                idx_mapping,
+                query_start_loc,
+                positions,
+                num_tokens_padded,
+            )
+            for attn_group in attn_groups:
+                attn_group.update_draft_decode_metadata(attn_metadata)
 
         for step in range(1, self.num_speculative_steps):
             self.current_draft_step.fill_(step)

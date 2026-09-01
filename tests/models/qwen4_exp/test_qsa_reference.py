@@ -431,6 +431,82 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("is_circular", [False, True])
+def test_qsa_draft_metadata_update_is_graph_safe_and_padding_aware(
+    is_circular: bool,
+) -> None:
+    """Fused draft replay must refresh QSA metadata from live input buffers."""
+    device = torch.device("cuda")
+    num_tokens = 4
+    builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.compress_ratio = 4
+    builder.is_circular_buffer = is_circular
+    builder.storage_block_size = 8 if is_circular else 4
+    builder.kv_cache_spec = SimpleNamespace(block_size=8)
+    builder.request_capacity = 4
+    builder.token_to_req_buffer = torch.empty(
+        num_tokens, dtype=torch.int32, device=device
+    )
+    builder.slot_mapping_buffer = torch.empty(
+        num_tokens, dtype=torch.int64, device=device
+    )
+    builder.logical_positions_buffer = torch.empty(
+        num_tokens, dtype=torch.int64, device=device
+    )
+    max_num_work = 0 if is_circular else 4
+    builder.k_work_metadata_buffer = torch.empty(
+        max_num_work, 2, dtype=torch.int32, device=device
+    )
+
+    query_start_loc = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device=device)
+    common = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=torch.tensor([7, 10, 0, 0], dtype=torch.int32, device=device),
+        slot_mapping=torch.tensor([13, 21, -1, -1], device=device),
+        block_table_tensor=torch.tensor(
+            [[2, 3], [4, 5], [0, 0], [0, 0]],
+            dtype=torch.int32,
+            device=device,
+        ),
+        token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
+    )
+    metadata = builder.build(0, common)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        builder.update_draft_decode_metadata(metadata)
+
+    common.seq_lens.add_(torch.tensor([1, 1, 0, 0], device=device))
+    common.slot_mapping.copy_(torch.tensor([17, -1, -1, -1], device=device))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_k_work = (
+        torch.empty_like(metadata.k_work_metadata) if max_num_work else None
+    )
+    expected = qsa_cache._build_qsa_metadata_torch(
+        common,
+        torch.empty_like(metadata.token_to_req),
+        torch.empty_like(metadata.logical_positions),
+        torch.empty(num_tokens, dtype=torch.int64, device=device),
+        storage_block_size=builder.storage_block_size,
+        compress_ratio=builder.compress_ratio,
+        circular_buffer_size=builder.kv_cache_spec.block_size if is_circular else 0,
+        k_work_metadata_buffer=expected_k_work,
+        request_capacity=builder.request_capacity,
+    )
+
+    torch.testing.assert_close(metadata.token_to_req, expected[0])
+    torch.testing.assert_close(metadata.logical_positions, expected[1])
+    torch.testing.assert_close(metadata.slot_mapping, expected[2])
+    if expected_k_work is not None:
+        torch.testing.assert_close(metadata.k_work_metadata, expected_k_work)
+
+
+@requires_qsa_kernels
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("num_reqs", [2, 3, 4, 7, 8, 9])
 def test_qsa_triton_metadata_matches_pytorch(

@@ -197,7 +197,6 @@ def _metadata_launch_pdl() -> bool:
 @triton.jit(
     do_not_specialize=[
         "num_reqs",
-        "num_mapped_tokens",
         "num_tokens",
         "max_num_work",
         "num_search_steps",
@@ -216,7 +215,6 @@ def _build_qsa_metadata_kernel(
     block_table_stride_0: tl.constexpr,
     block_table_stride_1: tl.constexpr,
     num_reqs,
-    num_mapped_tokens,
     num_tokens,
     max_num_work,
     num_search_steps,
@@ -236,6 +234,7 @@ def _build_qsa_metadata_kernel(
     pid = tl.program_id(0)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
     store_mask = token_idx < num_tokens
+    num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
     mapped = token_idx < num_mapped_tokens
     search_token_idx = tl.minimum(token_idx, num_mapped_tokens - 1)
     request_idx = tl.zeros((TOKEN_BLOCK_SIZE,), tl.int32)
@@ -376,11 +375,14 @@ def _build_qsa_metadata_kernel(
             tl.extra.cuda.gdc_launch_dependents()
 
 
-def build_qsa_metadata_triton(
-    common_attn_metadata: CommonAttentionMetadata,
-    token_to_req_buffer: torch.Tensor,
-    logical_positions_buffer: torch.Tensor,
-    slot_mapping_buffer: torch.Tensor,
+def _launch_qsa_metadata_triton(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    common_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
     *,
     storage_block_size: int,
     compress_ratio: int,
@@ -388,13 +390,8 @@ def build_qsa_metadata_triton(
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build QSA side-cache and optional pre-indexer work metadata."""
-    num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-    token_to_req = token_to_req_buffer[:num_tokens]
-    logical_positions = logical_positions_buffer[:num_tokens]
-    slot_mapping = slot_mapping_buffer[:num_tokens]
-    num_reqs = common_attn_metadata.query_start_loc.shape[0] - 1
+    num_tokens = logical_positions.shape[0]
+    num_reqs = query_start_loc.shape[0] - 1
     assert num_reqs > 0
 
     if k_work_metadata_buffer is not None:
@@ -411,7 +408,6 @@ def build_qsa_metadata_triton(
     if num_tokens == 0 and k_work_metadata_buffer is None:
         return token_to_req, logical_positions, slot_mapping
 
-    block_table = common_attn_metadata.block_table_tensor
     num_search_steps = int(math.ceil(math.log2(num_reqs)))
     work_search_steps = int(math.ceil(math.log2(num_reqs)))
     # The same grid covers token tiles and, for the compressed cache, work tiles.
@@ -420,9 +416,9 @@ def build_qsa_metadata_triton(
         cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
     )
     _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
-        common_attn_metadata.query_start_loc,
-        common_attn_metadata.seq_lens,
-        common_attn_metadata.slot_mapping,
+        query_start_loc,
+        seq_lens,
+        common_slot_mapping,
         block_table,
         token_to_req,
         logical_positions,
@@ -431,7 +427,6 @@ def build_qsa_metadata_triton(
         block_table.stride(0),
         block_table.stride(1),
         num_reqs,
-        num_mapped_tokens,
         num_tokens,
         max_num_work,
         num_search_steps,
@@ -447,8 +442,38 @@ def build_qsa_metadata_triton(
         num_warps=4,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
-        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        slot_mapping = common_slot_mapping
     return token_to_req, logical_positions, slot_mapping
+
+
+def build_qsa_metadata_triton(
+    common_attn_metadata: CommonAttentionMetadata,
+    token_to_req_buffer: torch.Tensor,
+    logical_positions_buffer: torch.Tensor,
+    slot_mapping_buffer: torch.Tensor,
+    *,
+    storage_block_size: int,
+    compress_ratio: int,
+    circular_buffer_size: int = 0,
+    k_work_metadata_buffer: torch.Tensor | None = None,
+    request_capacity: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build QSA side-cache and optional pre-indexer work metadata."""
+    num_tokens = common_attn_metadata.num_actual_tokens
+    return _launch_qsa_metadata_triton(
+        common_attn_metadata.query_start_loc,
+        common_attn_metadata.seq_lens,
+        common_attn_metadata.slot_mapping[:num_tokens],
+        common_attn_metadata.block_table_tensor,
+        token_to_req_buffer[:num_tokens],
+        logical_positions_buffer[:num_tokens],
+        slot_mapping_buffer[:num_tokens],
+        storage_block_size=storage_block_size,
+        compress_ratio=compress_ratio,
+        circular_buffer_size=circular_buffer_size,
+        k_work_metadata_buffer=k_work_metadata_buffer,
+        request_capacity=request_capacity,
+    )
 
 
 def _build_qsa_metadata_torch(
@@ -553,6 +578,7 @@ class QSAForwardMetadata(AttentionMetadata):
     """Common per-forward metadata for one QSA side cache."""
 
     block_table: torch.Tensor
+    common_slot_mapping: torch.Tensor
     slot_mapping: torch.Tensor
     seq_lens: torch.Tensor
     query_start_loc: torch.Tensor
@@ -568,6 +594,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = HAS_TRITON
 
     def __init__(
         self,
@@ -644,6 +671,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
+            common_slot_mapping=common_attn_metadata.slot_mapping[:num_tokens],
             slot_mapping=slot_mapping,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -653,6 +681,27 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        if not HAS_TRITON:
+            raise NotImplementedError("QSA draft metadata updates require Triton")
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
+        _launch_qsa_metadata_triton(
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            metadata.common_slot_mapping,
+            metadata.block_table,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.slot_mapping,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=(metadata.k_work_metadata if build_k_work else None),
+            request_capacity=self.request_capacity if build_k_work else None,
         )
 
 

@@ -99,15 +99,16 @@ def test_hc_combine_norm() -> None:
     or not hasattr(torch.ops._C, "qwen4_exp_hc_sm80_down"),
     reason="Qwen4Exp HC down kernel requires an SM80 build",
 )
-def test_hc_sm80_down_cuda_graph() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_hc_sm80_down_cuda_graph(num_tokens: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260901)
-    x = torch.empty((1, 10240), dtype=torch.bfloat16, device="cuda").uniform_(
+    x = torch.empty((num_tokens, 10240), dtype=torch.bfloat16, device="cuda").uniform_(
         -0.1, 0.1, generator=generator
     )
     weight = torch.empty((336, 10240), dtype=torch.bfloat16, device="cuda").uniform_(
         -0.02, 0.02, generator=generator
     )
-    output = torch.empty((1, 336), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((num_tokens, 336), dtype=torch.bfloat16, device="cuda")
     expected = torch.nn.functional.linear(x, weight)
 
     for _ in range(3):

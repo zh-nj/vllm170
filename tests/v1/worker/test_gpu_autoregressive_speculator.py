@@ -377,6 +377,77 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
     assert run_fullgraph.call_count == expected_graph_replays
 
 
+def test_fused_fullgraph_replay_skips_host_metadata_build() -> None:
+    speculator = object.__new__(_TestSpeculator)
+    speculator.decode_cudagraph_manager = SimpleNamespace(run_fullgraph=Mock())
+    speculator.block_tables = SimpleNamespace(compute_slot_mappings=Mock())
+    speculator._build_draft_attn_metadata = Mock()
+    batch_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=2,
+        num_reqs=2,
+    )
+
+    speculator._fused_multi_step_decode(
+        num_reqs=2,
+        skip_attn=False,
+        batch_desc=batch_desc,
+        seq_lens_cpu_upper_bound=torch.arange(2),
+        num_tokens_across_dp=None,
+    )
+
+    speculator.decode_cudagraph_manager.run_fullgraph.assert_called_once_with(
+        batch_desc
+    )
+    speculator.block_tables.compute_slot_mappings.assert_not_called()
+    speculator._build_draft_attn_metadata.assert_not_called()
+
+
+def test_captured_fused_drafts_refresh_metadata_before_each_step() -> None:
+    events = []
+    speculator = object.__new__(_TestSpeculator)
+    speculator.num_speculative_steps = 3
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.idx_mapping = torch.arange(2)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2),
+        query_start_loc=torch.arange(3),
+    )
+    speculator.block_tables = SimpleNamespace(
+        compute_slot_mappings=Mock(
+            side_effect=lambda *args: events.append("slot_mapping")
+        )
+    )
+    attn_group = SimpleNamespace(
+        update_draft_decode_metadata=Mock(
+            side_effect=lambda *args: events.append("metadata")
+        )
+    )
+    speculator.attn_groups = [[attn_group]]
+    speculator._generate_draft = Mock(
+        side_effect=lambda *args: events.append("generate")
+    )
+    attn_metadata = {"layer": object()}
+
+    speculator._generate_fused_drafts(
+        num_reqs=2,
+        num_tokens_padded=2,
+        attn_metadata=attn_metadata,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        refresh_attn_metadata=True,
+    )
+
+    assert events == [
+        "slot_mapping",
+        "metadata",
+        "generate",
+        "slot_mapping",
+        "metadata",
+        "generate",
+    ]
+
+
 def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
     monkeypatch,
 ):
