@@ -47,6 +47,44 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+@pytest.mark.parametrize(
+    ("capability", "quantization", "hidden_size", "expected"),
+    [
+        (True, "modelopt_fp4", 2560, 16),
+        (False, "modelopt_fp4", 2560, None),
+        (True, "fp8", 2560, None),
+        (True, "modelopt_fp4", 4096, None),
+    ],
+)
+def test_qwen4_exp_marlin_decode_block_size_is_exact_sm80_tuning(
+    capability: bool,
+    quantization: str,
+    hidden_size: int,
+    expected: int | None,
+) -> None:
+    from vllm.models.qwen4_exp.nvidia import model as model_module
+
+    config = SimpleNamespace(
+        hidden_size=hidden_size,
+        moe_intermediate_size=640,
+        num_experts=512,
+        num_experts_per_tok=10,
+    )
+    quant_config = SimpleNamespace(get_name=lambda: quantization)
+
+    with patch.object(
+        model_module.current_platform,
+        "is_device_capability",
+        return_value=capability,
+    ):
+        actual = model_module._qwen4_exp_marlin_moe_decode_block_size(
+            config,
+            quant_config,
+        )
+
+    assert actual == expected
+
+
 def test_qwen4_exp_loads_vision_tower_only_on_first_pp_rank() -> None:
     from vllm.model_executor.models.utils import StageMissingLayer
     from vllm.models.qwen4_exp.nvidia.model import (

@@ -1303,6 +1303,7 @@ class FusedMoEConfig:
     intermediate_size_per_partition_unpadded: int | None = None
     # Model specific override
     intermediate_pad: int | None = None
+    marlin_moe_decode_block_size: int | None = None
 
     moe_backend: MoEBackend = "auto"
     max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP

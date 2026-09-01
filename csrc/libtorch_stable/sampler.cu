@@ -934,3 +934,41 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
             static_cast<int>(topK), kSortingAlgorithmThreshold);
   }
 }
+
+void top_k_per_row_prefill_update_candidates(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& tileStarts,
+    const torch::stable::Tensor& tileEnds,
+    const torch::stable::Tensor& rowStarts,
+    const torch::stable::Tensor& bestScores,
+    const torch::stable::Tensor& bestIndices, torch::stable::Tensor& nextScores,
+    torch::stable::Tensor& nextIndices, int64_t tileOffset, int64_t numRows,
+    int64_t stride0, int64_t stride1, int64_t topK, bool hasBest) {
+  constexpr int kTopK = 512;
+  constexpr int kNumThreadsPerBlock = 512;
+  STD_TORCH_CHECK(topK == kTopK,
+                  "top_k_per_row_prefill_update_candidates supports only "
+                  "topK=512");
+  STD_TORCH_CHECK(bestScores.dim() == 2 && bestScores.size(0) == numRows &&
+                      bestScores.size(1) == kTopK,
+                  "bestScores must have shape [numRows, 512]");
+  STD_TORCH_CHECK(bestIndices.sizes().equals(bestScores.sizes()) &&
+                      nextScores.sizes().equals(bestScores.sizes()) &&
+                      nextIndices.sizes().equals(bestScores.sizes()),
+                  "candidate tensors must have matching shapes");
+  STD_TORCH_CHECK(tileStarts.size(0) == numRows &&
+                      tileEnds.size(0) == numRows &&
+                      rowStarts.size(0) == numRows,
+                  "row bound tensors must contain numRows elements");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      logits.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  vllm::topKPerRowPrefillUpdateCandidates<kNumThreadsPerBlock, kTopK>
+      <<<numRows, kNumThreadsPerBlock, 2 * kTopK * sizeof(int32_t), stream>>>(
+          logits.const_data_ptr<float>(), tileStarts.const_data_ptr<int>(),
+          tileEnds.const_data_ptr<int>(), rowStarts.const_data_ptr<int>(),
+          bestScores.const_data_ptr<float>(), bestIndices.const_data_ptr<int>(),
+          nextScores.mutable_data_ptr<float>(),
+          nextIndices.mutable_data_ptr<int>(), static_cast<int>(tileOffset),
+          logits.stride(0), logits.stride(1), hasBest);
+}

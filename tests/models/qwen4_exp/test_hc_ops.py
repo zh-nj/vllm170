@@ -92,3 +92,31 @@ def test_hc_combine_norm() -> None:
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_norm, expected_norm.to(torch.bfloat16))
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((8, 0))
+    or not hasattr(torch.ops._C, "qwen4_exp_hc_sm80_down"),
+    reason="Qwen4Exp HC down kernel requires an SM80 build",
+)
+def test_hc_sm80_down_cuda_graph() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260901)
+    x = torch.empty((1, 10240), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.1, 0.1, generator=generator
+    )
+    weight = torch.empty((336, 10240), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.02, 0.02, generator=generator
+    )
+    output = torch.empty((1, 336), dtype=torch.bfloat16, device="cuda")
+    expected = torch.nn.functional.linear(x, weight)
+
+    for _ in range(3):
+        torch.ops._C.qwen4_exp_hc_sm80_down(output, x, weight)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops._C.qwen4_exp_hc_sm80_down(output, x, weight)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=0.016, atol=0.01)

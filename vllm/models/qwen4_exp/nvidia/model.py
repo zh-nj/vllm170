@@ -68,6 +68,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -157,6 +158,23 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+def _qwen4_exp_marlin_moe_decode_block_size(
+    config: Qwen4ExpTextConfig,
+    quant_config: QuantizationConfig | None,
+) -> int | None:
+    if not current_platform.is_device_capability(80):
+        return None
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return None
+    shape = (
+        config.hidden_size,
+        config.moe_intermediate_size,
+        config.num_experts,
+        config.num_experts_per_tok,
+    )
+    return 16 if shape == (2560, 640, 512, 10) else None
+
+
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
@@ -168,6 +186,12 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
+        self.experts.moe_config.marlin_moe_decode_block_size = (
+            _qwen4_exp_marlin_moe_decode_block_size(
+                config,
+                vllm_config.quant_config,
+            )
+        )
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
 
 

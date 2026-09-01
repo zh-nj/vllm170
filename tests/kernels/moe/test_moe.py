@@ -1023,6 +1023,20 @@ def test_marlin_moe_block_size_override(monkeypatch: pytest.MonkeyPatch) -> None
     assert _select_marlin_moe_block_size(1, 6, 256, None) == 8
 
 
+def test_marlin_moe_decode_block_size_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "48")
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "1000")
+
+    assert _select_marlin_moe_block_size(1, 10, 512, None, 16) == 16
+    assert _select_marlin_moe_block_size(2, 10, 512, None, 16) == 8
+
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE", "8")
+    monkeypatch.setenv("VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M", "1")
+    assert _select_marlin_moe_block_size(1, 10, 512, None, 16) == 8
+
+
 def test_marlin_moe_block_size_override_rejects_invalid_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

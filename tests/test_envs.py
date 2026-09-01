@@ -85,6 +85,16 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_qwen4_exp_hc_sm80_gemv_is_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_QWEN4_EXP_HC_SM80_GEMV", "0")
+    assert envs.compile_factors()["VLLM_QWEN4_EXP_HC_SM80_GEMV"] is False
+
+    monkeypatch.setenv("VLLM_QWEN4_EXP_HC_SM80_GEMV", "1")
+    assert envs.compile_factors()["VLLM_QWEN4_EXP_HC_SM80_GEMV"] is True
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

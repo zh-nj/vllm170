@@ -99,11 +99,16 @@ def _marlin_moe_workspace_sizes(
     local_num_experts: int,
     activation: MoEActivation,
     input_dtype: torch.dtype | None,
+    decode_block_size: int | None = None,
     num_sms: int | None = None,
 ) -> tuple[int, int]:
     valid_M = math.ceil(M * local_num_experts / global_num_experts)
     block_size_m = _select_marlin_moe_block_size(
-        valid_M, topk, local_num_experts, input_dtype
+        valid_M,
+        topk,
+        local_num_experts,
+        input_dtype,
+        decode_block_size=decode_block_size,
     )
     max_sorted_tokens = _marlin_moe_max_sorted_tokens(
         M, topk, global_num_experts, block_size_m
@@ -137,6 +142,7 @@ def _select_marlin_moe_block_size(
     topk: int,
     num_experts: int,
     input_dtype: torch.dtype | None,
+    decode_block_size: int | None = None,
 ) -> int:
     forced = envs.VLLM_MARLIN_MOE_BLOCK_SIZE
     if forced and M >= envs.VLLM_MARLIN_MOE_BLOCK_SIZE_MIN_M:
@@ -146,6 +152,13 @@ def _select_marlin_moe_block_size(
                 f"{_MARLIN_MOE_BLOCK_SIZES}, got {forced}"
             )
         block_size_m = forced
+    elif M == 1 and decode_block_size is not None:
+        if decode_block_size not in _MARLIN_MOE_BLOCK_SIZES:
+            raise ValueError(
+                "Marlin MoE decode block size must be one of "
+                f"{_MARLIN_MOE_BLOCK_SIZES}, got {decode_block_size}"
+            )
+        block_size_m = decode_block_size
     else:
         block_size_m = _MARLIN_MOE_BLOCK_SIZES[-1]
         for candidate in _MARLIN_MOE_BLOCK_SIZES:
@@ -399,6 +412,7 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    decode_block_size: int | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -462,7 +476,13 @@ def fused_marlin_moe(
         # Set M to estimated valid tokens per rank
         M = math.ceil(M * E / global_num_experts)
 
-    block_size_m = _select_marlin_moe_block_size(M, topk, E, input_dtype)
+    block_size_m = _select_marlin_moe_block_size(
+        M,
+        topk,
+        E,
+        input_dtype,
+        decode_block_size=decode_block_size,
+    )
 
     profile_extra = {
         "M": M,
@@ -884,6 +904,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     local_num_experts,
                     activation,
                     self.input_dtype,
+                    decode_block_size=(self.moe_config.marlin_moe_decode_block_size),
                 )
             )
             workspace2 = (intermediate_cache13_size + fp32_reduce_workspace_size * 2,)
@@ -969,6 +990,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
+                decode_block_size=self.moe_config.marlin_moe_decode_block_size,
             )
             return
 
@@ -1085,6 +1107,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
+            decode_block_size=self.moe_config.marlin_moe_decode_block_size,
         )
 
     def moe_sum(

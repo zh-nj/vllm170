@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for BF16 skinny GEMMs and the Kimi-K3 SM90/SM100/SM103 selectors."""
+"""Tests for BF16 skinny GEMMs and model-specific NVIDIA selectors."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 from vllm.models.deepseek_v32.nvidia import glm52_low_latency_gemm as glm52_gemm
 from vllm.models.kimi_k3.nvidia import low_latency_gemm as k3_gemm
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import KIMI_K3_PROJECTIONS
+from vllm.models.qwen4_exp.nvidia import low_latency_gemm as qwen4_gemm
 
 # Keyed by local (N, K): (cute token counts, dsv3 token counts). 1536x7168 is
 # the unified shared_gate_up_proj/mla_g_proj entry (dsv3 M1..16).
@@ -149,6 +150,96 @@ def _config_tuple(config) -> tuple[int, int, int, int]:
         config.k_unroll,
         config.vector_width,
     )
+
+
+def test_qwen4_sm80_installer_selects_only_hc_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLinearBase(nn.Module):
+        def __init__(self, n: int, k: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(n, k, dtype=torch.bfloat16, device="meta")
+            )
+            self.quant_method = qwen4_gemm.UnquantizedLinearMethod()
+
+    root = nn.Module()
+    root.hc_down = FakeLinearBase(336, 10240)
+    root.hc_up = FakeLinearBase(10240, 320)
+    root.other = FakeLinearBase(320, 2560)
+    monkeypatch.setattr(qwen4_gemm, "LinearBase", FakeLinearBase)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm103", lambda: False)
+    monkeypatch.setattr(qwen4_gemm, "_sm80_hc_down_is_available", lambda: True)
+
+    qwen4_gemm.enable_qwen4_exp_low_latency_gemm(root, torch.bfloat16)
+
+    assert isinstance(
+        root.hc_down.quant_method,
+        qwen4_gemm.Qwen4ExpLowLatencyLinearMethod,
+    )
+    assert type(root.hc_up.quant_method) is qwen4_gemm.UnquantizedLinearMethod
+    assert type(root.other.quant_method) is qwen4_gemm.UnquantizedLinearMethod
+
+
+def test_qwen4_mtp_installer_does_not_select_sm80_hc_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLinearBase(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(336, 10240, dtype=torch.bfloat16, device="meta")
+            )
+            self.quant_method = qwen4_gemm.UnquantizedLinearMethod()
+
+    root = nn.Module()
+    root.hc_down = FakeLinearBase()
+    monkeypatch.setattr(qwen4_gemm, "LinearBase", FakeLinearBase)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm103", lambda: False)
+    monkeypatch.setattr(qwen4_gemm, "_sm80_hc_down_is_available", lambda: True)
+
+    qwen4_gemm.enable_qwen4_exp_low_latency_gemm(
+        root,
+        torch.bfloat16,
+        enable_sm80_hc_down=False,
+    )
+
+    assert type(root.hc_down.quant_method) is qwen4_gemm.UnquantizedLinearMethod
+
+
+def test_qwen4_sm80_batched_hc_down_does_not_use_blackwell_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableOnSm80:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        def __call__(self, *args: object, **kwargs: object) -> torch.Tensor:
+            raise AssertionError("Blackwell CuTe plan must not run on SM80")
+
+    expected = object()
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm103", lambda: False)
+    monkeypatch.setattr(qwen4_gemm, "_runtime_ok", lambda *args: True)
+    monkeypatch.setattr(
+        qwen4_gemm,
+        "_sm80_hc_down_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        qwen4_gemm,
+        "shape_dynamic_skinny_gemm",
+        UnavailableOnSm80(),
+    )
+    monkeypatch.setattr(torch.nn.functional, "linear", lambda *args: expected)
+
+    x = torch.empty((2, 10240), device="meta", dtype=torch.bfloat16)
+    weight = torch.empty((336, 10240), device="meta", dtype=torch.bfloat16)
+
+    assert qwen4_gemm._qwen4_exp_low_latency_gemm(x, weight) is expected
 
 
 def test_table_is_keyed_by_shape() -> None:

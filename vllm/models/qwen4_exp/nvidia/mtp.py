@@ -392,7 +392,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
-        enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        enable_qwen4_exp_low_latency_gemm(
+            self,
+            vllm_config.model_config.dtype,
+            enable_sm80_hc_down=False,
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

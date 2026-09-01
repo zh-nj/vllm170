@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp decode GEMM selection on Blackwell.
+"""Qwen4Exp decode GEMM selection on NVIDIA GPUs.
 
-Dispatch follows Kimi-K3 and uses the local ``(N, K)`` shape and token count.
-Plans contain measured CUDA graph capture sizes; other token counts use the
-standard linear implementation.
+SM80 uses an exact-shape HC down-projection kernel. Blackwell dispatch follows
+Kimi-K3 and uses the local ``(N, K)`` shape and token count. Other shapes and
+token counts use the standard linear implementation.
 """
 
 import torch
@@ -78,9 +78,21 @@ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
     },
 }
 
+_SM80_HC_DOWN_SHAPE = (336, 10240)
+
 
 def _is_sm103() -> bool:
     return current_platform.is_device_capability((10, 3))
+
+
+def _is_sm80() -> bool:
+    return current_platform.is_device_capability((8, 0))
+
+
+def _sm80_hc_down_is_available() -> bool:
+    return envs.VLLM_QWEN4_EXP_HC_SM80_GEMV and hasattr(
+        torch.ops._C, "qwen4_exp_hc_sm80_down"
+    )
 
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
@@ -124,10 +136,22 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if (
+        (weight.shape[0], weight.shape[1]) == _SM80_HC_DOWN_SHAPE
+        and x.shape[0] == 1
+        and _is_sm80()
+        and _runtime_ok(x, weight)
+        and _sm80_hc_down_is_available()
+    ):
+        output = x.new_empty((1, _SM80_HC_DOWN_SHAPE[0]))
+        torch.ops._C.qwen4_exp_hc_sm80_down(output, x, weight)
+        return output
+
     plan = QWEN4_EXP_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
     config = None if plan is None else plan.get(x.shape[0])
     if (
         config is not None
+        and _is_sm103()
         and _runtime_ok(x, weight)
         and shape_dynamic_skinny_gemm.is_available()
     ):
@@ -151,10 +175,17 @@ direct_register_custom_op(
 def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
+    *,
+    enable_sm80_hc_down: bool = True,
 ) -> None:
-    if dtype != torch.bfloat16 or not _is_sm103():
+    if dtype != torch.bfloat16:
         return
-    if not shape_dynamic_skinny_gemm.is_available():
+
+    use_sm80_hc_down = (
+        enable_sm80_hc_down and _is_sm80() and _sm80_hc_down_is_available()
+    )
+    use_blackwell_plans = _is_sm103() and shape_dynamic_skinny_gemm.is_available()
+    if not (use_sm80_hc_down or use_blackwell_plans):
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
@@ -172,14 +203,18 @@ def enable_qwen4_exp_low_latency_gemm(
         weight = getattr(child, "weight", None)
         if weight is None or weight.dim() != 2:
             continue
-        plan = QWEN4_EXP_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
-        if plan is None:
+        shape = (weight.shape[0], weight.shape[1])
+        plan = QWEN4_EXP_GEMM_PLANS.get(shape)
+        selected = use_sm80_hc_down and shape == _SM80_HC_DOWN_SHAPE
+        selected = selected or (use_blackwell_plans and plan is not None)
+        if not selected:
             continue
         if is_linear:
             child.quant_method = Qwen4ExpLowLatencyLinearMethod()
         else:
             child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
-        warmup_configs.update(plan.values())
+        if use_blackwell_plans and plan is not None:
+            warmup_configs.update(plan.values())
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
