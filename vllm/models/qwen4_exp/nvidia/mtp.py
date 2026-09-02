@@ -56,6 +56,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .mtp_fp8_lm_head import enable_qwen4_exp_mtp_fp8_lm_head
 
 
 def _remap_ignored_layers(
@@ -396,6 +397,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             vllm_config.model_config.dtype,
             enable_sm80_hc_down=False,
+        )
+        self.has_own_lm_head = enable_qwen4_exp_mtp_fp8_lm_head(
+            self.lm_head,
+            tied=config.tie_word_embeddings,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

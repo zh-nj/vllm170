@@ -482,7 +482,7 @@ def test_qsa_draft_metadata_update_is_graph_safe_and_padding_aware(
     common.seq_lens.add_(torch.tensor([1, 1, 0, 0], device=device))
     common.slot_mapping.copy_(torch.tensor([17, -1, -1, -1], device=device))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     expected_k_work = (
         torch.empty_like(metadata.k_work_metadata) if max_num_work else None
@@ -733,6 +733,7 @@ def test_qsa_block_expansion_matches_test_reference() -> None:
     [
         # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
         pytest.param(1, 24, 2, 1792, id="tp1_split64"),
+        pytest.param(4, 24, 2, 1792, id="tp1_mtp_verify"),
         pytest.param(16, 12, 1, 1792, id="tp2_split32"),
         pytest.param(32, 6, 1, 1024, id="tp4_split8"),
         pytest.param(257, 6, 1, 1024, id="tp4_split4"),

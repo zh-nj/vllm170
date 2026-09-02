@@ -79,7 +79,10 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
-from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .low_latency_gemm import (
+    can_use_qwen4_exp_sm80_gdn_input_projection,
+    enable_qwen4_exp_low_latency_gemm,
+)
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
@@ -195,6 +198,45 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
 
 
+class Qwen4ExpGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    def __init__(
+        self,
+        config: Qwen4ExpTextConfig,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        gqa_interleaved_layout: bool = False,
+        reduce_results: bool = True,
+    ) -> None:
+        super().__init__(
+            config,
+            vllm_config,
+            prefix,
+            gqa_interleaved_layout,
+            reduce_results,
+        )
+        self.use_sm80_fused_input_projection = (
+            can_use_qwen4_exp_sm80_gdn_input_projection(
+                self.in_proj_qkvz,
+                self.in_proj_ba,
+                tp_size=self.tp_size,
+                gqa_interleaved_layout=self.gqa_interleaved_layout,
+                lora_enabled=getattr(vllm_config, "lora_config", None) is not None,
+            )
+        )
+
+    def _forward_input_projection(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_sm80_fused_input_projection:
+            return torch.ops.vllm.qwen4_exp_gdn_input_projection(
+                hidden_states,
+                self.in_proj_qkvz.weight,
+                self.in_proj_ba.weight,
+            )
+        return super()._forward_input_projection(hidden_states)
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -232,7 +274,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",

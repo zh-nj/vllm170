@@ -845,6 +845,9 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
                     case 9:
                       LAUNCH_MOE_SUM_PAD_AWARE_VEC(9);
                       break;
+                    case 10:
+                      LAUNCH_MOE_SUM_PAD_AWARE_VEC(10);
+                      break;
                     default:
                       vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t, idx_t,
                                                             true>
@@ -911,6 +914,9 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
           break;
         case 9:
           LAUNCH_MOE_SUM_VEC(9);
+          break;
+        case 10:
+          LAUNCH_MOE_SUM_VEC(10);
           break;
         default:
           vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t, int32_t, false>

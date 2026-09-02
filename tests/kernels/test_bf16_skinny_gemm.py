@@ -152,7 +152,7 @@ def _config_tuple(config) -> tuple[int, int, int, int]:
     )
 
 
-def test_qwen4_sm80_installer_selects_only_hc_down(
+def test_qwen4_sm80_installer_selects_exact_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLinearBase(nn.Module):
@@ -165,17 +165,23 @@ def test_qwen4_sm80_installer_selects_only_hc_down(
 
     root = nn.Module()
     root.hc_down = FakeLinearBase(336, 10240)
+    root.out_projection = FakeLinearBase(2560, 6144)
     root.hc_up = FakeLinearBase(10240, 320)
     root.other = FakeLinearBase(320, 2560)
     monkeypatch.setattr(qwen4_gemm, "LinearBase", FakeLinearBase)
     monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
     monkeypatch.setattr(qwen4_gemm, "_is_sm103", lambda: False)
     monkeypatch.setattr(qwen4_gemm, "_sm80_hc_down_is_available", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_sm80_out_projection_is_available", lambda: True)
 
     qwen4_gemm.enable_qwen4_exp_low_latency_gemm(root, torch.bfloat16)
 
     assert isinstance(
         root.hc_down.quant_method,
+        qwen4_gemm.Qwen4ExpLowLatencyLinearMethod,
+    )
+    assert isinstance(
+        root.out_projection.quant_method,
         qwen4_gemm.Qwen4ExpLowLatencyLinearMethod,
     )
     assert type(root.hc_up.quant_method) is qwen4_gemm.UnquantizedLinearMethod
@@ -207,6 +213,120 @@ def test_qwen4_mtp_installer_does_not_select_sm80_hc_down(
     )
 
     assert type(root.hc_down.quant_method) is qwen4_gemm.UnquantizedLinearMethod
+
+
+def test_qwen4_sm80_gdn_input_projection_requires_exact_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLinearBase(nn.Module):
+        def __init__(self, n: int, k: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(n, k, dtype=torch.bfloat16, device="meta")
+            )
+            self.bias = None
+            self.quant_method = qwen4_gemm.UnquantizedLinearMethod()
+
+    qkvz = FakeLinearBase(16384, 2560)
+    ba = FakeLinearBase(96, 2560)
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen4_exp_gdn_sm80_input_projection",
+        lambda *args: None,
+        raising=False,
+    )
+
+    assert qwen4_gemm.can_use_qwen4_exp_sm80_gdn_input_projection(
+        qkvz,
+        ba,
+        tp_size=1,
+        gqa_interleaved_layout=False,
+        lora_enabled=False,
+    )
+    assert not qwen4_gemm.can_use_qwen4_exp_sm80_gdn_input_projection(
+        qkvz,
+        ba,
+        tp_size=2,
+        gqa_interleaved_layout=False,
+        lora_enabled=False,
+    )
+    assert not qwen4_gemm.can_use_qwen4_exp_sm80_gdn_input_projection(
+        qkvz,
+        ba,
+        tp_size=1,
+        gqa_interleaved_layout=False,
+        lora_enabled=True,
+    )
+
+
+def test_qwen4_sm80_gdn_input_projection_allocates_contiguous_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Size, ...]] = []
+
+    def custom_op(*args: torch.Tensor) -> None:
+        calls.append(tuple(tensor.shape for tensor in args))
+
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen4_exp_gdn_sm80_input_projection",
+        custom_op,
+        raising=False,
+    )
+    x = torch.empty((4, 2560), dtype=torch.bfloat16, device="meta")
+    qkvz_weight = torch.empty((16384, 2560), dtype=torch.bfloat16, device="meta")
+    ba_weight = torch.empty((96, 2560), dtype=torch.bfloat16, device="meta")
+
+    qkvz, ba = qwen4_gemm._qwen4_exp_gdn_input_projection(
+        x,
+        qkvz_weight,
+        ba_weight,
+    )
+
+    assert qkvz.shape == (4, 16384)
+    assert ba.shape == (4, 96)
+    assert qkvz.is_contiguous()
+    assert ba.is_contiguous()
+    assert calls == [
+        (
+            qkvz.shape,
+            ba.shape,
+            x.shape,
+            qkvz_weight.shape,
+            ba_weight.shape,
+        )
+    ]
+
+
+def test_qwen4_sm80_gdn_input_projection_falls_back_outside_m4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def custom_op(*args: torch.Tensor) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen4_exp_gdn_sm80_input_projection",
+        custom_op,
+        raising=False,
+    )
+    x = torch.empty((1, 2560), dtype=torch.bfloat16, device="meta")
+    qkvz_weight = torch.empty((16384, 2560), dtype=torch.bfloat16, device="meta")
+    ba_weight = torch.empty((96, 2560), dtype=torch.bfloat16, device="meta")
+
+    qkvz, ba = qwen4_gemm._qwen4_exp_gdn_input_projection(
+        x,
+        qkvz_weight,
+        ba_weight,
+    )
+
+    assert qkvz.shape == (1, 16384)
+    assert ba.shape == (1, 96)
+    assert calls == 0
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4])
@@ -274,6 +394,59 @@ def test_qwen4_sm80_unsupported_batched_hc_down_uses_linear(
 
     x = torch.empty((2, 10240), device="meta", dtype=torch.bfloat16)
     weight = torch.empty((336, 10240), device="meta", dtype=torch.bfloat16)
+
+    assert qwen4_gemm._qwen4_exp_low_latency_gemm(x, weight) is expected
+
+
+def test_qwen4_sm80_out_projection_uses_custom_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []
+
+    def custom_op(
+        output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        calls.append((output.shape, x.shape, weight.shape))
+
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_runtime_ok", lambda *args: True)
+    monkeypatch.setattr(
+        qwen4_gemm,
+        "_sm80_out_projection_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen4_exp_sm80_out_projection",
+        custom_op,
+        raising=False,
+    )
+
+    x = torch.empty((4, 6144), device="meta", dtype=torch.bfloat16)
+    weight = torch.empty((2560, 6144), device="meta", dtype=torch.bfloat16)
+    output = qwen4_gemm._qwen4_exp_low_latency_gemm(x, weight)
+
+    assert output.shape == (4, 2560)
+    assert calls == [(output.shape, x.shape, weight.shape)]
+
+
+def test_qwen4_sm80_out_projection_falls_back_outside_m4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = object()
+    monkeypatch.setattr(qwen4_gemm, "_is_sm80", lambda: True)
+    monkeypatch.setattr(qwen4_gemm, "_runtime_ok", lambda *args: True)
+    monkeypatch.setattr(
+        qwen4_gemm,
+        "_sm80_out_projection_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(torch.nn.functional, "linear", lambda *args: expected)
+
+    x = torch.empty((1, 6144), device="meta", dtype=torch.bfloat16)
+    weight = torch.empty((2560, 6144), device="meta", dtype=torch.bfloat16)
 
     assert qwen4_gemm._qwen4_exp_low_latency_gemm(x, weight) is expected
 

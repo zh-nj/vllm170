@@ -877,6 +877,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             return self.forward_cuda(hidden_states)
 
+    def _forward_input_projection(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+        return mixed_qkvz, ba
+
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -891,8 +899,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._forward_input_projection(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode

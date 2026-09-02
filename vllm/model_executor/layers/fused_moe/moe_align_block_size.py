@@ -4,8 +4,30 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
+
+
+def _can_use_sm80_m4_e512_align(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    pad_sorted_ids: bool,
+) -> bool:
+    return (
+        block_size == 8
+        and num_experts == 512
+        and expert_map is None
+        and not pad_sorted_ids
+        and topk_ids.shape == (4, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and current_platform.is_device_capability((8, 0))
+        and hasattr(torch.ops._C, "moe_align_block_size_m4_e512")
+    )
 
 
 def moe_align_block_size(
@@ -87,15 +109,29 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
+    if _can_use_sm80_m4_e512_align(
         topk_ids,
-        num_experts,
         block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-    )
+        num_experts,
+        expert_map,
+        pad_sorted_ids,
+    ):
+        torch.ops._C.moe_align_block_size_m4_e512(
+            topk_ids,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]

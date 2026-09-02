@@ -872,6 +872,14 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    if (
+        current_platform.is_device_capability(80)
+        and q.shape == (4, 24, 256)
+        and k_cache.shape[2] == 2
+        and logical_indices.shape[1] == 2051
+    ):
+        block_n, target_splits, partial_warps = 64, 8, 2
+
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)

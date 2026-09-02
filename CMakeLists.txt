@@ -593,15 +593,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       SRCS "${VLLM_STABLE_EXT_SRC}"
       CUDA_ARCHS "${CUDA_ARCHS}")
 
-    cuda_archs_loose_intersection(QWEN4_EXP_HC_GEMV_ARCHS
+    cuda_archs_loose_intersection(QWEN4_EXP_SM80_ARCHS
       "8.0" "${CUDA_ARCHS}")
-    if(QWEN4_EXP_HC_GEMV_ARCHS)
-      set(QWEN4_EXP_HC_GEMV_SRC
-        "csrc/libtorch_stable/qwen4_exp_hc_gemv.cu")
-      list(APPEND VLLM_STABLE_EXT_SRC "${QWEN4_EXP_HC_GEMV_SRC}")
+    if(QWEN4_EXP_SM80_ARCHS)
+      set(QWEN4_EXP_SM80_SRCS
+        "csrc/libtorch_stable/qwen4_exp_hc_gemv.cu"
+        "csrc/libtorch_stable/qwen4_exp_gdn_input_projection.cu"
+        "csrc/libtorch_stable/qwen4_exp_out_projection.cu"
+        "csrc/libtorch_stable/moe/moe_align_m4_e512_sm80.cu")
+      list(APPEND VLLM_STABLE_EXT_SRC ${QWEN4_EXP_SM80_SRCS})
       set_gencode_flags_for_srcs(
-        SRCS "${QWEN4_EXP_HC_GEMV_SRC}"
-        CUDA_ARCHS "${QWEN4_EXP_HC_GEMV_ARCHS}")
+        SRCS "${QWEN4_EXP_SM80_SRCS}"
+        CUDA_ARCHS "${QWEN4_EXP_SM80_ARCHS}")
     endif()
 
     if(COOPERATIVE_TOPK_ARCHS)

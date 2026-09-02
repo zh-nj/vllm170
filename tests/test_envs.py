@@ -95,6 +95,16 @@ def test_qwen4_exp_hc_sm80_gemv_is_compile_factor(
     assert envs.compile_factors()["VLLM_QWEN4_EXP_HC_SM80_GEMV"] is True
 
 
+def test_qwen4_exp_mtp_fp8_lm_head_is_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD", "0")
+    assert envs.compile_factors()["VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD"] is False
+
+    monkeypatch.setenv("VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD", "1")
+    assert envs.compile_factors()["VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD"] is True
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

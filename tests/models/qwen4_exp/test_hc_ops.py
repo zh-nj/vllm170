@@ -121,3 +121,79 @@ def test_hc_sm80_down_cuda_graph(num_tokens: int) -> None:
     torch.accelerator.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=0.016, atol=0.01)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((8, 0))
+    or not hasattr(torch.ops._C, "qwen4_exp_gdn_sm80_input_projection"),
+    reason="Qwen4Exp GDN input projection requires an SM80 build",
+)
+def test_gdn_sm80_input_projection_cuda_graph() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260902)
+    x = torch.empty((4, 2560), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.1, 0.1, generator=generator
+    )
+    qkvz_weight = torch.empty(
+        (16384, 2560), dtype=torch.bfloat16, device="cuda"
+    ).uniform_(-0.02, 0.02, generator=generator)
+    ba_weight = torch.empty((96, 2560), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.02, 0.02, generator=generator
+    )
+    qkvz_output = torch.empty((4, 16384), dtype=torch.bfloat16, device="cuda")
+    ba_output = torch.empty((4, 96), dtype=torch.bfloat16, device="cuda")
+    expected_qkvz = torch.nn.functional.linear(x, qkvz_weight)
+    expected_ba = torch.nn.functional.linear(x, ba_weight)
+
+    def run() -> None:
+        torch.ops._C.qwen4_exp_gdn_sm80_input_projection(
+            qkvz_output,
+            ba_output,
+            x,
+            qkvz_weight,
+            ba_weight,
+        )
+
+    for _ in range(3):
+        run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    assert qkvz_output.is_contiguous()
+    assert ba_output.is_contiguous()
+    torch.testing.assert_close(qkvz_output, expected_qkvz, rtol=0.016, atol=0.01)
+    torch.testing.assert_close(ba_output, expected_ba, rtol=0.016, atol=0.01)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((8, 0))
+    or not hasattr(torch.ops._C, "qwen4_exp_sm80_out_projection"),
+    reason="Qwen4Exp out projection requires an SM80 build",
+)
+def test_sm80_out_projection_cuda_graph() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260902)
+    x = torch.empty((4, 6144), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.1, 0.1, generator=generator
+    )
+    weight = torch.empty((2560, 6144), dtype=torch.bfloat16, device="cuda").uniform_(
+        -0.02, 0.02, generator=generator
+    )
+    output = torch.empty((4, 2560), dtype=torch.bfloat16, device="cuda")
+    expected = torch.nn.functional.linear(x, weight)
+
+    def run() -> None:
+        torch.ops._C.qwen4_exp_sm80_out_projection(output, x, weight)
+
+    for _ in range(3):
+        run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=0.016, atol=0.02)

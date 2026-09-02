@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import set_random_seed
 
@@ -240,6 +241,54 @@ def test_moe_align_block_size(
     assert (actual_expert_ids[:actual_num_blocks] >= 0).all() and (
         actual_expert_ids[:actual_num_blocks] < num_experts
     ).all(), "expert_ids should contain valid expert indices"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((8, 0))
+    or not hasattr(torch.ops._C, "moe_align_block_size_m4_e512"),
+    reason="Exact M4/E512 MoE alignment requires an SM80 build",
+)
+def test_moe_align_block_size_sm80_m4_e512_cuda_graph() -> None:
+    topk_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    def run() -> None:
+        nonlocal actual
+        actual = moe_align_block_size(topk_ids, block_size=8, num_experts=512)
+
+    for _ in range(3):
+        run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert actual is not None
+    actual_sorted_ids, actual_expert_ids, actual_num_tokens = actual
+    golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
+        torch_moe_align_block_size(topk_ids, block_size=8, num_experts=512)
+    )
+
+    torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
+    torch.testing.assert_close(actual_expert_ids, golden_expert_ids, atol=0, rtol=0)
+    _verify_expert_level_sorting(
+        actual_sorted_ids,
+        golden_sorted_ids,
+        actual_expert_ids,
+        8,
+        actual_num_tokens.item(),
+        topk_ids.numel(),
+    )
 
 
 @pytest.mark.parametrize("m", [16, 32, 2048])

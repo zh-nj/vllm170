@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD: bool = False
     VLLM_QWEN4_EXP_HC_SM80_GEMV: bool = True
+    VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -914,6 +915,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_QWEN4_EXP_HC_SM80_GEMV": lambda: bool(
         int(os.getenv("VLLM_QWEN4_EXP_HC_SM80_GEMV", "1"))
+    ),
+    "VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD", "1"))
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB

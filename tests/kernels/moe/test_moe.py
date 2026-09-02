@@ -1752,12 +1752,13 @@ def test_batched_moe_align_block_size_opcheck():
     )
 
 
-# topk=8 covers topk > 4; k=511 covers the non-vectorized scalar path. The
+# topk=10 covers the Qwen4Exp static reduction; k=511 covers the
+# non-vectorized scalar path. The
 # layouts exercise contiguous input plus the two non-contiguous cases: a
 # transpose (strided hidden -> scalar gather) and a topk-slice (hidden still
 # contiguous -> vectorized).
 @pytest.mark.parametrize("m", [1, 33, 222])
-@pytest.mark.parametrize("topk", [*TOP_KS, 8])
+@pytest.mark.parametrize("topk", [*TOP_KS, 8, 10])
 @pytest.mark.parametrize("k", [128, 511, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["contig", "transpose", "slice"])
@@ -1780,7 +1781,7 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype, layout: str):
     opcheck(torch.ops._moe_C.moe_sum, (input, actual))
 
 
-@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("topk", [2, 8, 10])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("topk_ids_dtype", [torch.int32, torch.int64])
 def test_moe_sum_pad_aware(topk: int, dtype: torch.dtype, topk_ids_dtype: torch.dtype):

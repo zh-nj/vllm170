@@ -79,6 +79,9 @@ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
 }
 
 _SM80_HC_DOWN_SHAPE = (336, 10240)
+_SM80_GDN_QKVZ_SHAPE = (16384, 2560)
+_SM80_GDN_BA_SHAPE = (96, 2560)
+_SM80_OUT_PROJECTION_SHAPE = (2560, 6144)
 
 
 def _is_sm103() -> bool:
@@ -92,6 +95,36 @@ def _is_sm80() -> bool:
 def _sm80_hc_down_is_available() -> bool:
     return envs.VLLM_QWEN4_EXP_HC_SM80_GEMV and hasattr(
         torch.ops._C, "qwen4_exp_hc_sm80_down"
+    )
+
+
+def _sm80_out_projection_is_available() -> bool:
+    return hasattr(torch.ops._C, "qwen4_exp_sm80_out_projection")
+
+
+def can_use_qwen4_exp_sm80_gdn_input_projection(
+    qkvz: LinearBase,
+    ba: LinearBase,
+    *,
+    tp_size: int,
+    gqa_interleaved_layout: bool,
+    lora_enabled: bool,
+) -> bool:
+    return (
+        not envs.VLLM_BATCH_INVARIANT
+        and not lora_enabled
+        and not gqa_interleaved_layout
+        and tp_size == 1
+        and _is_sm80()
+        and hasattr(torch.ops._C, "qwen4_exp_gdn_sm80_input_projection")
+        and type(qkvz.quant_method) is UnquantizedLinearMethod
+        and type(ba.quant_method) is UnquantizedLinearMethod
+        and qkvz.bias is None
+        and ba.bias is None
+        and qkvz.weight.dtype == torch.bfloat16
+        and ba.weight.dtype == torch.bfloat16
+        and tuple(qkvz.weight.shape) == _SM80_GDN_QKVZ_SHAPE
+        and tuple(ba.weight.shape) == _SM80_GDN_BA_SHAPE
     )
 
 
@@ -137,6 +170,17 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if (
+        (weight.shape[0], weight.shape[1]) == _SM80_OUT_PROJECTION_SHAPE
+        and x.shape[0] == 4
+        and _is_sm80()
+        and _runtime_ok(x, weight)
+        and _sm80_out_projection_is_available()
+    ):
+        output = x.new_empty((x.shape[0], _SM80_OUT_PROJECTION_SHAPE[0]))
+        torch.ops._C.qwen4_exp_sm80_out_projection(output, x, weight)
+        return output
+
+    if (
         (weight.shape[0], weight.shape[1]) == _SM80_HC_DOWN_SHAPE
         and x.shape[0] in (1, 4)
         and _is_sm80()
@@ -172,6 +216,46 @@ direct_register_custom_op(
 )
 
 
+def _qwen4_exp_gdn_input_projection(
+    x: torch.Tensor,
+    qkvz_weight: torch.Tensor,
+    ba_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.shape[0] != 4:
+        return (
+            torch.nn.functional.linear(x, qkvz_weight),
+            torch.nn.functional.linear(x, ba_weight),
+        )
+    qkvz_output = x.new_empty((x.shape[0], qkvz_weight.shape[0]))
+    ba_output = x.new_empty((x.shape[0], ba_weight.shape[0]))
+    torch.ops._C.qwen4_exp_gdn_sm80_input_projection(
+        qkvz_output,
+        ba_output,
+        x,
+        qkvz_weight,
+        ba_weight,
+    )
+    return qkvz_output, ba_output
+
+
+def _qwen4_exp_gdn_input_projection_fake(
+    x: torch.Tensor,
+    qkvz_weight: torch.Tensor,
+    ba_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        x.new_empty((x.shape[0], qkvz_weight.shape[0])),
+        x.new_empty((x.shape[0], ba_weight.shape[0])),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_gdn_input_projection",
+    op_func=_qwen4_exp_gdn_input_projection,
+    fake_impl=_qwen4_exp_gdn_input_projection_fake,
+)
+
+
 def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
@@ -184,8 +268,9 @@ def enable_qwen4_exp_low_latency_gemm(
     use_sm80_hc_down = (
         enable_sm80_hc_down and _is_sm80() and _sm80_hc_down_is_available()
     )
+    use_sm80_out_projection = _is_sm80() and _sm80_out_projection_is_available()
     use_blackwell_plans = _is_sm103() and shape_dynamic_skinny_gemm.is_available()
-    if not (use_sm80_hc_down or use_blackwell_plans):
+    if not (use_sm80_hc_down or use_sm80_out_projection or use_blackwell_plans):
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
@@ -206,6 +291,9 @@ def enable_qwen4_exp_low_latency_gemm(
         shape = (weight.shape[0], weight.shape[1])
         plan = QWEN4_EXP_GEMM_PLANS.get(shape)
         selected = use_sm80_hc_down and shape == _SM80_HC_DOWN_SHAPE
+        selected = selected or (
+            use_sm80_out_projection and shape == _SM80_OUT_PROJECTION_SHAPE
+        )
         selected = selected or (use_blackwell_plans and plan is not None)
         if not selected:
             continue
