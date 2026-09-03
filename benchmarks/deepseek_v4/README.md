@@ -19,15 +19,20 @@ benchmarks/deepseek_v4/run_cmp170hx_pp3_vision.sh
 ```
 
 It selects the local vision checkpoint when present, serves it as
-`dsv4-vision`, and defaults DSpark to three speculative tokens because the
-checkpoint contains three reusable draft blocks. The underlying PP3/SM80
+`dsv4-vision`, and defaults DSpark to five speculative tokens because the
+checkpoint declares `dspark_block_size=5` while exposing three reusable target
+layers. The underlying PP3/SM80
 settings remain identical to the text launcher, including physical GPUs
-`1,2,3`, partition `15,15,13`, FP8 KV cache, and the Triton sparse-MLA path.
-Override `DSV4_DSPARK_TOKENS` only with 3 or a larger multiple of 3.
+`1,2,3`, with the vision preset using partition `15,16,12`, FP8 KV cache, and
+the Triton sparse-MLA path.
+The vision preset requires `DSV4_DSPARK_TOKENS=5`.
+The ViT, aligner, and image sentinel vectors reside only on PP0; later pipeline
+ranks retain raw image-token IDs for `bias_vl` routing without replicating the
+vision tower.
 
 The defaults are the measured three-card configuration:
 
-- physical GPUs `1,2,3`, PP3 with `15,15,13` layers and TP1;
+- physical GPUs `1,2,3`, PP3 with `15,16,12` layers and TP1;
 - Triton sparse MLA, FP8 KV cache, block size 256;
 - CUDA Graph execution and the measured CMP170HX DSpark default of 5
   speculative tokens; the official model README recommends width 7;
@@ -54,6 +59,27 @@ sequence. The PP0/PP1 KV admission requirement is 2.46 GiB; the configured
 budget exposes 1,071,031 cache tokens, or 1.02 concurrent full-length
 requests. Keep `DSV4_MAX_NUM_SEQS=1` unless the KV and indexer workspace
 budgets are recalculated for the higher concurrency.
+
+For the validated long-context speed/correctness matrix, run the service with
+`DSV4_MAX_MODEL_LEN=131200` and 2.7 GB KV memory, then execute one request at
+each length:
+
+```bash
+for n in 1000 32000 128000; do
+  .venv/bin/python benchmarks/deepseek_v4/bench_concurrent_longctx.py \
+    --base-url http://127.0.0.1:8098 --model dsv4-vision \
+    --concurrency 1 --prompt-tokens "$n" --max-tokens 64 \
+    --seed "$((17000 + n / 1000))" --scenario general \
+    --temperature 0 --top-p 1.0 --mode dspark --timeout 3600 \
+    --output "/tmp/dsv4-vision-longctx-${n}.json"
+done
+```
+
+The harness reports TTFT/prefill throughput, decode throughput after the first
+token, DSpark acceptance, and exact needle recall/cross-talk checks.  The
+measured 1K/32K/128K results and the post-run two-image correctness check are
+recorded in
+`docs/design/vllm170-dsv4-vision-sm80-pp3-dspark-2026-09-03.md`.
 
 Do not add `--enforce-eager`: it disables the CUDA Graph decode path and causes
 an order-of-magnitude regression on this machine. The launcher defaults to

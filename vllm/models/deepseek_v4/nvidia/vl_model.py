@@ -22,6 +22,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.distributed import get_pp_group
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -114,6 +115,7 @@ class DeepseekV4ForConditionalGeneration(
         image_enabled = (
             config.vision_n_layers > 0
             and self.multimodal_config.get_limit_per_prompt("image") > 0
+            and get_pp_group().is_first_rank
         )
         with self._mark_tower_model(vllm_config, {"image"}):
             self.vision: DeepseekV4ViT | None = None

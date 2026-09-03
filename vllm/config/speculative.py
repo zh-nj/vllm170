@@ -1413,6 +1413,15 @@ class SpeculativeConfig:
                     # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
                     # and its weights ship in the target checkpoint.
                     self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                    # DeepSeek-V4 exposes two independent depths: the three
+                    # auxiliary target layers used by DSpark and the trained
+                    # speculative block width. The latter is stored as
+                    # ``dspark_block_size`` and must drive ``n_predict``.
+                    dspark_block_size = getattr(
+                        self.draft_model_config.hf_config, "dspark_block_size", None
+                    )
+                    if dspark_block_size is not None:
+                        self.draft_model_config.hf_config.n_predict = dspark_block_size
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
