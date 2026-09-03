@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NamedTuple, NewType, TypeAlias, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -1110,6 +1111,309 @@ def _get_kv_cache_groups_uniform_type(
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
 
 
+def _pp_balanced_mamba_group_count(
+    vllm_config: VllmConfig,
+    mamba_layer_names: list[str],
+    mla_layer_names: list[str],
+) -> int | None:
+    """Return a Mamba group count whose PP projections fit the MLA slots."""
+    num_groups = cdiv(len(mamba_layer_names), len(mla_layer_names))
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    if pp_size == 1:
+        return num_groups
+
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    mamba_indices = [extract_layer_index(name) for name in mamba_layer_names]
+    mla_indices = [extract_layer_index(name) for name in mla_layer_names]
+    for rank in range(pp_size):
+        start, end = get_pp_indices(total_layers, rank, pp_size)
+        num_mamba = sum(start <= index < end for index in mamba_indices)
+        num_mla = sum(start <= index < end for index in mla_indices)
+        if not num_mamba:
+            continue
+        if not num_mla:
+            return None
+        num_groups = max(num_groups, cdiv(num_mamba, num_mla))
+    return num_groups
+
+
+def _pages_fit_storage_slots(page_sizes: list[int], slot_sizes: list[int]) -> bool:
+    """Return whether pages fit into per-block slots without overlap."""
+    remaining = list(slot_sizes)
+    for page_size in sorted(page_sizes, reverse=True):
+        candidates = [
+            index for index, capacity in enumerate(remaining) if capacity >= page_size
+        ]
+        if not candidates:
+            return False
+        slot_index = min(candidates, key=remaining.__getitem__)
+        remaining[slot_index] -= page_size
+    return True
+
+
+def _get_kv_cache_groups_glm5_next(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build GLM-5.3 groups with Mamba/MLA and tail/indexer aliasing."""
+    mamba_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, MambaSpec)
+    }
+    tail_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, KpoolTailSpec)
+    }
+    mla_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if type(spec) is MLAAttentionSpec
+    }
+    extra_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        and type(spec) is not MLAAttentionSpec
+    }
+    if (
+        not mamba_specs
+        or not mla_specs
+        or any(isinstance(spec, HiddenStateCacheSpec) for spec in extra_specs.values())
+    ):
+        return None
+
+    mla_specs = cast(dict[str, MLAAttentionSpec], mla_specs)
+
+    def is_indexer(name: str, spec: MLAAttentionSpec) -> bool:
+        return spec.tokens_per_state > 1 or (
+            ".indexer.k_cache" in name and spec.storage_block_size is not None
+        )
+
+    idx_names = [name for name, spec in mla_specs.items() if is_indexer(name, spec)]
+    idx_pages = {mla_specs[name].page_size_bytes for name in idx_names}
+    if not idx_pages:
+        return None
+
+    assert all(spec.page_size_padded is None for spec in mla_specs.values())
+    assert len(idx_pages) == 1
+    mla_names = [name for name in mla_specs if name not in idx_names]
+    mla_pages = {mla_specs[name].page_size_bytes for name in mla_names}
+    assert len(mla_pages) == 1
+    mla_page = mla_pages.pop()
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(
+        cast(dict[str, KVCacheSpec], mla_specs)
+    )
+    assert uniform_spec is not None
+
+    extra_groups: list[KVCacheGroupSpec] = []
+    if extra_specs:
+        if not all(isinstance(spec, AttentionSpec) for spec in extra_specs.values()):
+            return None
+        extra_uniform = UniformTypeKVCacheSpecs.from_specs(extra_specs)
+        if extra_uniform is None:
+            return None
+        target_block_size = uniform_spec.block_size
+        slot_sizes = [mla_page] * len(mla_names) + [next(iter(idx_pages))] * len(
+            idx_names
+        )
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            from vllm.distributed.utils import get_pp_indices
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+            start, end = get_pp_indices(
+                total_layers,
+                vllm_config.parallel_config.pipeline_parallel_size - 1,
+                vllm_config.parallel_config.pipeline_parallel_size,
+            )
+            slot_sizes = [
+                page
+                for name, page in zip(
+                    [*mla_names, *idx_names],
+                    [mla_page] * len(mla_names)
+                    + [next(iter(idx_pages))] * len(idx_names),
+                )
+                if start <= extract_layer_index(name) < end
+            ]
+        draft_block_size = next(
+            (
+                candidate
+                for candidate in range(target_block_size, 15, -1)
+                if target_block_size % candidate == 0
+                and candidate % 16 == 0
+                and _pages_fit_storage_slots(
+                    [
+                        spec.page_size_bytes * candidate // spec.block_size
+                        for spec in extra_specs.values()
+                    ],
+                    slot_sizes,
+                )
+            ),
+            0,
+        )
+        if draft_block_size == 0:
+            return None
+        resized_extra_specs: dict[str, KVCacheSpec] = {
+            name: replace(
+                cast(AttentionSpec, spec),
+                block_size=draft_block_size,
+                page_size_padded=None,
+            )
+            for name, spec in extra_specs.items()
+        }
+        resized_uniform = UniformTypeKVCacheSpecs.from_specs(resized_extra_specs)
+        assert resized_uniform is not None
+        extra_groups.append(KVCacheGroupSpec(list(extra_specs), resized_uniform))
+
+    tail_group: KVCacheGroupSpec | None = None
+    if tail_specs:
+        idx_page = next(iter(idx_pages))
+        padded_tail_specs: dict[str, KVCacheSpec] = {
+            name: replace(spec, page_size_padded=idx_page)
+            for name, spec in tail_specs.items()
+        }
+        tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
+        assert tail_uniform is not None
+        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+
+    any_mamba = next(iter(mamba_specs.values()))
+    assert all(spec == any_mamba for spec in mamba_specs.values())
+    if any_mamba.real_page_size_bytes > mla_page:
+        raise ValueError(
+            f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
+            f"does not fit the MLA page ({mla_page} bytes); increase tensor "
+            "parallelism or use a wider KV cache dtype"
+        )
+    padded_specs: dict[str, KVCacheSpec] = {
+        name: replace(any_mamba, page_size_padded=mla_page) for name in mamba_specs
+    }
+    num_groups = _pp_balanced_mamba_group_count(
+        vllm_config, list(mamba_specs), mla_names
+    )
+    if num_groups is None:
+        raise ValueError(
+            "a pipeline stage has mamba layers but no MLA layer to share "
+            "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
+        )
+    mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+    for index, name in enumerate(mamba_specs):
+        mamba_grouped_names[index % num_groups].append(name)
+
+    return (
+        [KVCacheGroupSpec(list(mla_specs), uniform_spec)]
+        + ([tail_group] if tail_group is not None else [])
+        + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + extra_groups
+    )
+
+
+def _glm5_next_tensor_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> (
+    tuple[
+        KVCacheGroupSpec,
+        list[KVCacheGroupSpec],
+        list[str],
+        list[str],
+        int,
+        int,
+        list[str],
+        int,
+        list[KVCacheGroupSpec],
+    ]
+    | None
+):
+    """Recognize GLM-5.3 grouping after optional PP projection."""
+    uniform_groups = [
+        group
+        for group in kv_cache_groups
+        if group.layer_names
+        and isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    mamba_groups = [
+        group
+        for group in kv_cache_groups
+        if group.layer_names and isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    attn_group: KVCacheGroupSpec | None = None
+    tail_group: KVCacheGroupSpec | None = None
+    extra_groups: list[KVCacheGroupSpec] = []
+    for group in uniform_groups:
+        inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+        if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+            attn_group = group
+        elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+            tail_group = group
+        else:
+            extra_groups.append(group)
+    if attn_group is None or not mamba_groups:
+        return None
+    if len(uniform_groups) + len(mamba_groups) != sum(
+        bool(group.layer_names) for group in kv_cache_groups
+    ):
+        return None
+
+    attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+    mla_inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
+    if not all(
+        type(spec) is MLAAttentionSpec and spec.page_size_padded is None
+        for spec in mla_inner.values()
+    ):
+        return None
+    idx_names = [
+        name
+        for name in attn_group.layer_names
+        if mla_inner[name].tokens_per_state > 1
+        or (
+            ".indexer.k_cache" in name
+            and mla_inner[name].storage_block_size is not None
+        )
+    ]
+    mla_names = [name for name in attn_group.layer_names if name not in idx_names]
+    mla_pages = {mla_inner[name].page_size_bytes for name in mla_names}
+    idx_pages = {mla_inner[name].page_size_bytes for name in idx_names}
+    if len(mla_pages) != 1 or len(idx_pages) != 1:
+        return None
+    mla_page = mla_pages.pop()
+    idx_page = idx_pages.pop()
+    if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
+        return None
+
+    tail_names: list[str] = []
+    tail_page = 0
+    if tail_group is not None:
+        tail_names = list(tail_group.layer_names)
+        tail_inner = cast(
+            UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+        ).kv_cache_specs
+        tail_pages = {
+            cast(KpoolTailSpec, spec).unpadded_page_size_bytes
+            for spec in tail_inner.values()
+        }
+        if len(tail_pages) != 1 or len(tail_names) != len(idx_names):
+            return None
+        tail_page = tail_pages.pop()
+        if tail_page > idx_page:
+            return None
+
+    return (
+        attn_group,
+        mamba_groups,
+        mla_names,
+        idx_names,
+        mla_page,
+        idx_page,
+        tail_names,
+        tail_page,
+        extra_groups,
+    )
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1333,10 +1637,74 @@ def _get_per_layer_spec(
     return spec
 
 
+def _glm5_extra_slot_layout(
+    mla_names: list[str],
+    idx_names: list[str],
+    mla_page: int,
+    idx_page: int,
+    extra_groups: list[KVCacheGroupSpec],
+) -> list[dict[str, tuple[int, int, int]]] | None:
+    """Assign each extra-group layer to a target layer-major storage slot."""
+    slots = [(index * mla_page, mla_page) for index in range(len(mla_names))] + [
+        (len(mla_names) * mla_page + index * idx_page, idx_page)
+        for index in range(len(idx_names))
+    ]
+    layouts: list[dict[str, tuple[int, int, int]]] = []
+    for group in extra_groups:
+        used = [0] * len(slots)
+        assignment: dict[str, tuple[int, int, int]] = {}
+        layers = sorted(
+            group.layer_names,
+            key=lambda name: _get_per_layer_spec(group, name).page_size_bytes,
+            reverse=True,
+        )
+        for layer_name in layers:
+            page = _get_per_layer_spec(group, layer_name).page_size_bytes
+            candidates = [
+                index
+                for index, (_, capacity) in enumerate(slots)
+                if capacity - used[index] >= page
+            ]
+            if not candidates:
+                return None
+            slot_index = min(
+                candidates,
+                key=lambda index: slots[index][1] - used[index],
+            )
+            slot_offset, slot_stride = slots[slot_index]
+            assignment[layer_name] = (slot_offset, used[slot_index], slot_stride)
+            used[slot_index] += page
+        layouts.append(assignment)
+    return layouts
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Return the largest cache group's bytes per block."""
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, extra_groups = glm5_layout
+        target_width = len(mla_names) * mla_page + len(idx_names) * idx_page
+        if (
+            _glm5_extra_slot_layout(
+                mla_names,
+                idx_names,
+                mla_page,
+                idx_page,
+                extra_groups,
+            )
+            is not None
+        ):
+            return target_width
+        extra_widths = [
+            sum(
+                _get_per_layer_spec(group, layer_name).page_size_bytes
+                for layer_name in group.layer_names
+            )
+            for group in extra_groups
+        ]
+        return target_width + sum(extra_widths)
+
     bytes_per_block = max(
         sum(
             _get_per_layer_spec(group, layer_name).page_size_bytes
@@ -1404,6 +1772,123 @@ def get_kv_cache_config_from_groups(
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
+        )
+
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        (
+            attn_group,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _,
+            extra_groups,
+        ) = glm5_layout
+        target_width = len(mla_names) * mla_page + len(idx_names) * idx_page
+        extra_slot_layout = _glm5_extra_slot_layout(
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            extra_groups,
+        )
+        extra_widths = [group.kv_cache_spec.page_size_bytes for group in extra_groups]
+        bytes_per_block = (
+            target_width
+            if extra_slot_layout is not None
+            else target_width + sum(extra_widths)
+        )
+        num_blocks = may_override_num_blocks(
+            vllm_config, available_memory // bytes_per_block
+        )
+        size = bytes_per_block * num_blocks
+        attn_specs = cast(
+            UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+        ).kv_cache_specs
+
+        kv_cache_tensors: list[KVCacheTensor] = []
+
+        def add_tensor(
+            layer_name: str,
+            spec: KVCacheSpec,
+            offset: int,
+            block_stride: int | None = None,
+        ) -> None:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=[layer_name],
+                    layer_stride=spec.page_size_bytes * num_blocks,
+                    block_stride=block_stride or spec.page_size_bytes,
+                    offset=offset,
+                )
+            )
+
+        for index, mla_name in enumerate(mla_names):
+            offset = index * mla_page * num_blocks
+            add_tensor(mla_name, attn_specs[mla_name], offset)
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
+
+        idx_base = len(mla_names) * mla_page * num_blocks
+        for index, idx_name in enumerate(idx_names):
+            offset = idx_base + index * idx_page * num_blocks
+            add_tensor(idx_name, attn_specs[idx_name], offset)
+            if tail_names:
+                tail_name = tail_names[index]
+                tail_group = next(
+                    group for group in kv_cache_groups if tail_name in group.layer_names
+                )
+                tail_specs = cast(
+                    UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+                ).kv_cache_specs
+                add_tensor(tail_name, tail_specs[tail_name], offset)
+
+        extra_base = target_width * num_blocks
+        for group_index, group in enumerate(extra_groups):
+            extra_specs = cast(
+                UniformTypeKVCacheSpecs, group.kv_cache_spec
+            ).kv_cache_specs
+            if extra_slot_layout is not None:
+                for layer_name in group.layer_names:
+                    slot_offset, suboffset, slot_stride = extra_slot_layout[
+                        group_index
+                    ][layer_name]
+                    add_tensor(
+                        layer_name,
+                        extra_specs[layer_name],
+                        slot_offset * num_blocks + suboffset,
+                        block_stride=slot_stride,
+                    )
+            else:
+                extra_offset = extra_base
+                for layer_name in group.layer_names:
+                    add_tensor(layer_name, extra_specs[layer_name], extra_offset)
+                    extra_offset += extra_specs[layer_name].page_size_bytes * num_blocks
+                extra_base = extra_offset
+
+        logger.info(
+            "GLM KV pool ledger: available_bytes=%d, num_blocks=%d, "
+            "bytes_per_block=%d, allocated_bytes=%d, target_bytes_per_block=%d, "
+            "extra_bytes_per_block=%s, extra_overlaid=%s",
+            available_memory,
+            num_blocks,
+            bytes_per_block,
+            size,
+            target_width,
+            extra_widths,
+            extra_slot_layout is not None,
+        )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
@@ -1970,6 +2455,8 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        return glm5_groups
     # Hidden-state layers use their own block table and must not be absorbed
     # into a compatible attention bucket.
     hidden_specs = {
@@ -2096,6 +2583,36 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        (
+            attn_group,
+            mamba_groups,
+            _,
+            _,
+            _,
+            _,
+            tail_names,
+            _,
+            extra_groups,
+        ) = glm5_layout
+        uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+        total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
+        total_blocks += sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in mamba_groups
+        )
+        if tail_names:
+            total_blocks += 1
+        total_blocks += sum(
+            group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+            for group in extra_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
+        return total_blocks * _pool_bytes_per_block(kv_cache_groups)
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
     total_blocks = 0

@@ -577,3 +577,14 @@ class MHCFusedPostPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Expand one hidden stream into ``n`` replicated streams."""
+    return x.unsqueeze(1).expand(-1, n, -1).contiguous()
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Contract ``n`` hidden streams by averaging them."""
+    del n
+    return x.mean(dim=1)

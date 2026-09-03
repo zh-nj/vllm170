@@ -34,12 +34,18 @@ def test_direct_swa_ragged_controls_dense_decode_buffer(monkeypatch) -> None:
 
 
 @torch.inference_mode()
-def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("head_dim", "nope_head_dim", "rope_head_dim"),
+    [(512, 448, 64), (256, 256, 0)],
+)
+def test_sparse_prefill_caller_output_and_block_k_match(
+    monkeypatch, head_dim: int, nope_head_dim: int, rope_head_dim: int
+) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
 
     torch.manual_seed(0)
-    q = torch.randn(4, 8, 512, dtype=torch.bfloat16, device="cuda") * 0.125
-    kv = torch.randn(8, 1, 512, dtype=torch.bfloat16, device="cuda") * 0.125
+    q = torch.randn(4, 8, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
+    kv = torch.randn(8, 1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
     indices = torch.tensor(
         [
             [0, 2, 4, -1, -1, -1],
@@ -64,10 +70,10 @@ def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
             kv=kv,
             indices=indices,
             topk_length=lengths,
-            scale=512**-0.5,
-            head_dim=512,
-            nope_head_dim=448,
-            rope_head_dim=64,
+            scale=head_dim**-0.5,
+            head_dim=head_dim,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
             attn_sink=sink,
             output=output,
         )

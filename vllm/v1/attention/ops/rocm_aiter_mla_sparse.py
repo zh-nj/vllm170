@@ -1281,15 +1281,31 @@ _DSV4_SPARSE_NOPE_DIM = 448
 _DSV4_SPARSE_ROPE_DIM = 64
 
 
+def _validate_sparse_dims(
+    head_dim: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    op_name: str,
+) -> None:
+    assert head_dim > 0, f"{op_name} expected a positive head_dim, got {head_dim}"
+    assert nope_head_dim > 0, (
+        f"{op_name} expected a positive NoPE dimension, got {nope_head_dim}"
+    )
+    assert rope_head_dim >= 0, (
+        f"{op_name} expected a non-negative RoPE dimension, got {rope_head_dim}"
+    )
+    assert head_dim == nope_head_dim + rope_head_dim, (
+        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
+    )
+
+
 def _validate_dsv4_sparse_dims(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
     op_name: str,
 ) -> None:
-    assert head_dim == nope_head_dim + rope_head_dim, (
-        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
-    )
+    _validate_sparse_dims(head_dim, nope_head_dim, rope_head_dim, op_name)
     assert (
         nope_head_dim == _DSV4_SPARSE_NOPE_DIM
         and rope_head_dim == _DSV4_SPARSE_ROPE_DIM
@@ -2598,7 +2614,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     assert indptr.numel() == num_queries + 1, (
         f"expected indptr shape [{num_queries + 1}], got {indptr.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
@@ -3198,7 +3214,7 @@ def rocm_sparse_attn_prefill(
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,

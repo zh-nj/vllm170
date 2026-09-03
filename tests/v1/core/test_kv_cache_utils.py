@@ -6,13 +6,19 @@ import importlib
 from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -47,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -216,6 +223,90 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_glm5_next_kv_cache_layout_supports_pp4(monkeypatch):
+    """Each PP4 stage retains a valid MLA/indexer/KDA shared-cache layout."""
+    monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "13,11,11,10")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=8192),
+        parallel_config=ParallelConfig(pipeline_parallel_size=4),
+    )
+    specs: dict[str, KVCacheSpec] = {}
+    for index in range(45):
+        if index % 4 == 3:
+            specs[f"layers.{index}.attn"] = MLAAttentionSpec(
+                block_size=1024,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.bfloat16,
+            )
+            specs[f"layers.{index}.indexer.k_cache"] = MLAAttentionSpec(
+                block_size=1024,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                tokens_per_state=4,
+                storage_block_size=256,
+            )
+            specs[f"layers.{index}.tail"] = KpoolTailSpec(
+                block_size=4,
+                num_kv_heads=2,
+                head_size=128,
+                head_size_v=0,
+                dtype=torch.bfloat16,
+                sliding_window=4,
+            )
+        else:
+            specs[f"layers.{index}.linear_attn"] = new_mamba_spec()
+
+    groups = get_kv_cache_groups(vllm_config, specs)
+    assert len([g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]) == 5
+
+    from vllm.distributed.utils import get_pp_indices
+
+    for rank in range(4):
+        start, end = get_pp_indices(45, rank, 4)
+        worker_specs = {
+            name: spec
+            for name, spec in specs.items()
+            if start <= int(name.split(".")[1]) < end
+        }
+        projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+            groups, worker_specs
+        )
+        layout = kv_cache_utils._glm5_next_tensor_layout(projected)
+        assert layout is not None
+        assert layout[6]
+        config = kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config,
+            projected,
+            kv_cache_utils._pool_bytes_per_block(projected) * 8,
+        )
+        assert config.num_blocks == 8
+        tensors = {
+            layer: tensor
+            for tensor in config.kv_cache_tensors
+            for layer in tensor.layers
+        }
+        for tail_name in layout[6]:
+            indexer_name = tail_name.removesuffix("tail") + "indexer.k_cache"
+            assert tensors[tail_name].offset == tensors[indexer_name].offset
+            tail_spec = cast(
+                KpoolTailSpec,
+                next(
+                    spec
+                    for group in projected
+                    for name, spec in (
+                        group.kv_cache_spec.kv_cache_specs.items()
+                        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                        else []
+                    )
+                    if name == tail_name
+                ),
+            )
+            assert not tail_spec.prefix_cacheable
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

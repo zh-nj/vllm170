@@ -42,6 +42,12 @@ def fused_recurrent_kda_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
+    sigmoid_beta: bool = False,
+    a_log: torch.Tensor | None = None,
+    g_bias: torch.Tensor | None = None,
+    compute_gate: bool = False,
+    lower_bound: float | None = -5.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -52,7 +58,21 @@ def fused_recurrent_kda_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = torch.empty_like(k)
+    if compute_gate:
+        assert a_log is not None and g_bias is not None, (
+            "compute_gate requires a_log and g_bias"
+        )
+        assert lower_bound is not None, (
+            "compute_gate implements the bounded (safe_gate) branch only"
+        )
+        a_log = a_log.reshape(-1).contiguous()
+        g_bias = g_bias.reshape(-1).contiguous()
+    if out is None:
+        o = torch.empty_like(k)
+    else:
+        assert out.shape == k.shape and out.dtype == k.dtype
+        assert out.is_contiguous()
+        o = out
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -81,6 +101,8 @@ def fused_recurrent_kda_fwd(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        a_log=a_log,
+        g_bias=g_bias,
         scale=scale,
         N=N,
         T=T,
@@ -99,6 +121,10 @@ def fused_recurrent_kda_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=True,
+        SIGMOID_BETA=sigmoid_beta,
+        COMPUTE_GATE=compute_gate,
+        SAFE_GATE=True,
+        LOWER_BOUND=lower_bound if lower_bound is not None else -5.0,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -118,6 +144,13 @@ def fused_recurrent_kda(
     use_qk_l2norm_in_kernel: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.LongTensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    sigmoid_beta: bool = False,
+    a_log: torch.Tensor | None = None,
+    g_bias: torch.Tensor | None = None,
+    compute_gate: bool = False,
+    lower_bound: float | None = -5.0,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -139,8 +172,14 @@ def fused_recurrent_kda(
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
+        num_accepted_tokens=num_accepted_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        out=out,
+        sigmoid_beta=sigmoid_beta,
+        a_log=a_log,
+        g_bias=g_bias,
+        compute_gate=compute_gate,
+        lower_bound=lower_bound,
     )
     return o, final_state
 
