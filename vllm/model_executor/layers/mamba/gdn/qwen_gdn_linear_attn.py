@@ -50,6 +50,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
@@ -899,7 +900,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, ba = self._forward_input_projection(hidden_states)
+        with optional_phase_profile_stage(
+            "gdn.input_projection", hidden_states, level="stage"
+        ):
+            mixed_qkvz, ba = self._forward_input_projection(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
@@ -949,18 +953,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.qwen_gdn_attention_core(
-            mixed_qkv,
-            b.contiguous(),
-            a.contiguous(),
-            core_attn_out,
-            layer_name=_encode_layer_name(self.prefix),
-        )
+        with optional_phase_profile_stage("gdn.core_total", mixed_qkv, level="stage"):
+            torch.ops.vllm.qwen_gdn_attention_core(
+                mixed_qkv,
+                b.contiguous(),
+                a.contiguous(),
+                core_attn_out,
+                layer_name=_encode_layer_name(self.prefix),
+            )
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._output_projection(core_attn_out, z)
+        with optional_phase_profile_stage(
+            "gdn.output_projection", core_attn_out, level="stage"
+        ):
+            return self._output_projection(core_attn_out, z)
 
     def forward_xpu(
         self,
@@ -1948,20 +1956,21 @@ def qwen_gdn_attention_core(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    if use_aiter:
-        self._forward_core_rocm(
-            qkvz=qkv_or_qkvz,
-            ba=b_or_ba,
-            z_out=a_or_z_out,
-            core_attn_out=core_attn_out,
-        )
-    else:
-        self._forward_core(
-            mixed_qkv=qkv_or_qkvz,
-            b=b_or_ba,
-            a=a_or_z_out,
-            core_attn_out=core_attn_out,
-        )
+    with optional_phase_profile_stage("gdn.core", qkv_or_qkvz, level="detail"):
+        if use_aiter:
+            self._forward_core_rocm(
+                qkvz=qkv_or_qkvz,
+                ba=b_or_ba,
+                z_out=a_or_z_out,
+                core_attn_out=core_attn_out,
+            )
+        else:
+            self._forward_core(
+                mixed_qkv=qkv_or_qkvz,
+                b=b_or_ba,
+                a=a_or_z_out,
+                core_attn_out=core_attn_out,
+            )
 
 
 def gdn_attention_core_fake(
@@ -1993,11 +2002,14 @@ def qwen_gdn_attention_core_fused_norm_packed(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self._forward_core_fused_norm_packed(
-        mixed_qkvz=mixed_qkvz,
-        ba=ba,
-        core_attn_out=core_attn_out,
-    )
+    with optional_phase_profile_stage(
+        "gdn.fused_core_norm", mixed_qkvz, level="detail"
+    ):
+        self._forward_core_fused_norm_packed(
+            mixed_qkvz=mixed_qkvz,
+            ba=ba,
+            core_attn_out=core_attn_out,
+        )
 
 
 def gdn_attention_core_fused_norm_packed_fake(

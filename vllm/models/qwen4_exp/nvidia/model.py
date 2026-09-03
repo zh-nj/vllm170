@@ -66,9 +66,11 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.models.deepseek_v4.phase_profile import phase_profile_layer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -360,36 +362,50 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
-                hidden_states,
-                input_ids,
-                query_start_loc,
-                ngram_context,
-            )
+            with optional_phase_profile_stage(
+                "ple.total", hidden_states, level="module"
+            ):
+                hidden_states = hidden_states + self.ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if prev_block_output is not None and prev_injection is not None:
-            hidden_states, block_input, injection = attn_hc.combine_and_mix(
-                hidden_states, prev_block_output, prev_injection
-            )
-        else:
-            hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+        with optional_phase_profile_stage(
+            "layer.attention_hc", hidden_states, level="stage"
+        ):
+            if prev_block_output is not None and prev_injection is not None:
+                hidden_states, block_input, injection = attn_hc.combine_and_mix(
+                    hidden_states, prev_block_output, prev_injection
+                )
+            else:
+                hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
         if self.layer_type == "linear_attention":
-            attn_out = self.linear_attn(hidden_states=block_input)
+            with optional_phase_profile_stage(
+                "attention.gdn", block_input, level="module"
+            ):
+                attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type == "full_attention":
-            attn_out = self.self_attn(
-                hidden_states=block_input,
-                positions=positions,
-            )
+            with optional_phase_profile_stage(
+                "attention.qsa", block_input, level="module"
+            ):
+                attn_out = self.self_attn(
+                    hidden_states=block_input,
+                    positions=positions,
+                )
         else:
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
-        hidden_states, block_input, injection = mlp_hc.combine_and_mix(
-            hidden_states, attn_out, injection
-        )
-        mlp_out = self.mlp(block_input)
+        with optional_phase_profile_stage("layer.mlp_hc", hidden_states, level="stage"):
+            hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+                hidden_states, attn_out, injection
+            )
+        with optional_phase_profile_stage("layer.mlp", block_input, level="module"):
+            mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
 
 
@@ -551,8 +567,14 @@ class Qwen4ExpModel(nn.Module):
             else:
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
-                hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.repeat(1, self.config.hc_count)
+                with optional_phase_profile_stage(
+                    "model.embedding", input_ids, level="module"
+                ):
+                    hidden_states = self.embed_input_ids(input_ids)
+            with optional_phase_profile_stage(
+                "model.hc_expand", hidden_states, level="stage"
+            ):
+                hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
@@ -565,15 +587,21 @@ class Qwen4ExpModel(nn.Module):
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
-            hidden_states, block_output, injection = layer(
-                hidden_states=hidden_states,
-                prev_block_output=block_output,
-                prev_injection=injection,
-                positions=positions,
-                input_ids=input_ids,
-                query_start_loc=query_start_loc,
-                ngram_context=ngram_context,
-            )
+            with (
+                phase_profile_layer(f"model.layers.{layer_idx}"),
+                optional_phase_profile_stage(
+                    "layer.total", hidden_states, level="module"
+                ),
+            ):
+                hidden_states, block_output, injection = layer(
+                    hidden_states=hidden_states,
+                    prev_block_output=block_output,
+                    prev_injection=injection,
+                    positions=positions,
+                    input_ids=input_ids,
+                    query_start_loc=query_start_loc,
+                    ngram_context=ngram_context,
+                )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -602,18 +630,24 @@ class Qwen4ExpModel(nn.Module):
             # PP transports one tensor, not the delayed HC tuple. Materialize
             # with the HC module that produced the pending injection.
             if last_layer is not None and block_output is not None:
-                hidden_states = last_layer.mlp_hyper_connection.combine(
-                    hidden_states, block_output, injection
-                )
+                with optional_phase_profile_stage(
+                    "model.pp_materialize", hidden_states, level="stage"
+                ):
+                    hidden_states = last_layer.mlp_hyper_connection.combine(
+                        hidden_states, block_output, injection
+                    )
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # The final mixer consumes the last pending combine and returns both
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-            hidden_states, block_output, injection
-        )
+        with optional_phase_profile_stage(
+            "model.final_mixer", hidden_states, level="stage"
+        ):
+            multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+                hidden_states, block_output, injection
+            )
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:

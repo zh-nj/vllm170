@@ -702,6 +702,49 @@ def test_qsa_mqa_paged_matches_test_reference(num_rows: int) -> None:
 
 
 @requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="QSA row-tiled prefill scoring targets SM80",
+)
+def test_qsa_mqa_paged_single_request_prefill_matches_reference() -> None:
+    """Guard the cross-row packing and ragged final row tile."""
+    torch.manual_seed(2)
+    num_rows = 65
+    head_dim = 128
+    q = torch.randn(num_rows, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(40, 4, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.randperm(40, device="cuda", dtype=torch.int32).view(1, -1)
+    token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    sequence_lengths = torch.tensor([320], device="cuda", dtype=torch.int32)
+    query_positions = torch.arange(
+        320 - num_rows,
+        320,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    compress_ratio = 4
+    visible_lengths = (query_positions + 1) // compress_ratio
+
+    actual, actual_visible_blocks = qsa_ops.qsa_mqa_paged(
+        q,
+        cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio=compress_ratio,
+    )
+    expected = _qsa_mqa_paged_reference(
+        q, cache, page_table, token_to_req, visible_lengths
+    )
+
+    torch.testing.assert_close(actual_visible_blocks, visible_lengths)
+    columns = torch.arange(actual.shape[1], device=actual.device)
+    visible = columns[None, :] < actual_visible_blocks[:, None]
+    torch.testing.assert_close(actual[visible], expected[visible], rtol=1e-3, atol=1e-3)
+
+
+@requires_qsa_kernels
 def test_qsa_block_expansion_matches_test_reference() -> None:
     blocks = torch.tensor([[0, -1], [1, 0]], device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([5, 10], device="cuda")

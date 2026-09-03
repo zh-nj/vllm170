@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -364,72 +365,86 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
-        selected = self.indexer(
-            hidden_states,
-            positions,
-            self.topk_indices_buffer[:num_tokens],
-        )
+        with optional_phase_profile_stage("qsa.indexer", hidden_states, level="detail"):
+            selected = self.indexer(
+                hidden_states,
+                positions,
+                self.topk_indices_buffer[:num_tokens],
+            )
         if selected.shape != (
             num_tokens,
             self.indexer.output_width,
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
-        impl.forward_qsa(
-            self,
-            query,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata,
-            output,
-            token_to_req=side_metadata.token_to_req,
-        )
+        with optional_phase_profile_stage("qsa.kv_update", key, level="detail"):
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
+        with optional_phase_profile_stage(
+            "qsa.sparse_attention", query, level="detail"
+        ):
+            impl.forward_qsa(
+                self,
+                query,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+            )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        with optional_phase_profile_stage(
+            "qsa.qkv_projection", hidden_states, level="stage"
+        ):
+            qkv, _ = self.qkv_proj(hidden_states)
+        with optional_phase_profile_stage("qsa.qk_norm_rope", qkv, level="stage"):
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
-        if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
-        else:
-            qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
+        with optional_phase_profile_stage("qsa.transaction", query, level="stage"):
+            if current_platform.opaque_attention_op():
+                torch.ops.vllm.qwen4_exp_qsa_with_output(
+                    hidden_states,
+                    positions,
+                    query,
+                    key,
+                    value,
+                    attn_output,
+                    encoded_layer_name,
+                )
+            else:
+                qwen4_exp_qsa_with_output(
+                    hidden_states,
+                    positions,
+                    query,
+                    key,
+                    value,
+                    attn_output,
+                    encoded_layer_name,
+                )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
-            flat_output = flat_output * torch.sigmoid(gate)
-        output, _ = self.o_proj(flat_output)
+            with optional_phase_profile_stage("qsa.gate", gate, level="detail"):
+                flat_output = flat_output * torch.sigmoid(gate)
+        with optional_phase_profile_stage(
+            "qsa.output_projection", flat_output, level="stage"
+        ):
+            output, _ = self.o_proj(flat_output)
         return output
 
 

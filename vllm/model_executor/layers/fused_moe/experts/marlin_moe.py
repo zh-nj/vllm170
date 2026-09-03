@@ -274,57 +274,63 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
-    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
-        gate_up_input,
-        intermediate_cache1,
-        w1,
-        bias1,
-        w1_scale,
-        a_scales1,
-        global_scale1,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=num_topk,
-        mul_topk_weights=apply_router_weight_on_input,
-        b_q_type=quant_type,
-        size_m=M,
-        size_n=w13_num_shards * N,
-        size_k=K,
-        is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
+    with optional_phase_profile_stage(
+        "moe.marlin.w13_gemm", hidden_states, extra=profile_extra
+    ):
+        intermediate_cache1 = ops.moe_wna16_marlin_gemm(
+            gate_up_input,
+            intermediate_cache1,
+            w1,
+            bias1,
+            w1_scale,
+            a_scales1,
+            global_scale1,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=num_topk,
+            mul_topk_weights=apply_router_weight_on_input,
+            b_q_type=quant_type,
+            size_m=M,
+            size_n=w13_num_shards * N,
+            size_k=K,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
     activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
-    if activation_func is None:
-        config = (
-            ApplyMoEActivationConfig()
-            if activation_config is None
-            else activation_config
-        )
-        apply_moe_activation(
-            activation,
-            intermediate_cache2,
-            activation_input,
-            activation_config=config,
-            topk_ids=topk_ids,
-            expert_map=expert_map,
-        )
-    else:
-        activation_func(
-            activation,
-            intermediate_cache2,
-            activation_input,
-            topk_ids=topk_ids,
-            expert_map=expert_map,
-        )
+    with optional_phase_profile_stage(
+        "moe.marlin.activation", activation_input, extra=profile_extra
+    ):
+        if activation_func is None:
+            config = (
+                ApplyMoEActivationConfig()
+                if activation_config is None
+                else activation_config
+            )
+            apply_moe_activation(
+                activation,
+                intermediate_cache2,
+                activation_input,
+                activation_config=config,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
+        else:
+            activation_func(
+                activation,
+                intermediate_cache2,
+                activation_input,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
 
     if output is None:
         output = intermediate_cache3

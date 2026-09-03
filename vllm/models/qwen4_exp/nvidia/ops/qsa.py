@@ -9,6 +9,7 @@ import math
 import torch
 
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -115,6 +116,125 @@ def _qsa_mqa_paged_kernel(
             logits_ptr + row * stride_logits_row + columns,
             tl.where(page_valid, score, -float("inf")),
             mask=live & (columns < num_columns),
+        )
+
+
+@triton.jit
+def _qsa_mqa_paged_single_request_prefill_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TILES_PER_PROG: tl.constexpr,
+    STAGES: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    row_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    request = tl.load(
+        token_to_req_ptr + row_offsets, mask=row_offsets < num_rows, other=-1
+    )
+    row_valid = (row_offsets < num_rows) & (request == 0)
+    query_positions = tl.load(
+        query_positions_ptr + row_offsets,
+        mask=row_valid,
+        other=-1,
+    )
+    sequence_length = tl.load(sequence_lengths_ptr)
+    visible = tl.where(
+        row_valid,
+        tl.minimum(
+            (query_positions + 1) // COMPRESS_RATIO,
+            sequence_length // COMPRESS_RATIO,
+        ),
+        0,
+    )
+    if tl.program_id(1) == 0:
+        tl.store(visible_blocks_ptr + row_offsets, visible, mask=row_offsets < num_rows)
+
+    tile_start = tl.program_id(1) * TILES_PER_PROG
+    max_visible = tl.max(visible, axis=0)
+    if tile_start * BLOCK_N >= max_visible:
+        return
+    tile_end = tl.minimum(tile_start + TILES_PER_PROG, tl.cdiv(max_visible, BLOCK_N))
+    tile_end = tl.minimum(tile_end, tl.cdiv(num_columns, BLOCK_N))
+
+    # Pack 32 rows x 4 heads into the tensor-core N dimension and reuse K.
+    packed = tl.arange(0, BLOCK_M * NUM_HEADS)
+    packed_rows = tl.program_id(0) * BLOCK_M + packed // NUM_HEADS
+    packed_heads = packed % NUM_HEADS
+    packed_request = tl.load(
+        token_to_req_ptr + packed_rows,
+        mask=packed_rows < num_rows,
+        other=-1,
+    )
+    dims = tl.arange(0, BLOCK_D)
+    query = tl.load(
+        q_ptr
+        + packed_rows[None, :] * stride_q_row
+        + packed_heads[None, :] * stride_q_head
+        + dims[:, None] * stride_q_dim,
+        mask=(packed_rows[None, :] < num_rows)
+        & (packed_request[None, :] == 0)
+        & (dims[:, None] < HEAD_DIM),
+        other=0.0,
+    )
+    column_offsets = tl.arange(0, BLOCK_N)
+    for tile in tl.range(tile_start, tile_end, num_stages=STAGES):
+        columns = tile * BLOCK_N + column_offsets
+        live = columns < max_visible
+        logical_page = tl.minimum(columns // PAGE_SIZE, PAGE_TABLE_WIDTH - 1)
+        page_offset = columns % PAGE_SIZE
+        physical_page = tl.load(
+            page_table_ptr + logical_page * stride_table_page,
+            mask=live,
+            other=-1,
+        )
+        page_valid = live & (physical_page >= 0) & (physical_page < num_pages)
+        safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
+        keys = tl.load(
+            k_cache_ptr
+            + safe_physical_page[:, None] * stride_cache_block
+            + page_offset[:, None] * stride_cache_token
+            + dims[None, :] * stride_cache_dim,
+            mask=page_valid[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        scores = tl.dot(keys, query, out_dtype=tl.float32)
+        scores = tl.reshape(scores, (BLOCK_N, BLOCK_M, NUM_HEADS))
+        scores = tl.sum(tl.maximum(scores, 0.0), axis=2) / score_divisor
+        output_valid = (
+            page_valid[:, None]
+            & row_valid[None, :]
+            & (columns[:, None] < visible[None, :])
+        )
+        tl.store(
+            logits_ptr + columns[:, None] + row_offsets[None, :] * stride_logits_row,
+            tl.where(output_valid, scores, -float("inf")),
+            mask=output_valid,
         )
 
 
@@ -637,6 +757,58 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    use_single_request_prefill = (
+        page_table.shape[0] == 1
+        and q.shape[0] >= 64
+        and q.shape[1:] == (4, 128)
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+        and current_platform.is_device_capability(80)
+    )
+    if use_single_request_prefill:
+        block_m = 32
+        block_n = 64
+        tiles_per_program = 4
+        block_d = 128
+        _qsa_mqa_paged_single_request_prefill_kernel[
+            (
+                triton.cdiv(q.shape[0], block_m),
+                triton.cdiv(columns, block_n * tiles_per_program),
+            )
+        ](
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible_blocks,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(1),
+            logits.stride(0),
+            q.shape[0],
+            columns,
+            k_cache.shape[0],
+            float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=4,
+            HEAD_DIM=128,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_d,
+            TILES_PER_PROG=tiles_per_program,
+            STAGES=2,
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=8,
+        )
+        return logits, visible_blocks
     BLOCK_N = 64
     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
@@ -775,15 +947,18 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        logits, visible_blocks = qsa_mqa_paged(
-            q[row_slice],
-            k_cache,
-            page_table,
-            token_to_req[row_slice],
-            query_positions[row_slice],
-            sequence_lengths,
-            compress_ratio,
-        )
+        with optional_phase_profile_stage(
+            "qsa.indexer.score", q[row_slice], level="detail"
+        ):
+            logits, visible_blocks = qsa_mqa_paged(
+                q[row_slice],
+                k_cache,
+                page_table,
+                token_to_req[row_slice],
+                query_positions[row_slice],
+                sequence_lengths,
+                compress_ratio,
+            )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
             blocks.shape[0] <= 32
@@ -796,16 +971,25 @@ def qsa_select_paged_tokens(
             if use_cooperative_topk
             else torch.ops._C.persistent_topk
         )
-        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
-        expand_qsa_block_indices_cuda(
-            blocks,
-            query_positions[row_slice],
-            sequence_lengths,
-            token_to_req[row_slice],
-            compress_ratio,
-            token_topk,
-            out[row_slice],
-        )
+        with optional_phase_profile_stage("qsa.indexer.topk", logits, level="detail"):
+            topk_op(
+                logits,
+                visible_blocks,
+                blocks,
+                topk_workspace,
+                block_topk,
+                columns,
+            )
+        with optional_phase_profile_stage("qsa.indexer.expand", blocks, level="detail"):
+            expand_qsa_block_indices_cuda(
+                blocks,
+                query_positions[row_slice],
+                sequence_lengths,
+                token_to_req[row_slice],
+                compress_ratio,
+                token_topk,
+                out[row_slice],
+            )
     return out
 
 

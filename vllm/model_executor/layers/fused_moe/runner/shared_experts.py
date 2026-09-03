@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.torch_utils import (
     aux_stream,
     current_stream,
@@ -149,14 +150,20 @@ class SharedExperts(torch.nn.Module):
         self._input_ready_event[idx].record(current_stream())
         with torch.cuda.stream(self._stream):
             self._input_ready_event[idx].wait(self._stream)
-            self._output[idx] = self._layer(shared_experts_input)
+            with optional_phase_profile_stage(
+                "moe.shared_experts", shared_experts_input
+            ):
+                self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
         return True
 
     def wait(self) -> None:
         """Block the main stream until `maybe_forward_async` output is ready."""
         assert self._stream is not None
-        self._output_ready_event[self._output_idx].wait(current_stream())
+        output = self._output[self._output_idx]
+        assert output is not None
+        with optional_phase_profile_stage("moe.shared_experts.wait", output):
+            self._output_ready_event[self._output_idx].wait(current_stream())
 
     @property
     def _output_idx(self) -> int:
@@ -181,6 +188,7 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        self._output[self._output_idx] = self._layer(shared_experts_input)
+        with optional_phase_profile_stage("moe.shared_experts", shared_experts_input):
+            self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None

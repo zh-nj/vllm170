@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -1277,25 +1278,37 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
-        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
-        key, _ = self.key_proj(embeddings)
-        value, _ = self.value_proj(embeddings)
+        with optional_phase_profile_stage(
+            "ple.lookup_total", hidden_states, level="stage"
+        ):
+            embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+            embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        with optional_phase_profile_stage(
+            "ple.key_value_projection", embeddings, level="stage"
+        ):
+            key, _ = self.key_proj(embeddings)
+            value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
-        key = self._apply_norm(self.norm_key, key)
-        query = self._apply_norm(self.norm_query, query)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated_value = gate * value.unsqueeze(-2)
-        normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+        with optional_phase_profile_stage(
+            "ple.norm_gate", hidden_states, level="stage"
+        ):
+            key = self._apply_norm(self.norm_key, key)
+            query = self._apply_norm(self.norm_query, query)
+            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated_value = gate * value.unsqueeze(-2)
+            normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
         conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv(
-            normalized,
-            conv_output,
-            self.prefix,
-        )
+        with optional_phase_profile_stage(
+            "ple.short_conv_total", normalized, level="stage"
+        ):
+            torch.ops.vllm.qwen4_exp_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
         return gated_value.flatten(-2) + conv_output
 
 
@@ -1308,12 +1321,13 @@ def qwen4_exp_compute_ple_ngram_ids(
 ) -> None:
     """Compute request-dependent PLE n-gram IDs outside piecewise graphs."""
     layer = get_forward_context().no_compile_layers[layer_name]
-    ngram_ids = layer.ple_embedding.compute_ngram_ids(
-        input_ids,
-        query_start_loc,
-        ngram_context,
-    )
-    output.copy_(ngram_ids)
+    with optional_phase_profile_stage("ple.ngram_ids", input_ids, level="detail"):
+        ngram_ids = layer.ple_embedding.compute_ngram_ids(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+        output.copy_(ngram_ids)
 
 
 def qwen4_exp_compute_ple_ngram_ids_fake(
@@ -1335,24 +1349,25 @@ def qwen4_exp_cpu_ple_embedding(
     layer = get_forward_context().no_compile_layers[layer_name]
     embedding = layer.ple_embedding.ngram_embedding
     weight = embedding.weight
-    if (
-        weight.is_pinned()
-        and ngram_ids.is_cuda
-        and weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)
-    ):
-        weight_scale = layer._get_embedding_weight_scale()
-        scale = 1.0 if weight_scale is None else float(weight_scale.item())
-        gather_pinned_ple_embedding(
-            weight,
-            ngram_ids,
-            output,
-            vocab_start=embedding.shard_indices.org_vocab_start_index,
-            vocab_end=embedding.shard_indices.org_vocab_end_index,
-            scale=scale,
-        )
-        return
-    embeddings = embedding(ngram_ids.cpu())
-    output.copy_(layer._dequantize_embeddings(embeddings, output.dtype))
+    with optional_phase_profile_stage("ple.cpu_embedding", ngram_ids, level="detail"):
+        if (
+            weight.is_pinned()
+            and ngram_ids.is_cuda
+            and weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        ):
+            weight_scale = layer._get_embedding_weight_scale()
+            scale = 1.0 if weight_scale is None else float(weight_scale.item())
+            gather_pinned_ple_embedding(
+                weight,
+                ngram_ids,
+                output,
+                vocab_start=embedding.shard_indices.org_vocab_start_index,
+                vocab_end=embedding.shard_indices.org_vocab_end_index,
+                scale=scale,
+            )
+            return
+        embeddings = embedding(ngram_ids.cpu())
+        output.copy_(layer._dequantize_embeddings(embeddings, output.dtype))
 
 
 def qwen4_exp_cpu_ple_embedding_fake(
@@ -1369,8 +1384,9 @@ def qwen4_exp_ple_short_conv(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    result = layer._short_conv(inputs)
-    output[: result.shape[0]].copy_(result)
+    with optional_phase_profile_stage("ple.short_conv", inputs, level="detail"):
+        result = layer._short_conv(inputs)
+        output[: result.shape[0]].copy_(result)
 
 
 def qwen4_exp_ple_short_conv_fake(

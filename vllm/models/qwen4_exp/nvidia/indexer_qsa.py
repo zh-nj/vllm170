@@ -15,6 +15,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -227,7 +228,10 @@ class QSAIndexer(nn.Module):
         positions = positions[..., :num_tokens]
 
         # Q/K projection
-        projected_qk, _ = self.index_qk_proj(hidden_states)
+        with optional_phase_profile_stage(
+            "qsa.indexer.projection", hidden_states, level="detail"
+        ):
+            projected_qk, _ = self.index_qk_proj(hidden_states)
         projected_q, raw_keys = projected_qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -244,31 +248,34 @@ class QSAIndexer(nn.Module):
                 self.index_n_heads,
                 self.index_head_dim,
             )
-            qsa_pre_indexer(
-                projected_q,
-                raw_keys,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.q_layernorm.weight,
-                self.k_layernorm.weight,
-                self.q_layernorm.variance_epsilon,
-                q,
-                raw_key_state_cache.kv_cache,
-                raw_metadata.slot_mapping,
-                raw_metadata.block_table,
-                raw_metadata.query_start_loc,
-                raw_metadata.logical_positions,
-                compressed_key_cache,
-                compressed_metadata.slot_mapping,
-                compressed_metadata.k_work_metadata,
-                compress_ratio=self.compress_ratio,
-                mrope_section=getattr(self.rotary_emb, "mrope_section", None),
-                rope_pos_offset=(
-                    raw_key_state_cache.rope_position_offset
-                    if raw_key_state_cache.rope_position_cache is not None
-                    else None
-                ),
-            )
+            with optional_phase_profile_stage(
+                "qsa.indexer.pre_indexer", projected_q, level="detail"
+            ):
+                qsa_pre_indexer(
+                    projected_q,
+                    raw_keys,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.q_layernorm.weight,
+                    self.k_layernorm.weight,
+                    self.q_layernorm.variance_epsilon,
+                    q,
+                    raw_key_state_cache.kv_cache,
+                    raw_metadata.slot_mapping,
+                    raw_metadata.block_table,
+                    raw_metadata.query_start_loc,
+                    raw_metadata.logical_positions,
+                    compressed_key_cache,
+                    compressed_metadata.slot_mapping,
+                    compressed_metadata.k_work_metadata,
+                    compress_ratio=self.compress_ratio,
+                    mrope_section=getattr(self.rotary_emb, "mrope_section", None),
+                    rope_pos_offset=(
+                        raw_key_state_cache.rope_position_offset
+                        if raw_key_state_cache.rope_position_cache is not None
+                        else None
+                    ),
+                )
         else:
             # Unfused reference path
             from flashinfer.norm import gemma_rmsnorm
@@ -340,17 +347,18 @@ class QSAIndexer(nn.Module):
             return out
 
         # Score compressed keys, select blocks, then expand them to token indices.
-        return qsa_select_paged_tokens(
-            q,
-            compressed_key_cache,
-            compressed_metadata.block_table,
-            compressed_metadata.token_to_req,
-            compressed_metadata.logical_positions,
-            compressed_metadata.seq_lens,
-            self.token_topk,
-            self.compress_ratio,
-            out,
-        )
+        with optional_phase_profile_stage("qsa.indexer.select", q, level="detail"):
+            return qsa_select_paged_tokens(
+                q,
+                compressed_key_cache,
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions,
+                compressed_metadata.seq_lens,
+                self.token_topk,
+                self.compress_ratio,
+                out,
+            )
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]
