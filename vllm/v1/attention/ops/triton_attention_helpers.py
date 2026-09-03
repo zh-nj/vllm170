@@ -157,6 +157,7 @@ def compute_tile_loop_bounds(
     USE_PER_SEQ_CAUSAL: tl.constexpr = False,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    USE_DFLASH_BLOCK: tl.constexpr = False,
 ):
     """Compute the tile-loop bounds ``(loop_lo, loop_hi)`` and the
     derived ``max_seq_prefix_len`` used for per-tile masking.
@@ -198,32 +199,32 @@ def compute_tile_loop_bounds(
     # Default: keep previous global behavior
     tile_start = 0
     tile_end = num_tiles
-    # TODO(Isotr0py): sliding window pruning with image bidirectional mask
+    # DFlash uses a block-anchored history window plus the complete query suffix.
     if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
-        # Query rows covered by this Q-block
-        qpos_lo = q_block_local_idx * BLOCK_Q
-        qpos_hi = tl.minimum(
-            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
-            cur_batch_query_len - 1,
-        )
-        # For sliding window, each query position q can only attend to
-        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
-        # where q_abs = context_len + q
-        # The union of allowed key positions for this Q-block is:
-        # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
-        q_abs = context_len + qpos_lo
-        if CHUNK_LOOKBACK > -1:
-            first_allowed_key = ((q_abs // CHUNK_SIZE) - CHUNK_LOOKBACK) * CHUNK_SIZE
+        if USE_DFLASH_BLOCK:
+            first_allowed_key = context_len - SLIDING_WINDOW
+            last_allowed_key = seq_len - 1
         else:
-            first_allowed_key = q_abs - SLIDING_WINDOW + 1
-        if USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
-            # Non-causal: keys can be AHEAD of query within the window
-            last_allowed_key = tl.minimum(
-                context_len + qpos_hi + SLIDING_WINDOW - 1,
-                seq_len - 1,
+            # Query rows covered by this Q-block
+            qpos_lo = q_block_local_idx * BLOCK_Q
+            qpos_hi = tl.minimum(
+                qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+                cur_batch_query_len - 1,
             )
-        else:
-            last_allowed_key = context_len + qpos_hi
+            q_abs = context_len + qpos_lo
+            if CHUNK_LOOKBACK > -1:
+                first_allowed_key = (
+                    (q_abs // CHUNK_SIZE) - CHUNK_LOOKBACK
+                ) * CHUNK_SIZE
+            else:
+                first_allowed_key = q_abs - SLIDING_WINDOW + 1
+            if USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
+                last_allowed_key = tl.minimum(
+                    context_len + qpos_hi + SLIDING_WINDOW - 1,
+                    seq_len - 1,
+                )
+            else:
+                last_allowed_key = context_len + qpos_hi
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -287,6 +288,8 @@ def compute_kv_seq_mask(
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    USE_DFLASH_BLOCK: tl.constexpr = False,
+    dflash_context_len=0,
 ):
     """Build the KV mask for one tile.
 
@@ -326,14 +329,21 @@ def compute_kv_seq_mask(
             <= CHUNK_LOOKBACK
         )
     elif SLIDING_WINDOW > 0 and not USE_R_SWA:
-        sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
-        if USE_PER_SEQ_CAUSAL:
+        if USE_DFLASH_BLOCK:
+            history_start = dflash_context_len - SLIDING_WINDOW
+            seq_mask = (seq_offset[None, :] >= history_start) & (
+                seq_offset[None, :] < seq_len
+            )
+        elif USE_PER_SEQ_CAUSAL:
+            sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
             sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
             seq_mask = seq_mask & tl.where(is_causal, sw_left, sw_left & sw_right)
         elif not USE_CAUSAL:
+            sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
             sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
             seq_mask = seq_mask & sw_left & sw_right
         else:
+            sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
             seq_mask = seq_mask & sw_left
 
     if USE_R_SWA:

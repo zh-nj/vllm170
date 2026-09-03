@@ -8,6 +8,7 @@ VLLM_BIN=${VLLM_BIN:-${REPO_ROOT}/.venv/bin/vllm}
 MODEL_DIR=${MODEL_DIR:-/media/z/data6/models/GLM-5.3-Flash-EXL3-TR3-4bpw}
 EXL3_EXTENSION_DIR=${EXL3_EXTENSION_DIR:-/media/z/data6/.cache/vllm170/exllamav3_ext}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-${REPO_ROOT}/chat_templates/glm53-enable-thinking-switch.jinja}
+DFLASH_MODEL_DIR=${DFLASH_MODEL_DIR:-}
 
 if [[ ! -x "${VLLM_BIN}" ]]; then
     echo "vLLM executable not found: ${VLLM_BIN}" >&2
@@ -35,6 +36,20 @@ for shard in $(seq 1 120); do
     fi
 done
 
+SPECULATIVE_ARGS=()
+if [[ -n "${DFLASH_MODEL_DIR}" ]]; then
+    if [[ ! -f "${DFLASH_MODEL_DIR}/config.json" ]]; then
+        echo "Invalid GLM-5.3 DFlash2 model directory: ${DFLASH_MODEL_DIR}" >&2
+        exit 2
+    fi
+    DFLASH_NUM_SPECULATIVE_TOKENS=${DFLASH_NUM_SPECULATIVE_TOKENS:-2}
+    DFLASH_KV_CACHE_DTYPE=${DFLASH_KV_CACHE_DTYPE:-auto}
+    SPECULATIVE_ARGS=(
+        --speculative-config
+        "{\"method\":\"dflash\",\"model\":\"${DFLASH_MODEL_DIR}\",\"num_speculative_tokens\":${DFLASH_NUM_SPECULATIVE_TOKENS},\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"${DFLASH_KV_CACHE_DTYPE}\"}"
+    )
+fi
+
 export CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-PCI_BUS_ID}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,4,5}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
@@ -57,6 +72,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-256}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.94}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
 
 exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
@@ -69,7 +85,7 @@ exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-    --kv-cache-dtype auto \
+    --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --attention-backend TRITON_MLA_SPARSE_SM80 \
     --language-model-only \
     --skip-mm-profiling \
@@ -82,4 +98,5 @@ exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --reasoning-parser glm45 \
     --tool-call-parser glm47 \
     --enable-auto-tool-choice \
+    "${SPECULATIVE_ARGS[@]}" \
     "$@"

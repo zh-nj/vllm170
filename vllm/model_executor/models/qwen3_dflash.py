@@ -76,22 +76,42 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
 
 
 def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's RoPE layout, from its first attention layer.
+    """The target's primary-attention RoPE layout.
 
     A DFlash head must rotate Q/K the way the target it was distilled against
     does, and a mismatch is silent — acceptance collapses but nothing errors and
     the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no RoPE.
+    from the target. None if the target uses no primary-attention RoPE.
+
+    Sparse-MLA targets can still own auxiliary indexer RoPE modules. Only a
+    module installed as ``rotary_emb`` describes the target attention layout;
+    names such as ``indexer_rope_emb`` must not override the draft default.
     """
     language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    for module in language_model.modules():
+    auxiliary: list[tuple[str, bool]] = []
+    for name, module in language_model.named_modules():
         style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
+        if not isinstance(style, bool):
+            continue
+        if name.rsplit(".", 1)[-1] == "rotary_emb":
+            logger.info(
+                "Resolved DFlash RoPE layout from target primary attention "
+                "module %s: is_neox_style=%s",
+                name,
+                style,
+            )
             return style
+        auxiliary.append((name, style))
+    if auxiliary:
+        logger.info(
+            "Target has no primary-attention rotary_emb; ignoring auxiliary "
+            "RoPE modules for DFlash layout: %s",
+            auxiliary,
+        )
     return None
 
 
@@ -255,6 +275,7 @@ class DFlashQwen3Attention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
             sinks=self.attention_sink_bias,
+            dflash_block_attention=(not causal and sliding_window is not None),
         )
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -714,9 +735,15 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        # The draft is a local single-stage model hosted by the last target PP
+        # worker. Do not apply the target's four-stage layer partition when
+        # deriving its layer-name offset.
+        if vllm_config.parallel_config.pipeline_parallel_size == 1:
+            target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+        else:
+            target_layer_num = vllm_config.model_config.get_num_layers(
+                vllm_config.parallel_config
+            )
         self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),

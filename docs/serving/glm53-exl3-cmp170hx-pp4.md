@@ -57,7 +57,21 @@ curl http://127.0.0.1:8099/v1/chat/completions \
   }'
 ```
 
-The launcher deliberately does not enable the reference fork's optional
-DFlash2 draft model, Marlin sidecars, online FP8 conversion, or CUDA graphs.
-Those are throughput optimizations with additional artifacts and should be
-enabled only after the stock EXL3 PP4 path has passed correctness checks.
+## DFlash2 with FP8 target KV cache
+
+The dedicated launcher combines the EXL3 target with the local DFlash2 draft
+checkpoint and stores the target sparse-MLA cache as E4M3 FP8:
+
+```bash
+scripts/serve_glm53_exl3_dflash2_cmp170hx_pp4.sh
+```
+
+It uses DFlash2 `k=2`, probabilistic draft sampling, and the Triton attention
+backend. The small DFlash2 sliding-attention cache remains BF16 because native
+FP8 conversion in `TRITON_ATTN` requires SM89; the large target sparse-MLA cache
+uses the SM80 software E4M3 decode path. Override either choice explicitly with
+`KV_CACHE_DTYPE` or `DFLASH_KV_CACHE_DTYPE`.
+
+The launchers do not require the reference fork's optional Marlin sidecars or
+CUDA graphs. Those can be enabled separately after the baseline configuration
+passes correctness checks.

@@ -1537,7 +1537,7 @@ class SpeculativeConfig:
 
                 draft_pipeline_parallel_size = (
                     1
-                    if self.method == "dspark"
+                    if self.method in ("dflash", "dspark")
                     else self.target_parallel_config.pipeline_parallel_size
                 )
                 self.draft_parallel_config = (

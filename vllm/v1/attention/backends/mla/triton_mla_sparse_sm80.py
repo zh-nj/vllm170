@@ -30,7 +30,12 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
 
 class TritonMLASparseSM80Backend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -77,8 +82,8 @@ class TritonMLASparseSM80Backend(AttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if kv_cache_dtype not in (None, "auto", "bfloat16"):
-            return "SM80 sparse MLA requires a BF16 KV cache"
+        if kv_cache_dtype not in (None, *cls.supported_kv_cache_dtypes):
+            return "SM80 sparse MLA supports BF16 and E4M3 FP8 KV cache"
         return None
 
 
@@ -125,8 +130,10 @@ class TritonMLASparseSM80Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             raise NotImplementedError(
                 "SM80 sparse MLA currently supports rope-free 512-wide GLM MLA"
             )
-        if kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("SM80 sparse MLA requires a BF16 KV cache")
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError(
+                "SM80 sparse MLA supports BF16 and E4M3 FP8 KV cache"
+            )
         if any((alibi_slopes, sliding_window, logits_soft_cap)):
             raise NotImplementedError(
                 "SM80 sparse MLA does not support alibi, sliding window, or softcap"
@@ -177,5 +184,6 @@ class TritonMLASparseSM80Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             rope_head_dim=self.qk_rope_head_dim,
             attn_sink=None,
             output=out,
+            kv_scale=layer._k_scale,
         )
         return out, None
