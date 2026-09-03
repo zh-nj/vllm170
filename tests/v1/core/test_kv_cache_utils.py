@@ -229,8 +229,10 @@ def test_glm5_next_kv_cache_layout_supports_pp4(monkeypatch):
     """Each PP4 stage retains a valid MLA/indexer/KDA shared-cache layout."""
     monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "13,11,11,10")
+    model_config = ModelConfig(max_model_len=8192)
+    model_config.hf_config.model_type = "glm5_next"
     vllm_config = VllmConfig(
-        model_config=ModelConfig(max_model_len=8192),
+        model_config=model_config,
         parallel_config=ParallelConfig(pipeline_parallel_size=4),
     )
     specs: dict[str, KVCacheSpec] = {}

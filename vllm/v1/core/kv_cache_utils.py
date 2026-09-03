@@ -1159,6 +1159,14 @@ def _get_kv_cache_groups_glm5_next(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Build GLM-5.3 groups with Mamba/MLA and tail/indexer aliasing."""
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) not in {
+        "glm5_next",
+        "glm5_next_text",
+    }:
+        return None
+
     mamba_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
