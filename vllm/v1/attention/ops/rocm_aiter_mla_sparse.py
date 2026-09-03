@@ -3062,6 +3062,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             part_m,
             part_l,
             part_acc,
+            fp8_lut,
             q.stride(0),
             q.stride(1),
             main_cache.stride(0),

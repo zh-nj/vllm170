@@ -11,6 +11,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 logger = init_logger(__name__)
 
 
+def _is_materialized_embedding(module: nn.Module | None) -> bool:
+    return getattr(module, "weight", None) is not None
+
+
 def _resolve_dspark_attention_backend(
     draft_model_config: ModelConfig,
     draft_backend: AttentionBackendEnum | None,
@@ -90,7 +94,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
     if (
-        target_embed is not None
+        _is_materialized_embedding(target_embed)
         and draft_model_config.get_vocab_size() <= target_vocab_size
         and _should_share(
             draft_model, "has_own_embed_tokens", draft_embed, target_embed
@@ -99,7 +103,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_embed is not None:
             del draft_inner.embed_tokens
         draft_inner.embed_tokens = target_embed
-    elif is_pp and getattr(draft_embed, "weight", None) is None:
+    elif is_pp and not _is_materialized_embedding(draft_embed):
         raise RuntimeError(
             "DSpark+PP requires a materialized draft embedding on the last "
             "pipeline rank."

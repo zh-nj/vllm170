@@ -12,6 +12,19 @@ them.
 benchmarks/deepseek_v4/run_cmp170hx_pp3.sh
 ```
 
+For `DeepSeek-V4-Flash-Vision-Exp`, use the PP3 vision preset:
+
+```bash
+benchmarks/deepseek_v4/run_cmp170hx_pp3_vision.sh
+```
+
+It selects the local vision checkpoint when present, serves it as
+`dsv4-vision`, and defaults DSpark to three speculative tokens because the
+checkpoint contains three reusable draft blocks. The underlying PP3/SM80
+settings remain identical to the text launcher, including physical GPUs
+`1,2,3`, partition `15,15,13`, FP8 KV cache, and the Triton sparse-MLA path.
+Override `DSV4_DSPARK_TOKENS` only with 3 or a larger multiple of 3.
+
 The defaults are the measured three-card configuration:
 
 - physical GPUs `1,2,3`, PP3 with `15,15,13` layers and TP1;

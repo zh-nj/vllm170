@@ -47,7 +47,6 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -852,7 +851,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.propose(
                     input_batch=input_batch,
@@ -1771,7 +1771,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
                     )
-            if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
+            if (
+                inputs_embeds is not None
+                and not self.model_config.requires_raw_input_tokens
+            ):
                 input_ids = None
 
         with phase_profile_stage(
@@ -1791,7 +1794,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             }
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
+                if not self.model_config.requires_raw_input_tokens:
+                    model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
 
                 # Prepare the intermediate tensors.
@@ -2034,7 +2038,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,

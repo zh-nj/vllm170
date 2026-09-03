@@ -148,8 +148,10 @@ def _reference(
 def test_fused_indexer_q_rope_quant_matches_unfused(
     num_tokens, cache_dtype, use_fp4, use_cutedsl
 ):
-    if use_cutedsl and not has_cutedsl():
-        pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and (
+        not has_cutedsl() or not current_platform.has_device_capability(90)
+    ):
+        pytest.skip("cutedsl indexer requires SM90+ and the cutlass package")
 
     device = "cuda"
     torch.manual_seed(0)

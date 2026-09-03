@@ -534,7 +534,8 @@ class ModelCudaGraphManager(CudaGraphManager):
             }
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
+                if not model_state.model_config.requires_raw_input_tokens:
+                    model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]

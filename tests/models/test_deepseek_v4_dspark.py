@@ -9,8 +9,12 @@ import torch
 import torch.nn as nn
 
 from vllm.config import SpeculativeConfig
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import _needs_pre_hc_hidden_states
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    _is_materialized_embedding,
+)
 
 
 def _make_draft(confidence_head: nn.Module | None) -> DSparkDeepseekV4ForCausalLM:
@@ -85,3 +89,8 @@ def test_pre_hc_hidden_states_skip_dspark_only() -> None:
     assert not _needs_pre_hc_hidden_states(cast(SpeculativeConfig, dspark))
     assert _needs_pre_hc_hidden_states(cast(SpeculativeConfig, mtp))
     assert _needs_pre_hc_hidden_states(cast(SpeculativeConfig, generic_draft))
+
+
+def test_pp_missing_layer_is_not_a_materialized_embedding() -> None:
+    assert _is_materialized_embedding(torch.nn.Embedding(4, 8))
+    assert not _is_materialized_embedding(PPMissingLayer())

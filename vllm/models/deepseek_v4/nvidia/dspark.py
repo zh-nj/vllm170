@@ -337,7 +337,7 @@ def _insert_context_kv(
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # non-PP loads alias the target while PP loads a private embedding copy.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -429,8 +429,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        Non-mtp weights belong to the target model and are normally skipped.
+        ``embed_tokens``/``lm_head`` are aliased from the target except that PP
+        loads a private embedding copy on the last rank.
         """
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe

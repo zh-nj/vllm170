@@ -231,8 +231,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_reqs,
                 self.max_num_tokens,
                 self.max_model_len,
+                self.block_tables.cp_rank,
                 SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
                 PAD_SLOT_ID=PAD_SLOT_ID,
+                CP_SIZE=self.block_tables.cp_size,
+                CP_INTERLEAVE=self.block_tables.cp_interleave,
                 BLOCK_SIZE=block_tokens,
             )
 
