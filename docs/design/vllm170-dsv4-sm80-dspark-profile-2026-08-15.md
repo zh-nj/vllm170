@@ -29,7 +29,7 @@ DSpark 内部优化顺序为：
 
 | 项目 | 配置 |
 | --- | --- |
-| 模型 | `/mnt/data6/models/DeepSeek-V4-Flash-0731` |
+| 模型 | `/media/z/data6/models/DeepSeek-V4-Flash-0731` |
 | GPU | 3 x NVIDIA CMP170HX，SM80，PP3/TP1 |
 | target 层分配 | PP0/PP1/PP2 = 15/15/13 |
 | draft | PP2 上完整 3 层，7 个 speculative tokens |

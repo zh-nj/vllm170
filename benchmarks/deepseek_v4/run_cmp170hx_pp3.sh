@@ -8,7 +8,6 @@ VLLM_BIN=${VLLM_BIN:-${REPO_ROOT}/.venv/bin/vllm}
 
 if [[ -z "${DSV4_MODEL_DIR:-}" ]]; then
     for candidate in \
-        /mnt/data6/models/DeepSeek-V4-Flash-0731 \
         /media/z/data6/models/DeepSeek-V4-Flash-0731; do
         if [[ -d "${candidate}" ]]; then
             DSV4_MODEL_DIR=${candidate}

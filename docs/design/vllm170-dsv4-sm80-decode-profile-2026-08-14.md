@@ -30,7 +30,7 @@
 
 | 项目 | 配置 |
 | --- | --- |
-| 模型 | `/mnt/data6/models/DeepSeek-V4-Flash-0731` |
+| 模型 | `/media/z/data6/models/DeepSeek-V4-Flash-0731` |
 | GPU | 3 x NVIDIA CMP170HX，SM80，PP3/TP1 |
 | 层分配 | PP0/PP1/PP2 = 15/15/13 |
 | 上下文与输出 | 32,000 prompt tokens，64 output tokens，3 repeats |

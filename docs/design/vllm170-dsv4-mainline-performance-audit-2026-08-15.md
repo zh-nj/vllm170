@@ -6,7 +6,7 @@
 
 部署：3 x CMP170HX、PP3/TP1、TRITON_MLA_SPARSE_DSV4、Marlin、DSpark-7
 
-模型：`/mnt/data6/models/DeepSeek-V4-Flash-0731`
+模型：`/media/z/data6/models/DeepSeek-V4-Flash-0731`
 
 ## 结论
 

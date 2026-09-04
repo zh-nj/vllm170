@@ -6,7 +6,6 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ -z "${DSV4_MODEL_DIR:-}" ]]; then
     for candidate in \
-        /mnt/data6/models/DeepSeek-V4-Flash-Vision-Exp \
         /media/z/data6/models/DeepSeek-V4-Flash-Vision-Exp; do
         if [[ -d "${candidate}" ]]; then
             DSV4_MODEL_DIR=${candidate}

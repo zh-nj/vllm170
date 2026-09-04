@@ -18,7 +18,7 @@ and 60 aggregate decode tokens/s on this machine.
 - NVIDIA driver 610.43.03, CUDA toolkit 13.3, and PyTorch 2.13.0+cu130.
 - The cards do not expose peer-to-peer access, so PP uses
   `NCCL_P2P_DISABLE=1`.
-- The requested checkpoint path `/mnt/data6/models/DeepSeek-V4-Flash-0731`
+- The requested checkpoint path `/media/z/data6/models/DeepSeek-V4-Flash-0731`
   resolves on this host to
   `/media/z/data6/models/DeepSeek-V4-Flash-0731`.
 - The editable build targets SM80. Direct CUDA allocation and write tests
