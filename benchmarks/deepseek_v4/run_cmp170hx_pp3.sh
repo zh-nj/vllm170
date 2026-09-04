@@ -6,14 +6,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 VLLM_BIN=${VLLM_BIN:-${REPO_ROOT}/.venv/bin/vllm}
 
-if [[ -z "${DSV4_MODEL_DIR:-}" ]]; then
-    for candidate in \
-        /media/z/data6/models/DeepSeek-V4-Flash-0731; do
-        if [[ -d "${candidate}" ]]; then
-            DSV4_MODEL_DIR=${candidate}
-            break
-        fi
-    done
+if [[ -z "${DSV4_MODEL_DIR:-}" && \
+    -d /media/z/data6/models/DeepSeek-V4-Flash-0731 ]]; then
+    DSV4_MODEL_DIR=/media/z/data6/models/DeepSeek-V4-Flash-0731
 fi
 
 if [[ ! -x "${VLLM_BIN}" ]]; then
@@ -30,7 +25,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
-export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-15,15,13}
+export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-15,16,12}
 export VLLM_PP_REUSE_RECV_BUFFER=${VLLM_PP_REUSE_RECV_BUFFER:-1}
 export VLLM_PP_REUSE_RECV_BUFFER_DEBUG=${VLLM_PP_REUSE_RECV_BUFFER_DEBUG:-0}
 export VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-96}

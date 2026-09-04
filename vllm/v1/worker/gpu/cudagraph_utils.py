@@ -69,6 +69,18 @@ class BatchExecutionDescriptor:
     num_active_loras: int = 0
 
 
+def uses_raw_input_ids_for_decode_cudagraph(
+    model: nn.Module,
+    desc: BatchExecutionDescriptor,
+) -> bool:
+    """Whether a uniform FULL graph embeds raw token ids internally."""
+    return (
+        desc.cg_mode == CUDAGraphMode.FULL
+        and desc.uniform_token_count is not None
+        and getattr(model, "supports_decode_cudagraph_with_raw_input_ids", False)
+    )
+
+
 class CreateForwardFn(Protocol):
     """Factory that prepares inputs (OUTSIDE the graph) and returns a
     forward_fn. Called with warmup=True for the warmup pass and warmup=False
@@ -532,6 +544,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            if uses_raw_input_ids_for_decode_cudagraph(model, desc):
+                model_inputs["inputs_embeds"] = None
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 if not model_state.model_config.requires_raw_input_tokens:

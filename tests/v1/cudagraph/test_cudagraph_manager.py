@@ -19,7 +19,10 @@ from vllm.config import (
 from vllm.distributed.device_communicators import pynccl_allocator
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    uses_raw_input_ids_for_decode_cudagraph,
+)
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -48,6 +51,33 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
     return vllm_config
+
+
+@pytest.mark.parametrize(
+    ("cg_mode", "uniform_token_count", "model_opt_in", "expected"),
+    [
+        (CUDAGraphMode.FULL, 1, True, True),
+        (CUDAGraphMode.FULL, None, True, False),
+        (CUDAGraphMode.PIECEWISE, None, True, False),
+        (CUDAGraphMode.FULL, 1, False, False),
+    ],
+)
+def test_raw_inputs_are_only_used_for_opted_in_uniform_full_graphs(
+    cg_mode: CUDAGraphMode,
+    uniform_token_count: int | None,
+    model_opt_in: bool,
+    expected: bool,
+) -> None:
+    model = torch.nn.Module()
+    model.supports_decode_cudagraph_with_raw_input_ids = model_opt_in
+    desc = BatchExecutionDescriptor(
+        cg_mode=cg_mode,
+        num_tokens=1,
+        num_reqs=1,
+        uniform_token_count=uniform_token_count,
+    )
+
+    assert uses_raw_input_ids_for_decode_cudagraph(model, desc) is expected
 
 
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):

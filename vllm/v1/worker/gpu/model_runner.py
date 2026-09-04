@@ -103,6 +103,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    uses_raw_input_ids_for_decode_cudagraph,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
@@ -826,6 +827,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         dp_sync = self.execute_model_state.dp_sync
         self.execute_model_state = None
+        assert hidden_states is not None
 
         self.step_timing.forward_end()
 
@@ -1372,11 +1374,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
-
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.
@@ -1405,7 +1402,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
-            max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
@@ -1746,31 +1742,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_ids = input_batch.input_ids
         inputs_embeds = None
         ec_connector_output = None
-        if self.uses_inputs_embeds and self.is_first_pp_rank:
-            # Prepare inputs_embeds (MM encoder outputs and/or prompt_embeds
-            # overlay). Only first PP rank prepares them.
-            if dummy_run:
-                # Obtain embeddings of correct shape for compiled model.
-                inputs_embeds = self.model_state.dummy_inputs_embeds(
-                    input_batch.num_tokens_after_padding
-                )
-            else:
-                scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
-                if self.supports_mm_inputs and self.lora_config is not None:
-                    set_active_mm_loras(
-                        model=self.model,
-                        lora_manager=self.lora_manager,
-                        encoder_cache=self.encoder_cache,
-                        req_id_to_index=self.req_states.req_id_to_index,
-                        lora_state=self.lora_state,
-                        scheduled_encoder_inputs=scheduled_encoder_inputs,
+        graph_embeds_raw_input_ids = uses_raw_input_ids_for_decode_cudagraph(
+            self.model, batch_desc
+        )
+        if (
+            self.uses_inputs_embeds
+            and self.is_first_pp_rank
+            and not graph_embeds_raw_input_ids
+        ):
+            with phase_profile_stage(
+                "target.inputs_embeds",
+                input_batch.input_ids,
+                flow=profile_flow,
+                level="stage",
+                extra=profile_extra,
+            ):
+                # Prepare inputs_embeds (MM encoder outputs and/or prompt_embeds
+                # overlay). Only first PP rank prepares them.
+                if dummy_run:
+                    # Obtain embeddings of correct shape for compiled model.
+                    inputs_embeds = self.model_state.dummy_inputs_embeds(
+                        input_batch.num_tokens_after_padding
                     )
-                with self.ec_connector.maybe_get_output(
-                    scheduler_output
-                ) as ec_connector_output:
-                    inputs_embeds = self.model_state.prepare_inputs_embeds(
-                        scheduled_encoder_inputs, input_batch, self.req_states
-                    )
+                else:
+                    scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+                    if self.supports_mm_inputs and self.lora_config is not None:
+                        set_active_mm_loras(
+                            model=self.model,
+                            lora_manager=self.lora_manager,
+                            encoder_cache=self.encoder_cache,
+                            req_id_to_index=self.req_states.req_id_to_index,
+                            lora_state=self.lora_state,
+                            scheduled_encoder_inputs=scheduled_encoder_inputs,
+                        )
+                    with self.ec_connector.maybe_get_output(
+                        scheduler_output
+                    ) as ec_connector_output:
+                        inputs_embeds = self.model_state.prepare_inputs_embeds(
+                            scheduled_encoder_inputs, input_batch, self.req_states
+                        )
             if (
                 inputs_embeds is not None
                 and not self.model_config.requires_raw_input_tokens

@@ -47,6 +47,17 @@ def test_default_cmp170hx_layer_partition(monkeypatch: pytest.MonkeyPatch):
     ]
 
 
+def test_explicit_layer_partition_overrides_cmp170hx_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "14,15,14")
+    assert [get_pp_indices(43, rank, 3) for rank in range(3)] == [
+        (0, 14),
+        (14, 29),
+        (29, 43),
+    ]
+
+
 @pytest.mark.parametrize(
     "num_hidden_layers,pp_size,pp_rank,indices",
     [

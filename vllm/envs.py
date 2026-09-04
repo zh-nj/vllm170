@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
-    VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_LAYER_PARTITION: str | None = "15,16,12"
     VLLM_PP_REUSE_RECV_BUFFER: bool = True
     VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD: bool = False
@@ -903,7 +903,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else True
     ),
     # Pipeline stage partition strategy
-    "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", "15,16,12"),
     "VLLM_PP_REUSE_RECV_BUFFER": lambda: bool(
         int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER", "1"))
     ),

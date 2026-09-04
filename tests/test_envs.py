@@ -22,7 +22,7 @@ from vllm.exceptions import VLLMValidationError
 def test_cmp170hx_project_environment_defaults() -> None:
     expected = {
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-        "VLLM_PP_LAYER_PARTITION": None,
+        "VLLM_PP_LAYER_PARTITION": "15,16,12",
         "VLLM_PP_REUSE_RECV_BUFFER": True,
         "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": 96,
         "VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS": 1024,

@@ -199,6 +199,10 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     in their raw form and not input embeddings.
     """
 
+    supports_decode_cudagraph_with_raw_input_ids: ClassVar[bool] = False
+    """A flag indicating uniform FULL decode graphs can build their own
+    ``inputs_embeds`` from raw input ids."""
+
     _processor_factory: ClassVar["_ProcessorFactories"]
     """
     Set internally by `MultiModalRegistry.register_processor`.

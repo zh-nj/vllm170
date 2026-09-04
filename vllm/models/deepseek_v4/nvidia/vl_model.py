@@ -97,6 +97,7 @@ class DeepseekV4ForConditionalGeneration(
     # The MoE router needs raw token ids to detect image sentinel tokens
     # (borrowed reserved ids, see common/mm_preprocess.py) and apply bias_vl.
     requires_raw_input_tokens = True
+    supports_decode_cudagraph_with_raw_input_ids = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -296,6 +297,8 @@ class DeepseekV4ForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if inputs_embeds is None and get_pp_group().is_first_rank:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
