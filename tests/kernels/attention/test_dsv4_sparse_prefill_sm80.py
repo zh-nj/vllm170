@@ -34,18 +34,12 @@ def test_direct_swa_ragged_controls_dense_decode_buffer(monkeypatch) -> None:
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(
-    ("head_dim", "nope_head_dim", "rope_head_dim"),
-    [(512, 448, 64), (256, 256, 0)],
-)
-def test_sparse_prefill_caller_output_and_block_k_match(
-    monkeypatch, head_dim: int, nope_head_dim: int, rope_head_dim: int
-) -> None:
+def test_sparse_prefill_caller_output_and_block_k_match(monkeypatch) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
 
     torch.manual_seed(0)
-    q = torch.randn(4, 8, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
-    kv = torch.randn(8, 1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
+    q = torch.randn(4, 8, 512, dtype=torch.bfloat16, device="cuda") * 0.125
+    kv = torch.randn(8, 1, 512, dtype=torch.bfloat16, device="cuda") * 0.125
     indices = torch.tensor(
         [
             [0, 2, 4, -1, -1, -1],
@@ -70,10 +64,10 @@ def test_sparse_prefill_caller_output_and_block_k_match(
             kv=kv,
             indices=indices,
             topk_length=lengths,
-            scale=head_dim**-0.5,
-            head_dim=head_dim,
-            nope_head_dim=nope_head_dim,
-            rope_head_dim=rope_head_dim,
+            scale=512**-0.5,
+            head_dim=512,
+            nope_head_dim=448,
+            rope_head_dim=64,
             attn_sink=sink,
             output=output,
         )
@@ -86,54 +80,6 @@ def test_sparse_prefill_caller_output_and_block_k_match(
     torch.testing.assert_close(direct, copied, atol=0, rtol=0)
     torch.testing.assert_close(tuned, copied, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(tuned).all()
-
-
-@torch.inference_mode()
-def test_sparse_prefill_fp8_cache_matches_dequantized_reference(monkeypatch) -> None:
-    """SM80 decodes E4M3 KV bytes through the software lookup-table path."""
-    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
-
-    torch.manual_seed(17)
-    head_dim = 256
-    q = torch.randn(4, 8, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
-    kv = torch.randn(8, 1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.125
-    kv_scale = torch.tensor([0.01], dtype=torch.float32, device="cuda")
-    kv_fp8 = (kv / kv_scale).to(current_platform.fp8_dtype())
-    kv_dequantized = (kv_fp8.to(torch.bfloat16) * kv_scale).to(torch.bfloat16)
-    indices = torch.tensor(
-        [
-            [0, 2, 4, -1, -1, -1],
-            [1, 3, 5, 7, -1, -1],
-            [0, 1, 2, 3, 4, -1],
-            [2, 3, 4, 5, 6, 7],
-        ],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    lengths = torch.tensor([3, 4, 5, 6], dtype=torch.int32, device="cuda")
-    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_PREFILL_CALLER_OUTPUT", "1")
-
-    def run(cache: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
-        output = torch.empty_like(q)
-        rocm_sparse_attn_prefill(
-            q=q,
-            kv=cache,
-            indices=indices,
-            topk_length=lengths,
-            scale=head_dim**-0.5,
-            head_dim=head_dim,
-            nope_head_dim=head_dim,
-            rope_head_dim=0,
-            attn_sink=None,
-            output=output,
-            kv_scale=scale,
-        )
-        return output
-
-    reference = run(kv_dequantized, None)
-    actual = run(kv_fp8, kv_scale)
-    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
-    assert torch.isfinite(actual).all()
 
 
 @torch.inference_mode()

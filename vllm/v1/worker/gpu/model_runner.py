@@ -277,10 +277,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp and self.speculative_config.method not in (
-                    "dflash",
-                    "dspark",
-                ):
+                if self.use_pp and self.speculative_config.method != "dspark":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -327,7 +324,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 relay_draft_tokens=(
                     self.speculative_config is not None
-                    and self.speculative_config.method in ("dflash", "dspark", "mtp")
+                    and self.speculative_config.method in ("dspark", "mtp")
                 ),
             )
 
@@ -832,8 +829,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
-        assert hidden_states is not None  # Last PP rank always has hidden_states
-
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None
@@ -883,6 +878,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             self.step_timing.drafter_end()
 
+        assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 

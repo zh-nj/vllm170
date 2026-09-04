@@ -1281,31 +1281,15 @@ _DSV4_SPARSE_NOPE_DIM = 448
 _DSV4_SPARSE_ROPE_DIM = 64
 
 
-def _validate_sparse_dims(
-    head_dim: int,
-    nope_head_dim: int,
-    rope_head_dim: int,
-    op_name: str,
-) -> None:
-    assert head_dim > 0, f"{op_name} expected a positive head_dim, got {head_dim}"
-    assert nope_head_dim > 0, (
-        f"{op_name} expected a positive NoPE dimension, got {nope_head_dim}"
-    )
-    assert rope_head_dim >= 0, (
-        f"{op_name} expected a non-negative RoPE dimension, got {rope_head_dim}"
-    )
-    assert head_dim == nope_head_dim + rope_head_dim, (
-        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
-    )
-
-
 def _validate_dsv4_sparse_dims(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
     op_name: str,
 ) -> None:
-    _validate_sparse_dims(head_dim, nope_head_dim, rope_head_dim, op_name)
+    assert head_dim == nope_head_dim + rope_head_dim, (
+        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
+    )
     assert (
         nope_head_dim == _DSV4_SPARSE_NOPE_DIM
         and rope_head_dim == _DSV4_SPARSE_ROPE_DIM
@@ -1401,8 +1385,6 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
     kv_ptr,
-    kv_scale_ptr,
-    fp8_lut_ptr,
     kv_indices_ptr,
     kv_indptr_ptr,
     attn_sink_ptr,
@@ -1419,7 +1401,6 @@ def _sparse_attn_prefill_ragged_kernel(
     head_dim,
     num_kv,
     scale,
-    KV_IS_FP8: tl.constexpr,
     HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1468,10 +1449,6 @@ def _sparse_attn_prefill_ragged_kernel(
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )
-        if KV_IS_FP8:
-            kv = (_decode_fp8_lut(kv, False, fp8_lut_ptr) * tl.load(kv_scale_ptr)).to(
-                q.dtype
-            )
 
         next_k_pos = k_start + BLOCK_K + k_offsets
         slot = tl.load(
@@ -2598,7 +2575,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     nope_head_dim: int,
     rope_head_dim: int,
     output: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
     *,
     block_h: int = 16,
     block_k: int | None = None,
@@ -2609,16 +2585,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     assert indices.ndim == 1, f"expected indices=[nnz], got {indices.shape}"
     assert indptr.ndim == 1, f"expected indptr=[sq+1], got {indptr.shape}"
     assert not q.is_cpu and not kv.is_cpu and not indices.is_cpu and not indptr.is_cpu
-
-    kv_is_fp8 = kv.dtype == current_platform.fp8_dtype()
-    if kv_is_fp8:
-        assert kv_scale is not None, "FP8 sparse MLA requires a KV cache scale"
-        kv = kv.view(torch.uint8)
-        fp8_lut = get_e4m3fn_bf16_lut(q.device)
-    else:
-        fp8_lut = torch.empty(1, dtype=torch.bfloat16, device=q.device)
-        if kv_scale is None:
-            kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
 
     indices = _as_int32_contiguous_1d(indices)
     indptr = _as_int32_contiguous_1d(indptr)
@@ -2632,7 +2598,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     assert indptr.numel() == num_queries + 1, (
         f"expected indptr shape [{num_queries + 1}], got {indptr.shape}"
     )
-    _validate_sparse_dims(
+    _validate_dsv4_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
@@ -2659,8 +2625,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
-        kv_scale,
-        fp8_lut,
         indices,
         indptr,
         attn_sink,
@@ -2677,7 +2641,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         head_dim,
         kv.shape[0],
         float(scale),
-        KV_IS_FP8=kv_is_fp8,
         HAS_ATTN_SINK=has_attn_sink,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
@@ -2697,7 +2660,6 @@ def _rocm_sparse_attn_prefill_triton(
     rope_head_dim: int,
     topk_length: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
@@ -2716,7 +2678,6 @@ def _rocm_sparse_attn_prefill_triton(
         nope_head_dim=nope_head_dim,
         rope_head_dim=rope_head_dim,
         output=output,
-        kv_scale=kv_scale,
     )
 
 
@@ -3233,12 +3194,11 @@ def rocm_sparse_attn_prefill(
     output: torch.Tensor,
     ragged_indices: torch.Tensor | None = None,
     ragged_indptr: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
 ) -> None:
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
     )
-    _validate_sparse_dims(
+    _validate_dsv4_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
@@ -3258,7 +3218,6 @@ def rocm_sparse_attn_prefill(
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
             output=caller_output,
-            kv_scale=kv_scale,
         )
     else:
         indices_2d = indices.reshape(indices.shape[0], -1)
@@ -3272,7 +3231,6 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
             output=caller_output,
-            kv_scale=kv_scale,
         )
     if caller_output is None:
         output.copy_(output_chunk)

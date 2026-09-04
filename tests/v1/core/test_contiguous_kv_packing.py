@@ -159,7 +159,6 @@ def _make_csa_linear_specs(
 
 def _shared_layout_config():
     config = _mock_vllm_config("BLNHC")
-    config.model_config.hf_config.model_type = "qwen4_exp"
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.speculative_config = None
     config.model_config.max_model_len = 16

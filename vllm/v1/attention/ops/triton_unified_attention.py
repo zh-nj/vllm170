@@ -289,8 +289,6 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
-    # DFlash block diffusion uses a shared history window and full query suffix.
-    USE_DFLASH_BLOCK: tl.constexpr = False,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -416,7 +414,6 @@ def kernel_unified_attention(
         USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
-        USE_DFLASH_BLOCK,
     )
 
     # iterate through tiles (now limited to the sliding window range)
@@ -533,8 +530,6 @@ def kernel_unified_attention(
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
             MM_PREFIX_CLAMP_SW,
-            USE_DFLASH_BLOCK,
-            context_len,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -569,11 +564,7 @@ def kernel_unified_attention(
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
             dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_DFLASH_BLOCK:
-                sw_mask_v = (seq_offset[:, None] >= context_len - SLIDING_WINDOW) & (
-                    seq_offset[:, None] < seq_len
-                )
-            elif USE_PER_SEQ_CAUSAL:
+            if USE_PER_SEQ_CAUSAL:
                 is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
                 sw_mask_v = tl.where(
                     is_causal_seq,
@@ -856,21 +847,11 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
-    # DFlash: expose the complete draft block behind one shared history window.
-    dflash_block_attention: bool = False,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
-
-    if dflash_block_attention:
-        assert not use_causal and not use_per_seq_causal, (
-            "DFlash block attention requires a uniformly non-causal batch"
-        )
-        assert window_size[0] >= 0, (
-            "DFlash block attention requires a configured sliding window"
-        )
 
     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
     # sub-byte unpack); everything else goes through the core kernel below.
@@ -1182,7 +1163,6 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
-        USE_DFLASH_BLOCK=dflash_block_attention,
         **launch_kwargs,
     )
 

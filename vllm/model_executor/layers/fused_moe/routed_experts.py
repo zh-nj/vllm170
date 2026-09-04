@@ -892,10 +892,6 @@ class RoutedExperts(PluggableLayer):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
-        custom_loader = getattr(self.quant_method, "load_weights", None)
-        if custom_loader is not None:
-            yield from custom_loader(self, weights)
-            return
         expert_mapping = self.get_expert_mapping(include_fused=True)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
