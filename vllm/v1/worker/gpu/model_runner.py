@@ -278,7 +278,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp and self.speculative_config.method != "dspark":
+                if self.use_pp and self.speculative_config.method not in (
+                    "dflash",
+                    "dspark",
+                ):
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -325,7 +328,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 relay_draft_tokens=(
                     self.speculative_config is not None
-                    and self.speculative_config.method in ("dspark", "mtp")
+                    and self.speculative_config.method in ("dflash", "dspark", "mtp")
                 ),
             )
 
@@ -736,11 +739,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+        runner_only_attn_layers: set[str] = set()
+        if isinstance(self.speculator, DraftModelSpeculator):
+            # Draft attention caches are owned by the proposer and may be
+            # packed into the target pool.
+            runner_only_attn_layers = self.speculator.draft_attn_layer_names
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
+            runner_only_attn_layers=runner_only_attn_layers,
+            use_tensor_zeroing=bool(runner_only_attn_layers),
         )
 
     @torch.inference_mode()
@@ -831,6 +842,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
+        assert hidden_states is not None  # Last PP rank always has hidden_states
+
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None
@@ -880,7 +893,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             self.step_timing.drafter_end()
 
-        assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 

@@ -686,6 +686,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            dflash_block_attention=getattr(layer, "dflash_block_attention", False),
         )
 
         return output

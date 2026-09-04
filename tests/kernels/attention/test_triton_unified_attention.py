@@ -90,6 +90,92 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+def ref_dflash_block_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_len: int,
+    kv_len: int,
+    block_table: torch.Tensor,
+    scale: float,
+    sliding_window: int,
+) -> torch.Tensor:
+    """Reference for DFlash's shared-history-window draft block."""
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+    block_indices = block_table[0, : (kv_len + block_size - 1) // block_size]
+    k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
+    v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
+    if query.shape[1] != k.shape[1]:
+        k = torch.repeat_interleave(k, query.shape[1] // k.shape[1], dim=1)
+        v = torch.repeat_interleave(v, query.shape[1] // v.shape[1], dim=1)
+
+    scores = torch.einsum("qhd,khd->hqk", query * scale, k).float()
+    context_len = kv_len - query_len
+    first_key = max(0, context_len - sliding_window)
+    key_pos = torch.arange(kv_len, device=query.device)
+    scores.masked_fill_((key_pos < first_key)[None, None, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1).to(v.dtype)
+    return torch.einsum("hqk,khd->qhd", probs, v)
+
+
+@pytest.mark.parametrize("context_len", [61, 137])
+@torch.inference_mode()
+def test_triton_unified_attn_dflash_block_window(context_len: int) -> None:
+    """Every DFlash row sees the same history tail and full draft block."""
+    if not current_platform.is_cuda():
+        pytest.skip("Triton attention requires CUDA")
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(11)
+    query_len = 8
+    kv_len = context_len + query_len
+    sliding_window = 32
+    block_size = 16
+    num_query_heads, num_kv_heads, head_size = 8, 2, 128
+    num_blocks = (kv_len + block_size - 1) // block_size
+    scale = head_size**-0.5
+
+    query = torch.randn(query_len, num_query_heads, head_size, dtype=torch.bfloat16)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    output = torch.empty_like(query)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([kv_len], dtype=torch.int32),
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=(sliding_window - 1, sliding_window - 1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        dflash_block_attention=True,
+    )
+
+    reference = ref_dflash_block_attn(
+        query,
+        key_cache,
+        value_cache,
+        query_len,
+        kv_len,
+        block_table,
+        scale,
+        sliding_window,
+    )
+    torch.testing.assert_close(output, reference, atol=1.5e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )

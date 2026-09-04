@@ -98,6 +98,7 @@ MTPModelTypes = Literal[
     "hy_v4_mtp",
     "gemma4_mtp",
     "inkling_mtp",
+    "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -1055,6 +1056,12 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["MiniMaxM3MTP"]}
             )
+        if hf_config.model_type == "glm5_next":
+            hf_config.model_type = "glm5_next_mtp"
+            n_predict = hf_config.num_nextn_predict_layers
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
+            )
 
         return hf_config
 
@@ -1537,7 +1544,7 @@ class SpeculativeConfig:
 
                 draft_pipeline_parallel_size = (
                     1
-                    if self.method == "dspark"
+                    if self.method in ("dflash", "dspark")
                     else self.target_parallel_config.pipeline_parallel_size
                 )
                 self.draft_parallel_config = (

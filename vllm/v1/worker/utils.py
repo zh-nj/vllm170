@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -114,12 +115,15 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
+        num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
+        use_tensor_zeroing: bool = False,
     ) -> None:
-        """Precompute the absolute-address table for the Triton zeroing kernel.
+        """Precompute metadata for zeroing newly allocated KV blocks.
 
-        Each entry is the absolute byte address of a segment start on the
-        GPU, so segments in different CUDA allocations work correctly.
+        The default path builds an absolute-address table for one Triton
+        launch. Packed overlays can instead retain the original tensor views
+        so their allocator-defined aliasing is preserved.
 
         Per-layer views are standardized ``[B, H, N, C]`` with blocks at dim 0; dims
         physically outside B (separate head groups under LHBNC) each get their own
@@ -138,6 +142,9 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        self._tensor_meta: list[tuple[torch.Tensor, torch.Tensor]] | None = (
+            [] if use_tensor_zeroing else None
+        )
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -157,8 +164,6 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            ratio = spec.block_size // kernel_bs
-
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
@@ -167,6 +172,17 @@ class KVBlockZeroer:
                     continue
 
                 dp = kv.data_ptr()
+
+                assert kv.shape[0] % num_blocks == 0, (
+                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
+                    f"multiple of {num_blocks} logical blocks"
+                )
+                ratio = kv.shape[0] // num_blocks
+
+                if self._tensor_meta is not None:
+                    offsets = torch.arange(ratio, device=self.device, dtype=torch.int64)
+                    self._tensor_meta.append((kv, offsets))
+                    continue
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
@@ -203,6 +219,8 @@ class KVBlockZeroer:
                         seg_block_strides.append(logical_block_stride_bytes // 4)
                         seg_page_sizes.append(kernel_page_bytes // 4)
 
+        if self._tensor_meta is not None:
+            return
         if not seg_addrs:
             self._meta = None
             return
@@ -220,7 +238,23 @@ class KVBlockZeroer:
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids:
+            return
+        tensor_meta = getattr(self, "_tensor_meta", None)
+        if tensor_meta is not None:
+            block_ids_tensor = async_tensor_h2d(
+                block_ids, device=self.device, dtype=torch.int64
+            )
+            row_ids_by_ratio: dict[int, torch.Tensor] = {}
+            for kv, offsets in tensor_meta:
+                ratio = offsets.numel()
+                row_ids = row_ids_by_ratio.get(ratio)
+                if row_ids is None:
+                    row_ids = (block_ids_tensor[:, None] * ratio + offsets).flatten()
+                    row_ids_by_ratio[ratio] = row_ids
+                kv.index_fill_(0, row_ids, 0)
+            return
+        if self._meta is None:
             return
         (
             seg_addrs,
@@ -267,11 +301,19 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
-        kv_cache_spec_builder = (
-            self.kv_cache_spec.copy_with_new_block_size(kernel_block_size)
-            if kernel_block_size is not None
-            else self.kv_cache_spec
-        )
+        if kernel_block_size is None:
+            kv_cache_spec_builder = self.kv_cache_spec
+        elif (
+            isinstance(self.kv_cache_spec, MLAAttentionSpec)
+            and self.kv_cache_spec.storage_block_size is not None
+        ):
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                self.kv_cache_spec.storage_block_size
+            )
+        else:
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                kernel_block_size
+            )
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width:
@@ -291,6 +333,9 @@ class AttentionGroup:
             )
             for _ in range(num_metadata_builders)
         ]
+        if kernel_block_size is not None:
+            for builder in self.metadata_builders:
+                builder.set_kernel_block_size(kernel_block_size)
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id
@@ -427,6 +472,8 @@ def allocate_kv_cache(
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
+        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
+            kernel_block_size = spec.storage_block_size
 
         views = create_kv_cache_views(
             buf,

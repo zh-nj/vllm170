@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for error handling in the CUDA attention backend probe.
+"""Tests for CUDA attention backend selection and probe error handling.
 
 Environment-shaped probe failures (missing packages, unreadable caches,
 broken driver installs) must mark the backend unavailable rather than
@@ -31,6 +31,7 @@ SELECTOR_CONFIG = AttentionSelectorConfig(
 )
 
 SM90 = DeviceCapability(major=9, minor=0)
+SM80 = DeviceCapability(major=8, minor=0)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +88,75 @@ def test_get_valid_backends_keeps_probing_after_failure():
         )
     assert len(invalid_reasons) == 1
     assert valid
+
+
+def test_sm90_nope_mla_prefers_flashinfer_without_changing_rope_order():
+    backend_cls = MagicMock()
+    backend_cls.validate_configuration.return_value = []
+    sparse_backends = {
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+    }
+
+    def sparse_order(head_size: int) -> list[AttentionBackendEnum]:
+        config = SELECTOR_CONFIG._replace(
+            head_size=head_size,
+            use_mla=True,
+            use_sparse=True,
+        )
+        with patch(
+            "vllm.platforms.cuda._get_attn_backend_class",
+            return_value=backend_cls,
+        ):
+            valid, _ = CudaPlatform.get_valid_backends(
+                device_capability=SM90,
+                attn_selector_config=config,
+                num_heads=32,
+            )
+        return [
+            candidate.backend
+            for candidate in valid
+            if candidate.backend in sparse_backends
+        ]
+
+    assert sparse_order(512) == [
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+    ]
+    assert sparse_order(576) == [
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+    ]
+
+
+@pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
+def test_sm80_sparse_mla_uses_triton_backend(kv_cache_dtype):
+    backend_cls = MagicMock()
+    backend_cls.validate_configuration.return_value = []
+    config = SELECTOR_CONFIG._replace(
+        head_size=512,
+        kv_cache_dtype=kv_cache_dtype,
+        use_mla=True,
+        use_sparse=True,
+    )
+
+    with patch(
+        "vllm.platforms.cuda._get_attn_backend_class",
+        return_value=backend_cls,
+    ):
+        valid, invalid = CudaPlatform.get_valid_backends(
+            device_capability=SM80,
+            attn_selector_config=config,
+            num_heads=32,
+        )
+
+    assert invalid == {}
+    assert [candidate.backend for candidate in valid] == [
+        AttentionBackendEnum.TRITON_MLA_SPARSE_SM80
+    ]
 
 
 def test_selected_backend_probe_failure_raises_value_error_with_cause():

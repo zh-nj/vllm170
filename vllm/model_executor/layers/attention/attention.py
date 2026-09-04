@@ -243,6 +243,7 @@ class Attention(nn.Module, AttentionLayerBase):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
         mm_prefix_clamp_sliding_window: bool = False,
+        dflash_block_attention: bool = False,
         attn_backend: type[AttentionBackend] | None = None,
         head_size_v: int | None = None,
         **extra_impl_args,
@@ -328,6 +329,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        self.dflash_block_attention = dflash_block_attention
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
