@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sweep Marlin MXFP4 execution configs for DeepSeek-V4 MoE shapes."""
+"""Sweep Marlin MXFP4 execution configs for DeepSeek-V4/GLM MoE shapes."""
 
 from __future__ import annotations
 
@@ -122,6 +122,7 @@ def _benchmark_shape(
     stage: str,
     m: int,
     routing_seed: int,
+    moe_block_size: int,
     device: torch.device,
     warmup: int,
     iterations: int,
@@ -130,6 +131,7 @@ def _benchmark_shape(
     fp32_reduce_workspace_mode: str,
     qweight: torch.Tensor,
     scales: torch.Tensor,
+    exec_configs: tuple[tuple[str, int, int, int], ...],
 ) -> list[dict[str, Any]]:
     size_m, size_k, size_n, kernel_top_k = _stage_shape(stage, m)
     topk_ids = _routing(m, routing_seed, device)
@@ -138,7 +140,7 @@ def _benchmark_shape(
         (m, TOP_K), dtype=torch.float32, device=device, generator=generator
     )
     sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, MOE_BLOCK_SIZE, NUM_EXPERTS
+        topk_ids, moe_block_size, NUM_EXPERTS
     )
     input = torch.randn(
         (size_m, size_k), dtype=torch.bfloat16, device=device, generator=generator
@@ -154,7 +156,7 @@ def _benchmark_shape(
                 _marlin_moe_fp32_reduce_workspace_size(
                     size_n,
                     sorted_ids.numel(),
-                    MOE_BLOCK_SIZE,
+                    moe_block_size,
                     device.index,
                 )
             ),
@@ -179,7 +181,7 @@ def _benchmark_shape(
             expert_ids,
             num_tokens_post_padded,
             topk_weights,
-            MOE_BLOCK_SIZE,
+            moe_block_size,
             kernel_top_k,
             stage == "w2",
             scalar_types.float4_e2m1f,
@@ -214,7 +216,7 @@ def _benchmark_shape(
         "size_k": size_k,
         "num_experts": NUM_EXPERTS,
         "top_k": TOP_K,
-        "moe_block_size": MOE_BLOCK_SIZE,
+        "moe_block_size": moe_block_size,
         "routing_seed": routing_seed,
         "padded_rows": padded_rows,
         "useful_row_pct": 100 * useful_rows / padded_rows,
@@ -225,7 +227,7 @@ def _benchmark_shape(
     }
     results: list[dict[str, Any]] = []
     auto_latency_us = 0.0
-    for name, thread_k, thread_n, blocks_per_sm in EXEC_CONFIGS:
+    for name, thread_k, thread_n, blocks_per_sm in exec_configs:
         row = common | {
             "config": name,
             "thread_k": thread_k,
@@ -273,6 +275,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", choices=("w13", "w2", "both"), default="both")
     parser.add_argument("--m", nargs="+", type=int, default=[1000, 1666, 1667, 2000])
     parser.add_argument("--routing-seeds", nargs="+", type=int, default=[-1, 8, 9])
+    parser.add_argument("--hidden-size", type=int, default=HIDDEN_SIZE)
+    parser.add_argument("--intermediate-size", type=int, default=INTERMEDIATE_SIZE)
+    parser.add_argument("--num-experts", type=int, default=NUM_EXPERTS)
+    parser.add_argument("--top-k", type=int, default=TOP_K)
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        choices=tuple(config[0] for config in EXEC_CONFIGS),
+        default=[config[0] for config in EXEC_CONFIGS],
+    )
+    parser.add_argument(
+        "--block-sizes",
+        nargs="+",
+        type=int,
+        default=[MOE_BLOCK_SIZE],
+        choices=(8, 16, 32, 48, 64),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--samples", type=int, default=5)
@@ -288,6 +307,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    global HIDDEN_SIZE, INTERMEDIATE_SIZE, NUM_EXPERTS, TOP_K
+    HIDDEN_SIZE = args.hidden_size
+    INTERMEDIATE_SIZE = args.intermediate_size
+    NUM_EXPERTS = args.num_experts
+    TOP_K = args.top_k
     if min(args.m) <= 0 or args.warmup < 0 or args.iterations <= 0 or args.samples <= 0:
         raise ValueError("M, iterations, and samples must be positive")
     if not current_platform.is_cuda():
@@ -298,32 +322,38 @@ def main() -> None:
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
     stages = ("w13", "w2") if args.stage == "both" else (args.stage,)
+    exec_configs = tuple(
+        config for config in EXEC_CONFIGS if config[0] in args.configs
+    )
     output = args.output.open("w") if args.output is not None else None
     try:
         for stage in stages:
             _, size_k, size_n, _ = _stage_shape(stage, 1)
             qweight, scales = _packed_weight(size_k, size_n, device)
-            for m in args.m:
-                for routing_seed in args.routing_seeds:
-                    rows = _benchmark_shape(
-                        stage,
-                        m,
-                        routing_seed,
-                        device,
-                        args.warmup,
-                        args.iterations,
-                        args.samples,
-                        args.correctness_atol,
-                        args.fp32_reduce_workspace,
-                        qweight,
-                        scales,
-                    )
-                    for row in rows:
-                        line = json.dumps(row, sort_keys=True)
-                        print(line, flush=True)
-                        if output is not None:
-                            output.write(line + "\n")
-                            output.flush()
+            for moe_block_size in args.block_sizes:
+                for m in args.m:
+                    for routing_seed in args.routing_seeds:
+                        rows = _benchmark_shape(
+                            stage,
+                            m,
+                            routing_seed,
+                            moe_block_size,
+                            device,
+                            args.warmup,
+                            args.iterations,
+                            args.samples,
+                            args.correctness_atol,
+                            args.fp32_reduce_workspace,
+                            qweight,
+                            scales,
+                            exec_configs,
+                        )
+                        for row in rows:
+                            line = json.dumps(row, sort_keys=True)
+                            print(line, flush=True)
+                            if output is not None:
+                                output.write(line + "\n")
+                                output.flush()
             del qweight, scales
             torch.accelerator.empty_cache()
     finally:

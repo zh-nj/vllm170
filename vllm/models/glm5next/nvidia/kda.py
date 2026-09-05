@@ -34,6 +34,7 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -289,7 +290,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        with optional_phase_profile_stage("kda.input_projection", hidden_states):
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -306,10 +308,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
-        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
-
-        g_proj_states = self.g_b_proj(g_a)[0]
+        with optional_phase_profile_stage("kda.gate_projections", projected):
+            g1 = self.f_b_proj(f_a)[0]
+            g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+            g_proj_states = self.g_b_proj(g_a)[0]
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
@@ -320,15 +322,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         # Call the decorated eager break directly so host-side prefill branches
         # are not captured by PIECEWISE CUDA graphs.
-        self._forward(
-            qkv_proj_states=qkv,
-            g1=g1,
-            beta=beta,
-            core_attn_out=core_attn_out,
-        )
-        core_attn_out = self.o_norm(core_attn_out, g2)
+        with optional_phase_profile_stage("kda.core", qkv):
+            self._forward(
+                qkv_proj_states=qkv,
+                g1=g1,
+                beta=beta,
+                core_attn_out=core_attn_out,
+            )
+        with optional_phase_profile_stage("kda.output_norm", core_attn_out):
+            core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        with optional_phase_profile_stage("kda.output_projection", core_attn_out):
+            return self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
     def _forward(

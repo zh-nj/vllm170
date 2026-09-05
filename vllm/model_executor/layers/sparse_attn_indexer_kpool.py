@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -367,16 +368,19 @@ def sparse_attn_indexer_kpool(
             if n_prefill > 0:
                 # decode tokens are batched first; prefill tokens follow.
                 prefill_slice = slice(num_decode_tokens, num_tokens)
-                _kpool_compress_insert(
-                    k[prefill_slice],
-                    gate_score[prefill_slice],
-                    compress_ape,
-                    kv_cache,
-                    slot_mapping[prefill_slice],
-                    index_kpool,
-                    head_dim,
-                    round_scale=(scale_fmt is not None),
-                )
+                with optional_phase_profile_stage(
+                    "indexer.kpool_compress_insert", k, flow="prefill"
+                ):
+                    _kpool_compress_insert(
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        compress_ape,
+                        kv_cache,
+                        slot_mapping[prefill_slice],
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
                 # ``pos % kpool`` within the request's tail block. Processing
@@ -451,7 +455,10 @@ def sparse_attn_indexer_kpool(
             assert positions is not None
             _pos = positions[num_decode_tokens:num_tokens].to(torch.int32)
             _buf = topk_indices_buffer[num_decode_tokens:num_tokens]
-            _fill_causal_indices(_buf, _pos)
+            with optional_phase_profile_stage(
+                "indexer.short_prefill_fill", _buf, flow="prefill"
+            ):
+                _fill_causal_indices(_buf, _pos)
 
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
@@ -478,27 +485,30 @@ def sparse_attn_indexer_kpool(
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
-                if current_platform.is_rocm():
-                    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                        cp_gather_indexer_k_quant_cache_triton,
-                    )
+                with optional_phase_profile_stage(
+                    "indexer.kv_gather", q_quant, flow="prefill"
+                ):
+                    if current_platform.is_rocm():
+                        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                            cp_gather_indexer_k_quant_cache_triton,
+                        )
 
-                    cp_gather_indexer_k_quant_cache_triton(
-                        kv_cache,
-                        k_quant,
-                        k_scale,
-                        chunk.block_table,
-                        chunk.cu_seq_lens,
-                        token_to_seq=chunk.token_to_seq,
-                    )
-                else:
-                    ops.cp_gather_indexer_k_quant_cache(
-                        kv_cache,
-                        k_quant,
-                        k_scale,
-                        chunk.block_table,
-                        chunk.cu_seq_lens,
-                    )
+                        cp_gather_indexer_k_quant_cache_triton(
+                            kv_cache,
+                            k_quant,
+                            k_scale,
+                            chunk.block_table,
+                            chunk.cu_seq_lens,
+                            token_to_seq=chunk.token_to_seq,
+                        )
+                    else:
+                        ops.cp_gather_indexer_k_quant_cache(
+                            kv_cache,
+                            k_quant,
+                            k_scale,
+                            chunk.block_table,
+                            chunk.cu_seq_lens,
+                        )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -516,50 +526,53 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if current_platform.is_rocm():
-                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                    rocm_fp8_mqa_logits,
-                )
-
-                assert q_scale_slice is None
-                logits = rocm_fp8_mqa_logits(
-                    q_slice_cast,
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
-            elif is_deep_gemm_supported():
-                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
-
-                logits = fp8_fp4_mqa_logits(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
-                )
-            else:
-                if use_fp4_cache:
-                    raise RuntimeError(
-                        "Triton sparse-indexer fallback supports FP8 cache only."
+            with optional_phase_profile_stage(
+                "indexer.logits", q_slice, flow="prefill"
+            ):
+                if current_platform.is_rocm():
+                    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                        rocm_fp8_mqa_logits,
                     )
-                logits_out = None
-                if logits_workspace is not None:
-                    num_logits = q_slice_cast.shape[0] * k_quant_cast.shape[0]
-                    logits_out = logits_workspace[:num_logits].view(
-                        q_slice_cast.shape[0], k_quant_cast.shape[0]
+
+                    assert q_scale_slice is None
+                    logits = rocm_fp8_mqa_logits(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
                     )
-                logits = fp8_mqa_logits_triton(
-                    q_slice_cast,
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
-                    logits_out=logits_out,
-                )
+                elif is_deep_gemm_supported():
+                    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+                else:
+                    if use_fp4_cache:
+                        raise RuntimeError(
+                            "Triton sparse-indexer fallback supports FP8 cache only."
+                        )
+                    logits_out = None
+                    if logits_workspace is not None:
+                        num_logits = q_slice_cast.shape[0] * k_quant_cast.shape[0]
+                        logits_out = logits_workspace[:num_logits].view(
+                            q_slice_cast.shape[0], k_quant_cast.shape[0]
+                        )
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                        logits_out=logits_out,
+                    )
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -576,50 +589,58 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
-                )
-            else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
-                )
-
-            if index_kpool > 1:
-                pool_ids = pool_topk.to(torch.int64)
-                if positions is not None:
-                    # Fused expand-pools + append-tail into one Triton kernel
-                    # (replaces ~25 elementwise ops). seq_len is token-granular
-                    # (pos+1); the kernel derives pool_len internally.
-                    q_seq = (
-                        positions[chunk.token_start : chunk.token_end].to(torch.int32)
-                        + 1
-                    )
-                    expanded = kpool_ops.expand_pools_and_append_tail(
-                        pool_ids, q_seq, index_kpool
+            with optional_phase_profile_stage(
+                "indexer.topk", logits, flow="prefill"
+            ):
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
                     )
                 else:
-                    valid = pool_ids >= 0
-                    expanded = kpool_ops.expand_pools_to_tokens(
-                        pool_ids, valid, topk_tokens, index_kpool
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
                     )
-                topk_indices_buffer[
-                    chunk.token_start : chunk.token_end, : expanded.shape[-1]
-                ] = expanded
+
+            if index_kpool > 1:
+                with optional_phase_profile_stage(
+                    "indexer.pool_expand", pool_topk, flow="prefill"
+                ):
+                    pool_ids = pool_topk.to(torch.int64)
+                    if positions is not None:
+                        # Fused expand-pools + append-tail into one Triton kernel
+                        # (replaces ~25 elementwise ops). seq_len is token-granular
+                        # (pos+1); the kernel derives pool_len internally.
+                        q_seq = (
+                            positions[chunk.token_start : chunk.token_end].to(
+                                torch.int32
+                            )
+                            + 1
+                        )
+                        expanded = kpool_ops.expand_pools_and_append_tail(
+                            pool_ids, q_seq, index_kpool
+                        )
+                    else:
+                        valid = pool_ids >= 0
+                        expanded = kpool_ops.expand_pools_to_tokens(
+                            pool_ids, valid, topk_tokens, index_kpool
+                        )
+                    topk_indices_buffer[
+                        chunk.token_start : chunk.token_end, : expanded.shape[-1]
+                    ] = expanded
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

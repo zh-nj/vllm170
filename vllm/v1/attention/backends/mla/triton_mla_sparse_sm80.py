@@ -11,6 +11,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionLayer,
@@ -163,27 +164,36 @@ class TritonMLASparseSM80Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
-        physical_indices, valid_counts = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_tokens],
-            attn_metadata.block_table,
-            logical_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=logical_indices.shape[1],
-            return_valid_counts=True,
-        )
+        with optional_phase_profile_stage(
+            "sparse_mla.index_convert", logical_indices
+        ):
+            physical_indices, valid_counts = (
+                triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_tokens],
+                    attn_metadata.block_table,
+                    logical_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=logical_indices.shape[1],
+                    return_valid_counts=True,
+                )
+            )
         out = torch.empty_like(q, dtype=torch.bfloat16)
-        rocm_sparse_attn_prefill(
-            q=q,
-            kv=kv_rows.unsqueeze(1),
-            indices=physical_indices,
-            topk_length=valid_counts,
-            scale=self.scale,
-            head_dim=self.head_size,
-            nope_head_dim=self.kv_lora_rank,
-            rope_head_dim=self.qk_rope_head_dim,
-            attn_sink=None,
-            output=out,
-            kv_scale=layer._k_scale,
-        )
+        with optional_phase_profile_stage("sparse_mla.attention", q):
+            rocm_sparse_attn_prefill(
+                q=q,
+                kv=kv_rows.unsqueeze(1),
+                indices=physical_indices,
+                topk_length=valid_counts,
+                scale=self.scale,
+                head_dim=self.head_size,
+                nope_head_dim=self.kv_lora_rank,
+                rope_head_dim=self.qk_rope_head_dim,
+                attn_sink=None,
+                output=out,
+                kv_scale=layer._k_scale,
+                block_h=32,
+                block_k=64,
+                num_warps=8,
+            )
         return out, None

@@ -259,6 +259,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
@@ -701,14 +702,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.use_pcp,
                 )
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            with optional_phase_profile_stage(
+                "attention.kv_cache_update", kv_for_cache
+            ):
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -971,7 +975,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
-            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
+            with optional_phase_profile_stage("sparse_mla.backend", mqa_q_nope):
+                attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                    mqa_q, kv_cache, attn_metadata, self
+                )
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
@@ -1002,7 +1009,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
             # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+            with optional_phase_profile_stage(
+                "sparse_mla.output_projection", attn_out
+            ):
+                self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

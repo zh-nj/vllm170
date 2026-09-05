@@ -9,6 +9,15 @@ PYTHON_BIN=${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}
 MODEL_DIR=${MODEL_DIR:-/media/z/data6/models/GLM-5.3-Flash-W4A16-AutoRound}
 DFLASH_MODEL_DIR=${DFLASH_MODEL_DIR:-/media/z/data6/models/GLM-5.3-Flash-DFlash2}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-${MODEL_DIR}/chat_template.jinja}
+ENABLE_DFLASH=${ENABLE_DFLASH:-1}
+
+case "${ENABLE_DFLASH}" in
+    0|1) ;;
+    *)
+        echo "ENABLE_DFLASH must be 0 or 1: ${ENABLE_DFLASH}" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -x "${VLLM_BIN}" ]]; then
     echo "vLLM executable not found: ${VLLM_BIN}" >&2
@@ -32,17 +41,19 @@ for shard in $(seq 1 34); do
         exit 2
     fi
 done
-for required in config.json model.safetensors; do
-    if [[ ! -s "${DFLASH_MODEL_DIR}/${required}" ]]; then
-        echo "Invalid GLM-5.3 DFlash2 directory: ${DFLASH_MODEL_DIR}/${required}" >&2
-        exit 2
-    fi
-done
+if [[ "${ENABLE_DFLASH}" == "1" ]]; then
+    for required in config.json model.safetensors; do
+        if [[ ! -s "${DFLASH_MODEL_DIR}/${required}" ]]; then
+            echo "Invalid GLM-5.3 DFlash2 directory: ${DFLASH_MODEL_DIR}/${required}" >&2
+            exit 2
+        fi
+    done
+fi
 if [[ ! -s "${CHAT_TEMPLATE}" ]]; then
     echo "Chat template not found: ${CHAT_TEMPLATE}" >&2
     exit 2
 fi
-if ! "${PYTHON_BIN}" - "${MODEL_DIR}" "${DFLASH_MODEL_DIR}" <<'PY'
+if ! "${PYTHON_BIN}" - "${MODEL_DIR}" "${DFLASH_MODEL_DIR}" "${ENABLE_DFLASH}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -86,7 +97,8 @@ try:
         if Path(shard).name != shard:
             raise ValueError(f"target index contains an invalid path: {shard}")
         validate_safetensors(model_dir / shard)
-    validate_safetensors(draft_dir / "model.safetensors")
+    if sys.argv[3] == "1":
+        validate_safetensors(draft_dir / "model.safetensors")
 except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
     print(f"Model download validation failed: {exc}", file=sys.stderr)
     raise SystemExit(1)
@@ -101,10 +113,10 @@ export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
-# Keep the last target stage lighter because DFlash2 is constructed there. The
-# 16,15,14 split leaves enough headroom for its full-vocabulary lm_head on
-# 64-GiB CMP170HX cards while preserving three target PP stages.
-export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-16,15,14}
+# Keep the last target stage lighter because DFlash2 and its full-vocabulary
+# lm_head are constructed there. This measured split balances the three 64-GiB
+# CMP170HX cards more closely than an even target-layer partition.
+export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-17,15,13}
 export VLLM_PP_REUSE_RECV_BUFFER=${VLLM_PP_REUSE_RECV_BUFFER:-0}
 export VLLM_KV_CACHE_LAYOUT=${VLLM_KV_CACHE_LAYOUT:-LBHNC}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -114,21 +126,26 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8099}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-glm53-flash-autoround-dflash2}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
-# Keep dummy-run activation workspace below the 64-GiB per-card limit after
-# loading the target and DFlash2 models. Increase explicitly for larger batches
-# only after measuring the resulting PP2 peak.
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-128}
+# Use a larger prefill chunk to amortize PP and scheduler overhead. The PP
+# partition keeps the DFlash2 stage lighter for its larger activation workspace.
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-2048}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.96}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}
 DFLASH_KV_CACHE_DTYPE=${DFLASH_KV_CACHE_DTYPE:-auto}
 DFLASH_NUM_SPECULATIVE_TOKENS=${DFLASH_NUM_SPECULATIVE_TOKENS:-7}
+COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"cudagraph_mode":"FULL"}'}
 
 SPECULATIVE_CONFIG=$(printf \
     '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":1,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN","kv_cache_dtype":"%s"}' \
     "${DFLASH_MODEL_DIR}" \
     "${DFLASH_NUM_SPECULATIVE_TOKENS}" \
     "${DFLASH_KV_CACHE_DTYPE}")
+
+SPECULATIVE_ARGS=()
+if [[ "${ENABLE_DFLASH}" == "1" ]]; then
+    SPECULATIVE_ARGS=(--speculative-config "${SPECULATIVE_CONFIG}")
+fi
 
 exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
@@ -145,7 +162,7 @@ exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --attention-backend TRITON_MLA_SPARSE_SM80 \
     --language-model-only \
     --skip-mm-profiling \
-    --enforce-eager \
+    --compilation-config "${COMPILATION_CONFIG}" \
     --disable-cascade-attn \
     --no-enable-prefix-caching \
     --trust-remote-code \
@@ -154,5 +171,5 @@ exec "${VLLM_BIN}" serve "${MODEL_DIR}" \
     --reasoning-parser glm45 \
     --tool-call-parser glm47 \
     --enable-auto-tool-choice \
-    --speculative-config "${SPECULATIVE_CONFIG}" \
+    "${SPECULATIVE_ARGS[@]}" \
     "$@"

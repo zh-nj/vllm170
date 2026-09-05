@@ -81,8 +81,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.deepseek_v4.phase_profile import phase_profile_layer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
@@ -144,9 +146,12 @@ class Glm5NextMLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        with optional_phase_profile_stage("mlp.dense.gate_up", x):
+            gate_up, _ = self.gate_up_proj(x)
+        with optional_phase_profile_stage("mlp.dense.activation", gate_up):
+            x = self.act_fn(gate_up)
+        with optional_phase_profile_stage("mlp.dense.down", x):
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -263,7 +268,8 @@ class Glm5NextMoE(nn.Module):
 
         # The router is always external (self.gate); main's MoERunner expects
         # pre-computed router_logits, so compute them here unconditionally.
-        router_logits, _ = self.gate(hidden_states)
+        with optional_phase_profile_stage("moe.router_gate", hidden_states):
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -423,14 +429,20 @@ class Glm5NextDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-            attn_output = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-            )
+            with optional_phase_profile_stage(
+                "layer.attention", hidden_states, level="module"
+            ):
+                attn_output = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                )
             hidden_states, residual = self.post_attention_layernorm(
                 attn_output, residual=residual
             )
-            hidden_states = self.mlp(hidden_states)
+            with optional_phase_profile_stage(
+                "layer.ffn", hidden_states, level="module"
+            ):
+                hidden_states = self.mlp(hidden_states)
             if self.is_mtp_layer:
                 # Return the unsummed pair: the MTP caller feeds it straight
                 # into shared_head's fused_add_rms_norm (one kernel instead of
@@ -445,62 +457,68 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
-        if post is None:
-            if self.layer_idx == 0:
-                x = hc_expand(x, self.n)
-            residual = x
-            post, comb, x = self.hc_pre(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm_weight=self.input_layernorm.weight.data,
-                norm_eps=self.input_layernorm.variance_epsilon,
-            )
-        else:
-            residual, post, comb, x = self.hc_fused_post_pre(
-                x,
-                residual,
-                post,
-                comb,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm_weight=self.input_layernorm.weight.data,
-                norm_eps=self.input_layernorm.variance_epsilon,
-            )
+        with optional_phase_profile_stage("layer.mhc_attention_pre", x):
+            if post is None:
+                if self.layer_idx == 0:
+                    x = hc_expand(x, self.n)
+                residual = x
+                post, comb, x = self.hc_pre(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm_weight=self.input_layernorm.weight.data,
+                    norm_eps=self.input_layernorm.variance_epsilon,
+                )
+            else:
+                residual, post, comb, x = self.hc_fused_post_pre(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm_weight=self.input_layernorm.weight.data,
+                    norm_eps=self.input_layernorm.variance_epsilon,
+                )
 
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.self_attn(
-            hidden_states=x,
-            positions=positions,
-        )
+        with optional_phase_profile_stage("layer.attention", x, level="module"):
+            x = self.self_attn(
+                hidden_states=x,
+                positions=positions,
+            )
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
-        residual, post, comb, x = self.hc_fused_post_pre(
-            x,
-            residual,
-            post,
-            comb,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            norm_weight=self.post_attention_layernorm.weight.data,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
-        )
+        with optional_phase_profile_stage("layer.mhc_ffn_pre", x):
+            residual, post, comb, x = self.hc_fused_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm_weight=self.post_attention_layernorm.weight.data,
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
+            )
 
         # Fully Connected
-        if self._mlp_is_moe:
-            x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
-        else:
-            x = self.mlp(x)
+        with optional_phase_profile_stage("layer.ffn", x, level="module"):
+            if self._mlp_is_moe:
+                x = self.mlp(
+                    x, already_sequence_parallel=self.is_sequence_parallel
+                )
+            else:
+                x = self.mlp(x)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -718,7 +736,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                with optional_phase_profile_stage(
+                    "model.embedding", input_ids, level="module"
+                ):
+                    hidden_states = self.embed_input_ids(input_ids)
             residual = None
             post = None
             comb = None
@@ -753,9 +774,15 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         for local_idx, layer in enumerate(self._active_layers):
             layer_idx = self.start_layer + local_idx
-            hidden_states, residual, post, comb = layer(
-                positions, hidden_states, residual, post, comb
-            )
+            with (
+                phase_profile_layer(f"model.layers.{layer_idx}"),
+                optional_phase_profile_stage(
+                    "layer.total", hidden_states, level="module"
+                ),
+            ):
+                hidden_states, residual, post, comb = layer(
+                    positions, hidden_states, residual, post, comb
+                )
             # DFlash layer ids denote the target block output (the generic
             # Eagle3 config converts them to one-based ids).  mHC defers this
             # output's post-mix until the next block, so materialize it on a
@@ -776,7 +803,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             if post is not None:
                 assert residual is not None and comb is not None
                 last_layer = self._active_layers[-1]
-                hidden_states = last_layer.hc_post(hidden_states, residual, post, comb)
+                with optional_phase_profile_stage(
+                    "model.pp_materialize", hidden_states, level="stage"
+                ):
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, residual, post, comb
+                    )
             tensors = {"hidden_states": hidden_states}
             if aux_hidden_states is not None:
                 tensors["aux_hidden_states"] = aux_hidden_states
@@ -785,7 +817,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
-        hidden_states = self.norm(hidden_states)
+        with optional_phase_profile_stage(
+            "model.final_norm", hidden_states, level="stage"
+        ):
+            hidden_states = self.norm(hidden_states)
         if aux_hidden_states is not None:
             return hidden_states, [
                 aux_hidden_states[:, i] for i in range(aux_hidden_states.shape[1])

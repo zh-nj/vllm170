@@ -2705,6 +2705,9 @@ def _rocm_sparse_attn_prefill_triton(
     topk_length: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    block_h: int = 16,
+    block_k: int | None = None,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
@@ -2724,6 +2727,9 @@ def _rocm_sparse_attn_prefill_triton(
         rope_head_dim=rope_head_dim,
         output=output,
         kv_scale=kv_scale,
+        block_h=block_h,
+        block_k=block_k,
+        num_warps=num_warps,
     )
 
 
@@ -3241,6 +3247,9 @@ def rocm_sparse_attn_prefill(
     ragged_indices: torch.Tensor | None = None,
     ragged_indptr: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    block_h: int = 16,
+    block_k: int | None = None,
+    num_warps: int = 4,
 ) -> None:
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
@@ -3266,6 +3275,9 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             output=caller_output,
             kv_scale=kv_scale,
+            block_h=block_h,
+            block_k=block_k,
+            num_warps=num_warps,
         )
     else:
         assert indices is not None
@@ -3281,6 +3293,9 @@ def rocm_sparse_attn_prefill(
             topk_length=topk_length,
             output=caller_output,
             kv_scale=kv_scale,
+            block_h=block_h,
+            block_k=block_k,
+            num_warps=num_warps,
         )
     if caller_output is None:
         output.copy_(output_chunk)

@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
 
 @dataclass
@@ -172,7 +173,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            with optional_phase_profile_stage(
+                "attention.qkv_a_projection", hidden_states
+            ):
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -188,41 +192,48 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             assert self.q_proj is not None, (
                 "q_proj is required when q_lora_rank is None"
             )
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            with optional_phase_profile_stage(
+                "attention.kv_a_projection", hidden_states
+            ):
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q_proj_layer = self.q_proj
             q_proj_input = hidden_states
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        if self.fuse_qkv_rmsnorm and q_c is not None:
-            # Fuse q_a + kv_a RMSNorm into one kernel launch (q_c is still the
-            # pre-norm projection output here).
-            assert self.q_a_layernorm is not None
-            q_proj_input, kv_c_normed = fused_q_kv_rmsnorm(
-                q_c,
-                kv_c,
-                self.q_a_layernorm.weight.data,
-                self.kv_a_layernorm.weight.data,
-                self.q_a_layernorm.variance_epsilon,
-            )
-            q_c = q_proj_input
-        else:
-            kv_c_normed = self.kv_a_layernorm(kv_c)
+        with optional_phase_profile_stage("attention.qkv_a_norm", kv_c):
+            if self.fuse_qkv_rmsnorm and q_c is not None:
+                # Fuse q_a + kv_a RMSNorm into one kernel launch (q_c is still
+                # the pre-norm projection output here).
+                assert self.q_a_layernorm is not None
+                q_proj_input, kv_c_normed = fused_q_kv_rmsnorm(
+                    q_c,
+                    kv_c,
+                    self.q_a_layernorm.weight.data,
+                    self.kv_a_layernorm.weight.data,
+                    self.q_a_layernorm.variance_epsilon,
+                )
+                q_c = q_proj_input
+            else:
+                kv_c_normed = self.kv_a_layernorm(kv_c)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q = q_proj_layer(q_proj_input)[0]
+        with optional_phase_profile_stage("attention.q_projection", q_proj_input):
+            q = q_proj_layer(q_proj_input)[0]
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
 
         if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            with optional_phase_profile_stage("attention.rope", q):
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            with optional_phase_profile_stage("attention.indexer", hidden_states):
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
@@ -231,15 +242,21 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.dcp_q_replicate:
             q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
-        attn_out = self.mla_attn(
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
-            q_dcp_replicated=q_dcp_replicated,
-        )
+        with optional_phase_profile_stage("attention.sparse_mla", q):
+            attn_out = self.mla_attn(
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape=(
+                    hidden_states.shape[0],
+                    self.num_heads * self.v_head_dim,
+                ),
+                q_dcp_replicated=q_dcp_replicated,
+            )
 
         if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+            with optional_phase_profile_stage("attention.output_gate", attn_out):
+                attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
-        return self.o_proj(attn_out)[0]
+        with optional_phase_profile_stage("attention.output_projection", attn_out):
+            return self.o_proj(attn_out)[0]

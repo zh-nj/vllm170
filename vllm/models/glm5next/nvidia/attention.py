@@ -32,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
@@ -316,45 +317,52 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
+        with optional_phase_profile_stage("indexer.q_projection", qr):
+            q, _ = self.wq_b(qr)
+            q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        with optional_phase_profile_stage(
+            "indexer.k_weights_projection", hidden_states
+        ):
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            if self._wp_fp32 is None:
+                self._wp_fp32 = (
+                    self.wk_weights_proj.weight.data[self.head_dim :, :]
+                    .t()
+                    .contiguous()
+                    .float()
+                )
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
-        k = _fused_indexer_k_norm(
-            k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
-        )
+        with optional_phase_profile_stage("indexer.k_norm", k):
+            k = _fused_indexer_k_norm(
+                k,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.head_dim,
+                self.k_norm.eps,
+            )
 
         if self.rope_dim > 0:
-            q_pe, q_nope = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-            k_pe, k_nope = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
+            with optional_phase_profile_stage("indexer.rope", q):
+                q_pe, q_nope = torch.split(
+                    q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+                k_pe, k_nope = torch.split(
+                    k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
 
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-            # Note: RoPE (NeoX) can introduce extra leading dimensions during
-            # compilation so we need to reshape back to token-flattened shapes
-            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+                # Note: RoPE (NeoX) can introduce extra leading dimensions
+                # during compilation so reshape back to token-flattened shapes.
+                q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+                k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-            # `rotary_emb` is shape-preserving; `q_pe` is already
-            # [num_tokens, n_head, rope_dim].
-            q = torch.cat([q_pe, q_nope], dim=-1)
-            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+                q = torch.cat([q_pe, q_nope], dim=-1)
+                k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
         # else: qk_rope_head_dim=0 — no rope component. q is already
         # [num_tokens, n_head, head_dim] and k is [num_tokens, head_dim] (all
         # nope), so skip the rope split / rotary / cat entirely; otherwise the
@@ -365,19 +373,22 @@ class Indexer(nn.Module):
         # round-trip and bf16 matrix-rounding bias.
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        with optional_phase_profile_stage("indexer.q_quant", q):
+            q = q.view(-1, self.head_dim)
+            q_fp8, q_scale = fwht128_quant_fp8(q)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
-        )
+        with optional_phase_profile_stage("indexer.weight_scale", weights):
+            weights = _fused_indexer_weight_scale(
+                weights, q_scale, self.softmax_scale * self.n_head**-0.5
+            )
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        with optional_phase_profile_stage("indexer.gate_projection", hidden_states):
+            gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
@@ -385,20 +396,22 @@ class Indexer(nn.Module):
         # weights: logits are a weights-weighted sum over heads, so
         # zero-weight padded heads contribute exactly nothing.
         if self.n_head < 32:
-            pad = 32 - self.n_head
-            q_fp8 = _pad_indexer_heads(q_fp8, pad)
-            weights = _pad_indexer_heads(weights, pad)
+            with optional_phase_profile_stage("indexer.pad_heads", q_fp8):
+                pad = 32 - self.n_head
+                q_fp8 = _pad_indexer_heads(q_fp8, pad)
+                weights = _pad_indexer_heads(weights, pad)
 
-        return self.indexer_op(
-            hidden_states,
-            q_fp8,
-            k,
-            weights,
-            gate_score=gate_score,
-            compress_ape=self.index_kpool_compress_ape,
-            index_kpool=self.index_kpool,
-            positions=positions,
-        )
+        with optional_phase_profile_stage("indexer.kpool_op", hidden_states):
+            return self.indexer_op(
+                hidden_states,
+                q_fp8,
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=self.index_kpool_compress_ape,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
 
 
 class Glm5NextMLAAttention(nn.Module):
