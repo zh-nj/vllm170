@@ -9,6 +9,7 @@ from vllm.models.glm5next.nvidia.model import (
     Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
+    _should_materialize_target_embedding,
 )
 
 
@@ -37,3 +38,21 @@ def test_glm5next_target_declares_pp_and_dflash_interfaces() -> None:
     assert Glm5NextForCausalLM.supports_eagle3
     assert Glm5NextForConditionalGeneration.supports_eagle3
     assert callable(Glm5NextForCausalLM.make_empty_intermediate_tensors)
+
+
+def test_glm5next_dflash_pp_last_rank_has_target_embedding() -> None:
+    dflash_config = SimpleNamespace(speculative_config=SimpleNamespace(method="dflash"))
+    eagle_config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle"))
+
+    assert _should_materialize_target_embedding(
+        dflash_config, is_first_rank=False, is_last_rank=True
+    )
+    assert not _should_materialize_target_embedding(
+        eagle_config, is_first_rank=False, is_last_rank=True
+    )
+    assert _should_materialize_target_embedding(
+        eagle_config, is_first_rank=True, is_last_rank=False
+    )
+    assert not _should_materialize_target_embedding(
+        dflash_config, is_first_rank=False, is_last_rank=False
+    )

@@ -514,9 +514,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # Fully Connected
         with optional_phase_profile_stage("layer.ffn", x, level="module"):
             if self._mlp_is_moe:
-                x = self.mlp(
-                    x, already_sequence_parallel=self.is_sequence_parallel
-                )
+                x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
             else:
                 x = self.mlp(x)
 
@@ -595,6 +593,20 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
+def _should_materialize_target_embedding(
+    vllm_config: VllmConfig,
+    *,
+    is_first_rank: bool,
+    is_last_rank: bool,
+) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return is_first_rank or (
+        is_last_rank
+        and speculative_config is not None
+        and speculative_config.method == "dflash"
+    )
+
+
 class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -628,7 +640,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if _should_materialize_target_embedding(
+            vllm_config,
+            is_first_rank=pp_group.is_first_rank,
+            is_last_rank=pp_group.is_last_rank,
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

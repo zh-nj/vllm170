@@ -83,7 +83,7 @@ def test_analyzer_preserves_attention_metadata_kv_cache_groups() -> None:
     assert [row["cpu_mean_us"] for row in rows] == [35, 55]
 
 
-def test_analyzer_requires_distinct_prefill_decode_and_dspark_details() -> None:
+def test_analyzer_requires_distinct_target_and_draft_details() -> None:
     records: list[dict[str, Any]] = []
     for flow, stages in phase_profile_analyze.DETAIL_REQUIREMENTS.items():
         records.extend(_row(flow, stage, 0, 1) for stage in stages)
@@ -92,7 +92,7 @@ def test_analyzer_requires_distinct_prefill_decode_and_dspark_details() -> None:
 
     assert all(
         summary["flows"][flow]["detail_complete"]
-        for flow in ("prefill", "decode", "dspark")
+        for flow in ("prefill", "decode", "dspark", "dflash")
     )
 
 

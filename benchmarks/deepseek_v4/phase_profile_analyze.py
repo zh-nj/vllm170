@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Summarize prefill, decode, and DSpark CUDA-event phase records."""
+"""Summarize target, DSpark, and DFlash CUDA-event phase records."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-FLOWS = ("prefill", "decode", "dspark")
+FLOWS = ("prefill", "decode", "dspark", "dflash")
 DETAIL_REQUIREMENTS = {
     "prefill": {
         "layer.total",
@@ -86,6 +86,20 @@ DETAIL_REQUIREMENTS = {
         "draft.markov_bias",
         "draft.markov.projection",
         "draft.markov_sample",
+    },
+    "dflash": {
+        "target.sampling_total",
+        "target.logits",
+        "target.rejection.verify_total",
+        "draft.propose_total",
+        "draft.prepare_inputs",
+        "draft.context_kv",
+        "draft.dispatch",
+        "draft.metadata",
+        "draft.backbone",
+        "draft.logits.lm_head",
+        "draft.selector",
+        "draft.selector_walk",
     },
 }
 
@@ -194,7 +208,7 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         extra = row.get("extra")
         step_kind = row.get("step_kind")
         if step_kind is None and isinstance(extra, dict):
-            step_kind = extra.get("dspark_kind")
+            step_kind = extra.get("draft_kind", extra.get("dspark_kind"))
         if not isinstance(step_kind, str):
             step_kind = None
         step_id = row.get("step_id")
@@ -533,22 +547,23 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     flows["decode"]["serial_stage"] = _decode_serial_stages(
         flows["decode"]["by_step_rank_stage"]
     )
-    flows["dspark"]["proposal_shapes"] = _dspark_proposal_shapes(
-        flows["dspark"]["by_step_rank_stage"]
-    )
-    flows["dspark"]["draft_module_coverage"] = _draft_module_coverage(
-        flows["dspark"]["by_rank_stage"]
-    )
-    flows["dspark"]["marlin_moe"] = _marlin_moe(
-        flows["dspark"]["by_rank_stage"],
-        flows["dspark"]["marlin_shape_stage"],
-    )
-    flows["dspark"]["cycle_summary"] = _dspark_cycle_summary(
-        flows["decode"]["round_summary"],
-        flows["decode"]["by_rank_stage"],
-        flows["dspark"]["by_kind_rank_stage"],
-        flows["dspark"]["proposal_shapes"],
-    )
+    for flow in ("dspark", "dflash"):
+        flows[flow]["proposal_shapes"] = _draft_proposal_shapes(
+            flows[flow]["by_step_rank_stage"]
+        )
+        flows[flow]["draft_module_coverage"] = _draft_module_coverage(
+            flows[flow]["by_rank_stage"]
+        )
+        flows[flow]["marlin_moe"] = _marlin_moe(
+            flows[flow]["by_rank_stage"],
+            flows[flow]["marlin_shape_stage"],
+        )
+        flows[flow]["cycle_summary"] = _draft_cycle_summary(
+            flows["decode"]["round_summary"],
+            flows["decode"]["by_rank_stage"],
+            flows[flow]["by_kind_rank_stage"],
+            flows[flow]["proposal_shapes"],
+        )
 
     return {
         "schema_version": 1,
@@ -566,7 +581,7 @@ def analyze_phase_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _dspark_proposal_shapes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _draft_proposal_shapes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str | None, int | None], list[float]] = defaultdict(list)
     for row in rows:
         if row["stage"] == "draft.propose_total":
@@ -636,10 +651,10 @@ def _draft_module_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _dspark_cycle_summary(
+def _draft_cycle_summary(
     target_rounds: list[dict[str, Any]],
     target_rows: list[dict[str, Any]],
-    dspark_kind_rows: list[dict[str, Any]],
+    draft_kind_rows: list[dict[str, Any]],
     proposal_shapes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     target_round_count = sum(row["round_count"] for row in target_rounds)
@@ -656,11 +671,11 @@ def _dspark_cycle_summary(
     target_prepare_critical_rank, target_prepare_critical_us = max(
         target_prepare_by_rank.items(), key=lambda item: item[1], default=(None, 0.0)
     )
-    dspark_decode = {
-        row["stage"]: row for row in dspark_kind_rows if row["step_kind"] == "decode"
+    draft_decode = {
+        row["stage"]: row for row in draft_kind_rows if row["step_kind"] == "decode"
     }
-    target_sampling = dspark_decode.get("target.sampling_total")
-    draft_propose = dspark_decode.get("draft.propose_total")
+    target_sampling = draft_decode.get("target.sampling_total")
+    draft_propose = draft_decode.get("draft.propose_total")
     proposal_tokens = {
         row["token_count"] for row in proposal_shapes if row["step_kind"] == "decode"
     }
@@ -904,10 +919,12 @@ def render_flow_markdown(flow: str, summary: dict[str, Any]) -> str:
             "largest rank only as a balance diagnostic; the serial section aligns "
             "and sums model work by round. Nested levels must not be added."
         )
-    elif flow == "dspark":
+    elif flow in {"dspark", "dflash"}:
+        draft_name = "DSpark" if flow == "dspark" else "DFlash"
         rank_note = (
             "The target q8 verification traverses PP0/PP1/PP2 and remains in the "
-            "decode flow. Target sampling and the DSpark proposal then execute on "
+            f"decode flow. Target sampling and the {draft_name} proposal then "
+            "execute on "
             "PP2. The cycle section combines only sibling top-level GPU scopes; "
             "nested rows must not be added."
         )
@@ -957,15 +974,16 @@ def render_flow_markdown(flow: str, summary: dict[str, Any]) -> str:
         lines.extend(_render_prefill_details(summary))
     elif flow == "decode":
         lines.extend(_render_decode_details(summary))
-    elif flow == "dspark":
-        lines.extend(_render_dspark_details(summary))
+    elif flow in {"dspark", "dflash"}:
+        lines.extend(_render_draft_details(flow, summary))
     return "\n".join(lines) + "\n"
 
 
-def _render_dspark_details(summary: dict[str, Any]) -> list[str]:
+def _render_draft_details(flow: str, summary: dict[str, Any]) -> list[str]:
+    draft_name = "DSpark" if flow == "dspark" else "DFlash"
     lines = [
         "",
-        "## Steady-state DSpark cycle",
+        f"## Steady-state {draft_name} cycle",
         "",
         (
             "Target input and attention-metadata preparation can run concurrently "
@@ -1025,7 +1043,8 @@ def _render_dspark_details(summary: dict[str, Any]) -> list[str]:
             "## Proposal classes",
             "",
             (
-                "Prefill rows are DSpark proposals invoked while target prompt chunks "
+                f"Prefill rows are {draft_name} proposals invoked while target "
+                "prompt chunks "
                 "are still being processed. Decode rows are steady speculative rounds."
             ),
             "",
@@ -1055,12 +1074,17 @@ def _render_dspark_details(summary: dict[str, Any]) -> list[str]:
         "target.rejection.counts",
         "draft.propose_total",
         "draft.hidden_prepare",
+        "draft.hidden_combine.concat",
+        "draft.hidden_combine.projection",
+        "draft.hidden_copy",
         "draft.hidden_combine.main_proj",
         "draft.hidden_combine.main_norm",
         "draft.prepare_inputs",
         "draft.context_kv",
+        "draft.context_kv.input_norm",
         "draft.context_kv.input_gemm",
         "draft.context_kv.norm",
+        "draft.context_kv.rope",
         "draft.context_kv.insert",
         "draft.dispatch",
         "draft.metadata",
@@ -1076,6 +1100,9 @@ def _render_dspark_details(summary: dict[str, Any]) -> list[str]:
         "draft.base_logits",
         "draft.logits.norm",
         "draft.logits.lm_head",
+        "draft.logits.cache",
+        "draft.selector",
+        "draft.selector_walk",
         "draft.markov_bias",
         "draft.markov.embed",
         "draft.markov.projection",
@@ -1196,7 +1223,7 @@ def _render_decode_details(summary: dict[str, Any]) -> list[str]:
         "## Target verification rounds",
         "",
         (
-            "A production DSpark-7 target round carries up to eight tokens. "
+            "A production seven-token speculative round carries up to eight tokens. "
             "Its PP stages form a dependency chain, so the aligned PP model "
             "ranges are additive; the slowest-stage column remains a balance "
             "diagnostic."

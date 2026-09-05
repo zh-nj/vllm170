@@ -22,7 +22,7 @@ from vllm.profiler.phase_profile_hook import register_phase_profile_stage
 
 logger = init_logger(__name__)
 
-ProfileFlow = Literal["prefill", "decode", "dspark"]
+ProfileFlow = Literal["prefill", "decode", "dspark", "dflash"]
 ProfileLevel = Literal["total", "module", "stage", "detail"]
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -35,7 +35,7 @@ _PROFILE_RECORD_FUNCTION = (
 _PROFILE_FLOWS = {
     flow.strip()
     for flow in os.getenv(
-        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark,dflash"
     ).split(",")
     if flow.strip()
 }
@@ -259,10 +259,13 @@ def phase_profile_stage(
     extra: dict[str, Any] | None = None,
 ):
     """Measure one GPU stage and expose the same label to Torch traces."""
-    # The DSpark drafter can reuse target DSV4 attention modules whose backend
-    # naturally calls itself "decode". Keep those nested records in the outer
-    # DSpark flow instead of contaminating target decode attribution.
-    actual_flow = "dspark" if _CONTEXT.flow == "dspark" else flow or _CONTEXT.flow
+    # Draft backbones can reuse target modules whose backend naturally calls
+    # itself "decode". Keep nested records in the outer draft flow.
+    actual_flow = (
+        _CONTEXT.flow
+        if _CONTEXT.flow in {"dspark", "dflash"}
+        else flow or _CONTEXT.flow
+    )
     if _PROFILE_STAGES and stage not in _PROFILE_STAGES:
         return nullcontext()
     current_layer = _CONTEXT.layer
@@ -289,7 +292,7 @@ def phase_profile_stage(
         previous_step_kind = context.step_kind
         context.flow = actual_flow
         if context.step_kind is None and extra:
-            extra_step_kind = extra.get("dspark_kind")
+            extra_step_kind = extra.get("draft_kind", extra.get("dspark_kind"))
             if isinstance(extra_step_kind, str):
                 context.step_kind = extra_step_kind
         context.stage_depth += 1
@@ -345,12 +348,24 @@ def classify_target_flow(is_prefilling: Any) -> ProfileFlow:
         return "decode"
 
 
-def profile_dspark_step(function: _F) -> _F:
-    """Wrap the shared DFlash proposal only when the subclass is DSpark."""
+def classify_speculator_flow(speculator_name: Any) -> ProfileFlow | None:
+    """Map a supported speculator to its profiling flow."""
+    flows: dict[str, ProfileFlow] = {
+        "DFlash": "dflash",
+        "DFlash2": "dflash",
+        "DSpark": "dspark",
+    }
+    return flows.get(speculator_name) if isinstance(speculator_name, str) else None
+
+
+def profile_parallel_draft_step(function: _F) -> _F:
+    """Attach one DFlash or DSpark proposal to its draft profiling flow."""
 
     @wraps(function)
     def wrapped(self: Any, input_batch: Any, *args: Any, **kwargs: Any) -> Any:
-        if getattr(self, "_speculator_name", None) != "DSpark":
+        speculator_name = getattr(self, "_speculator_name", None)
+        flow = classify_speculator_flow(speculator_name)
+        if flow is None:
             return function(self, input_batch, *args, **kwargs)
         graph_mode = self.vllm_config.compilation_config.cudagraph_mode.decode_mode()
         execution = (
@@ -361,7 +376,7 @@ def profile_dspark_step(function: _F) -> _F:
         step_kind = classify_target_flow(input_batch.is_prefilling_np)
         with (
             phase_profile_step(
-                "dspark",
+                flow,
                 token_count=input_batch.num_tokens,
                 execution=execution,
                 step_kind=step_kind,
@@ -371,7 +386,8 @@ def profile_dspark_step(function: _F) -> _F:
                 input_batch.input_ids,
                 level="total",
                 extra={
-                    "dspark_kind": step_kind,
+                    "draft_kind": step_kind,
+                    "speculator": speculator_name,
                     "num_reqs": input_batch.num_reqs,
                     "num_draft_tokens": input_batch.num_draft_tokens,
                     "num_query_tokens": (input_batch.num_reqs * self.num_query_per_req),

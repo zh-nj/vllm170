@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -187,31 +188,44 @@ class DFlash2Speculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        last_hidden_states = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
+        with optional_phase_profile_stage(
+            "draft.backbone", self.input_buffers.input_ids, level="stage"
+        ):
+            last_hidden_states = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
         num_sample = num_reqs * self.num_speculative_steps
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
             num_reqs, self.num_speculative_steps, -1
         )
-        candidate_ids, unary_logits = self.model.compute_candidates(
-            hidden_states.flatten(0, 1)
-        )
+        with optional_phase_profile_stage(
+            "draft.logits.lm_head", hidden_states, level="stage"
+        ):
+            candidate_ids, unary_logits = self.model.compute_candidates(
+                hidden_states.flatten(0, 1)
+            )
         candidate_ids = candidate_ids.view(
             num_reqs, self.num_speculative_steps, self.selector_top_k
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
-        scores = self.model.model.candidate_selector(
-            candidate_ids,
-            unary_logits,
-            hidden_states,
-            anchor_token_ids,
-        )
-        self._sample_path(candidate_ids, scores, num_reqs)
+        with optional_phase_profile_stage(
+            "draft.selector", hidden_states, level="stage"
+        ):
+            scores = self.model.model.candidate_selector(
+                candidate_ids,
+                unary_logits,
+                hidden_states,
+                anchor_token_ids,
+            )
+        with optional_phase_profile_stage("draft.selector_walk", scores, level="stage"):
+            self._sample_path(candidate_ids, scores, num_reqs)
         if self.draft_logits is not None:
-            self._cache_draft_logits(candidate_ids, num_sample)
+            with optional_phase_profile_stage(
+                "draft.logits.cache", candidate_ids, level="stage"
+            ):
+                self._cache_draft_logits(candidate_ids, num_sample)

@@ -54,6 +54,7 @@ from vllm.model_executor.offloader import (
 )
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.models.deepseek_v4.phase_profile import (
+    classify_speculator_flow,
     classify_target_flow,
     phase_profile_stage,
     phase_profile_step,
@@ -1470,24 +1471,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        speculator_name = getattr(self.speculator, "_speculator_name", None)
+        profile_flow = classify_speculator_flow(speculator_name)
+        profile_extra = {
+            "draft_kind": classify_target_flow(input_batch.is_prefilling_np),
+            "speculator": speculator_name,
+            "num_reqs": input_batch.num_reqs,
+            "num_draft_tokens": input_batch.num_draft_tokens,
+        }
+        with phase_profile_stage(
+            "target.sampling_total",
+            hidden_states,
+            flow=profile_flow,
+            level="total",
+            extra=profile_extra,
+        ):
+            return self._sample(hidden_states, input_batch, grammar_output)
+
+    def _sample(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
-        if self.batch_sharder is not None:
-            # Shard the inputs along the batch dimension to sample in parallel
-            # across TP ranks.
-            input_batch, sorted_logits_indices, grammar_output, shard_metadata = (
-                self.batch_sharder.shard_sampler_inputs(input_batch, grammar_output)
-            )
-            # The hidden states must be gathered in rank-owner-sorted order
-            # before computing the partial-vocab logits, so that the all-to-all
-            # produces full-vocab logits for just the locally-owned requests.
-            sample_hidden_states = hidden_states[sorted_logits_indices]
-            local_logits = self.model.compute_logits_local(sample_hidden_states)
-            logits = all_to_all_logits(local_logits, shard_metadata)
-            logits = logits[:, : self.vocab_size]
-        else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+        with phase_profile_stage("target.logits", hidden_states, level="stage"):
+            if self.batch_sharder is not None:
+                # Shard the inputs along the batch dimension to sample in parallel
+                # across TP ranks.
+                input_batch, sorted_logits_indices, grammar_output, shard_metadata = (
+                    self.batch_sharder.shard_sampler_inputs(input_batch, grammar_output)
+                )
+                # The hidden states must be gathered in rank-owner-sorted order
+                # before computing the partial-vocab logits, so that the all-to-all
+                # produces full-vocab logits for just the locally-owned requests.
+                sample_hidden_states = hidden_states[sorted_logits_indices]
+                local_logits = self.model.compute_logits_local(sample_hidden_states)
+                logits = all_to_all_logits(local_logits, shard_metadata)
+                logits = logits[:, : self.vocab_size]
+            else:
+                sample_hidden_states = hidden_states[input_batch.logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1500,23 +1525,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         sampler_output: SamplerOutput | None
-        if input_batch.num_reqs == 0:
-            # This rank owns no requests this step. It contributes an
-            # all-padding block to the gather below.
-            sampler_output = None
-        elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
-            assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
-        else:
-            # Rejection sampling for spec decoding.
-            assert self.rejection_sampler is not None
-            assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-            )
+        sample_stage = (
+            "target.sample"
+            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None
+            else "target.rejection"
+        )
+        with phase_profile_stage(sample_stage, logits, level="stage"):
+            if input_batch.num_reqs == 0:
+                # This rank owns no requests this step. It contributes an
+                # all-padding block to the gather below.
+                sampler_output = None
+            elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+                assert self.sampler is not None
+                sampler_output = self.sampler(logits, input_batch)
+            else:
+                # Rejection sampling for spec decoding.
+                assert self.rejection_sampler is not None
+                assert self.speculator is not None
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
 
         if shard_metadata is not None:
             # Gather the sharded sampler outputs from the TP ranks into a single

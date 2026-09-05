@@ -424,12 +424,15 @@ class RejectionSampler:
         self.device = device
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.has_draft_logits = spec_config.draft_sample_method == "probabilistic"
+        self._audit_method = spec_config.method
         self._q1_audit_samples = 0
         self._q1_audit_sample_limit = 0
         if spec_config.method == "dspark" and envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT:
             self._q1_audit_sample_limit = max(
                 0, envs.VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES
             )
+        elif spec_config.method == "dflash" and envs.VLLM_DFLASH_Q1_AUDIT:
+            self._q1_audit_sample_limit = max(0, envs.VLLM_DFLASH_Q1_AUDIT_SAMPLES)
         self._prob_audit_samples = 0
         self._prob_audit_sample_limit = 0
         if (
@@ -698,7 +701,8 @@ class RejectionSampler:
         for record in records:
             record["sample_index"] = self._q1_audit_samples
             logger.info(
-                "DSpark q1 acceptance audit: %s",
+                "%s q1 acceptance audit: %s",
+                self._audit_method,
                 json.dumps(record, sort_keys=True),
             )
             self._q1_audit_samples += 1
@@ -801,15 +805,24 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+        with optional_phase_profile_stage(
+            "target.rejection.verify_total",
             logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            chunk_logit_limit,
-            max_num_logprobs,
-        )
+            extra={
+                "num_logits": logits.shape[0],
+                "vocab_size": logits.shape[1],
+                "max_chunk_logits": chunk_logit_limit,
+            },
+        ):
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                chunk_logit_limit,
+                max_num_logprobs,
+            )
 
         with optional_phase_profile_stage("target.rejection.counts", num_sampled):
             num_sampled, num_rejected = get_num_sampled_and_rejected(

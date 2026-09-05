@@ -32,6 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.multimodal.inputs import NestedTensors
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
@@ -73,46 +74,6 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
-
-
-def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's primary-attention RoPE layout.
-
-    A DFlash head must rotate Q/K the way the target it was distilled against
-    does, and a mismatch is silent — acceptance collapses but nothing errors and
-    the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no primary-attention RoPE.
-
-    Sparse-MLA targets can still own auxiliary indexer RoPE modules. Only a
-    module installed as ``rotary_emb`` describes the target attention layout;
-    names such as ``indexer_rope_emb`` must not override the draft default.
-    """
-    language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    auxiliary: list[tuple[str, bool]] = []
-    for name, module in language_model.named_modules():
-        style = getattr(module, "is_neox_style", None)
-        if not isinstance(style, bool):
-            continue
-        if name.rsplit(".", 1)[-1] == "rotary_emb":
-            logger.info(
-                "Resolved DFlash RoPE layout from target primary attention "
-                "module %s: is_neox_style=%s",
-                name,
-                style,
-            )
-            return style
-        auxiliary.append((name, style))
-    if auxiliary:
-        logger.info(
-            "Target has no primary-attention rotary_emb; ignoring auxiliary "
-            "RoPE modules for DFlash layout: %s",
-            auxiliary,
-        )
-    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -337,11 +298,11 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
-        # RoPE layout, copied off the target at load time by the draft loader
-        # (see `dflash_target_rope_is_neox_style`). Checkpoints do not carry it:
-        # a head distilled from an interleaved-RoPE target must rotate the way
-        # that target does, or every drafted Q/K is wrong and acceptance
-        # collapses with no error raised.
+        # RoPE layout. The rotation applies to the draft's own Q/K, so this is
+        # fixed by how the head was distilled, not by the target: a neox-trained
+        # head on an interleaved target still needs neox. A mismatch is silent --
+        # acceptance collapses and nothing errors -- so a checkpoint that was
+        # distilled the other way has to say so here.
         is_neox_style = getattr(config, "is_neox_style", True)
 
         self.self_attn = DFlashQwen3Attention(
@@ -576,16 +537,22 @@ class DFlashQwen3Model(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one GEMM for all layers) ---
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        with optional_phase_profile_stage(
+            "draft.context_kv.input_norm", context_states
+        ):
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
+        with optional_phase_profile_stage(
+            "draft.context_kv.input_gemm", normed_context_states
+        ):
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -601,13 +568,14 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
-        all_k_normed = torch.empty_like(all_k)
-        ops.rms_norm(
-            all_k_normed,
-            all_k,
-            self._k_norm_weights,
-            self._rms_norm_eps,
-        )
+        with optional_phase_profile_stage("draft.context_kv.norm", all_k):
+            all_k_normed = torch.empty_like(all_k)
+            ops.rms_norm(
+                all_k_normed,
+                all_k,
+                self._k_norm_weights,
+                self._rms_norm_eps,
+            )
         return all_k_normed
 
     def precompute_and_store_context_kv(
@@ -648,18 +616,19 @@ class DFlashQwen3Model(nn.Module):
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
         # In-place RoPE: pass K as the "query" arg with key=None.
         all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-        ops.rotary_embedding(
-            positions_repeated,
-            all_k_flat,
-            None,
-            self._rope_head_size,
-            cos_sin_cache,
-            self._rope_is_neox,
-        )
+        with optional_phase_profile_stage("draft.context_kv.rope", all_k_flat):
+            positions_repeated = context_positions.repeat(L)
+            cos_sin_cache = self._rope_cos_sin_cache
+            if cos_sin_cache.dtype != all_k_flat.dtype:
+                cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+            ops.rotary_embedding(
+                positions_repeated,
+                all_k_flat,
+                None,
+                self._rope_head_size,
+                cos_sin_cache,
+                self._rope_is_neox,
+            )
 
         if context_slot_mapping is None:
             return
@@ -667,21 +636,22 @@ class DFlashQwen3Model(nn.Module):
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        for i in range(L):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
-            if slot_mapping is None:
-                continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
-            kv_cache = attn.kv_cache
-            attn.impl.do_kv_cache_update(
-                attn,
-                all_k_final[i],
-                all_v[i],
-                kv_cache,
-                slot_mapping,
-            )
+        with optional_phase_profile_stage("draft.context_kv.insert", all_k_final):
+            for i in range(L):
+                slot_mapping = (
+                    context_slot_mapping[i] if per_layer else context_slot_mapping
+                )
+                if slot_mapping is None:
+                    continue  # dummy run: skip cache ops
+                attn = self._attn_layers[i]
+                kv_cache = attn.kv_cache
+                attn.impl.do_kv_cache_update(
+                    attn,
+                    all_k_final[i],
+                    all_v[i],
+                    kv_cache,
+                    slot_mapping,
+                )
 
     def forward(
         self,

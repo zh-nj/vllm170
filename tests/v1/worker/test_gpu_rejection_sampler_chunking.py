@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm import envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
@@ -103,6 +104,42 @@ def test_collect_q1_acceptance_audit_records() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("method", "dspark_enabled", "dflash_enabled", "expected_limit"),
+    [
+        ("dspark", True, False, 17),
+        ("dflash", False, True, 23),
+        ("eagle", True, True, 0),
+    ],
+)
+def test_q1_audit_method_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    dspark_enabled: bool,
+    dflash_enabled: bool,
+    expected_limit: int,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT", dspark_enabled)
+    monkeypatch.setattr(envs, "VLLM_DFLASH_Q1_AUDIT", dflash_enabled)
+    monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES", 17)
+    monkeypatch.setattr(envs, "VLLM_DFLASH_Q1_AUDIT_SAMPLES", 23)
+
+    sampler = SimpleNamespace(use_fp64_gumbel=False)
+    spec_config = SimpleNamespace(
+        method=method,
+        num_speculative_tokens=7,
+        draft_sample_method="probabilistic",
+        rejection_sample_method="standard",
+        enable_adaptive_verification=False,
+    )
+    rejection_sampler = RejectionSampler(
+        sampler, spec_config, torch.device(current_platform.device_type)
+    )
+
+    assert rejection_sampler._audit_method == method
+    assert rejection_sampler._q1_audit_sample_limit == expected_limit
+
+
 def test_collect_probabilistic_acceptance_audit_records() -> None:
     processed_logits = torch.tensor(
         [
@@ -181,9 +218,10 @@ def test_collect_probabilistic_acceptance_audit_records() -> None:
     )
     assert "draft_top_p_050_expected_overlap" in records[0]
     assert "draft_top_p_099_expected_overlap" in records[0]
-    assert records[2]["target_support_oracle_expected_overlap"] > records[2][
-        "expected_overlap"
-    ]
+    assert (
+        records[2]["target_support_oracle_expected_overlap"]
+        > records[2]["expected_overlap"]
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

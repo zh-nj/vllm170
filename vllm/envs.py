@@ -88,6 +88,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DSPARK_Q1_AUDIT_SAMPLES: int = 64
     VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES: int = 64
+    VLLM_DFLASH_Q1_AUDIT: bool = False
+    VLLM_DFLASH_Q1_AUDIT_SAMPLES: int = 64
     VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH: str = ""
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN: int = 0
@@ -100,7 +102,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION: bool = True
-    VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS: str = "prefill,decode,dspark"
+    VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS: str = "prefill,decode,dspark,dflash"
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES: str = ""
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1229,6 +1231,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES", "64")
     ),
+    "VLLM_DFLASH_Q1_AUDIT": lambda: bool(int(os.getenv("VLLM_DFLASH_Q1_AUDIT", "0"))),
+    "VLLM_DFLASH_Q1_AUDIT_SAMPLES": lambda: int(
+        os.getenv("VLLM_DFLASH_Q1_AUDIT_SAMPLES", "64")
+    ),
     "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH", ""
     ),
@@ -1266,7 +1272,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION", "1"))
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS": lambda: os.getenv(
-        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark"
+        "VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS", "prefill,decode,dspark,dflash"
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_PHASE_PROFILE_LAYERS", ""
