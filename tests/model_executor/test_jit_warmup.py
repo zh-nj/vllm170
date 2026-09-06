@@ -9,6 +9,10 @@ from typing import Any, cast
 import pytest
 import torch
 
+from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
+    _find_first_mhc_layer,
+    _warmup_layer_mhc,
+)
 from vllm.model_executor.warmup.jit_warmup import (
     JitWarmupRegistry,
     VllmJitKernel,
@@ -23,6 +27,45 @@ from vllm.model_executor.warmup.kernel_warmup import (
     _warmup_spec_decode_triton_kernels,
     _warmup_v2_spec_decode_triton_kernels,
 )
+
+
+class Glm5NextDecoderLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_size = 2
+        self.n = 4
+        self.hc_attn_fn = torch.nn.Parameter(torch.zeros(24, 8))
+        self.hc_attn_scale = torch.nn.Parameter(torch.zeros(3))
+        self.hc_attn_base = torch.nn.Parameter(torch.zeros(24))
+        self.hc_ffn_fn = torch.nn.Parameter(torch.zeros(24, 8))
+        self.hc_ffn_scale = torch.nn.Parameter(torch.zeros(3))
+        self.hc_ffn_base = torch.nn.Parameter(torch.zeros(24))
+        self.input_layernorm = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.ones(2)), variance_epsilon=1e-6
+        )
+        self.post_attention_layernorm = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.ones(2)), variance_epsilon=1e-6
+        )
+        self.pre_calls: list[dict[str, Any]] = []
+        self.post_shapes: list[torch.Size] = []
+
+    def hc_pre(self, residual: torch.Tensor, *args: Any, **kwargs: Any):
+        self.pre_calls.append(kwargs)
+        tokens = residual.shape[0]
+        post_mix = torch.zeros(tokens, self.n, 1)
+        comb_mix = torch.zeros(tokens, self.n, self.n)
+        layer_input = torch.zeros(tokens, self.hidden_size)
+        return post_mix, comb_mix, layer_input
+
+    def hc_post(
+        self,
+        layer_input: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        self.post_shapes.append(layer_input.shape)
+        return residual
 
 
 def _next_power_of_2(value: int) -> int:
@@ -111,6 +154,19 @@ def test_v2_spec_decode_warmup_uses_runtime_shape_hooks(method: str) -> None:
         ),
         ("dflash", {}),
     ]
+
+
+def test_mhc_warmup_supports_glm_runtime_contract() -> None:
+    layer = Glm5NextDecoderLayer()
+    model = torch.nn.Sequential(layer)
+
+    assert _find_first_mhc_layer(model) is layer
+
+    _warmup_layer_mhc(layer, [1, 2])
+
+    assert len(layer.pre_calls) == 4
+    assert all(set(call) == {"norm_weight", "norm_eps"} for call in layer.pre_calls)
+    assert layer.post_shapes == [torch.Size((1, 2))] * 2 + [torch.Size((2, 2))] * 2
 
 
 class ToyKernel(VllmJitKernel["ToyKernel.CompileKey"]):

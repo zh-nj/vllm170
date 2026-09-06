@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
 
+import vllm.models.glm5next.nvidia.model as glm5next_model
+from vllm.model_executor.models.utils import StageMissingLayer
 from vllm.models.glm5next.nvidia.model import (
     Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
@@ -56,3 +59,54 @@ def test_glm5next_dflash_pp_last_rank_has_target_embedding() -> None:
     assert not _should_materialize_target_embedding(
         dflash_config, is_first_rank=False, is_last_rank=False
     )
+
+
+def test_glm5next_multimodal_pp_tower_only_on_first_rank(monkeypatch) -> None:
+    class DummyLanguageModel(torch.nn.Module):
+        def make_empty_intermediate_tensors(self):
+            return None
+
+    pp_group = SimpleNamespace(is_first_rank=True)
+    multimodal_config = SimpleNamespace(
+        mm_encoder_tp_mode="weights",
+        is_multimodal_pruning_enabled=lambda: False,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                text_config=SimpleNamespace(),
+                vision_config=SimpleNamespace(rms_norm_eps=1e-6),
+            ),
+            multimodal_config=multimodal_config,
+        )
+    )
+
+    monkeypatch.setattr(glm5next_model, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        Glm5NextForConditionalGeneration,
+        "_mark_tower_model",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        Glm5NextForConditionalGeneration,
+        "_mark_language_model",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        glm5next_model,
+        "Glm5NextVisionTransformer",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(
+        glm5next_model,
+        "init_vllm_registered_model",
+        lambda **kwargs: DummyLanguageModel(),
+    )
+
+    first_stage = Glm5NextForConditionalGeneration(vllm_config=vllm_config)
+    assert isinstance(first_stage.visual, torch.nn.Identity)
+
+    pp_group.is_first_rank = False
+    later_stage = Glm5NextForConditionalGeneration(vllm_config=vllm_config)
+    assert isinstance(later_stage.visual, StageMissingLayer)
+    assert later_stage._tower_model_names == []

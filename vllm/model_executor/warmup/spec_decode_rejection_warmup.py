@@ -85,14 +85,14 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
             rejection_sample(
                 target_logits=target_logits,
                 draft_logits=draft_logits,
-                draft_sampled=torch.zeros(num_logits, dtype=torch.int64, device=device),
+                draft_sampled=torch.zeros(num_logits, dtype=torch.int32, device=device),
                 cu_num_logits=torch.tensor(
                     [0, num_logits], dtype=torch.int32, device=device
                 ),
                 pos=torch.zeros(num_logits, dtype=torch.int64, device=device),
-                idx_mapping=torch.zeros(num_reqs, dtype=torch.int32, device=device),
+                idx_mapping=torch.zeros(num_reqs, dtype=torch.int64, device=device),
                 expanded_idx_mapping=torch.zeros(
-                    num_logits, dtype=torch.int32, device=device
+                    num_logits, dtype=torch.int64, device=device
                 ),
                 expanded_local_pos=torch.arange(
                     num_logits, dtype=torch.int32, device=device

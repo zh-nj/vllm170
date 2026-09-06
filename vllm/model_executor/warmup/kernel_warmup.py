@@ -56,31 +56,138 @@ _LL_BF16_WARMUP_M_RANGE = range(1, 17)
 
 def _warmup_v2_spec_decode_triton_kernels(runner: "GPUModelRunner") -> None:
     spec_config = runner.speculative_config
+    if spec_config is None:
+        return
+
     rejection_sampler = getattr(runner, "rejection_sampler", None)
     vocab_size = getattr(runner, "vocab_size", None)
     if vocab_size is None:
         input_batch = getattr(runner, "input_batch", None)
         vocab_size = getattr(input_batch, "vocab_size", None)
-    if spec_config is None or rejection_sampler is None or vocab_size is None:
-        return
-
-    logger.info_once("Warming up V2 speculative decoding Triton kernels.")
-    warmup_rejection = getattr(rejection_sampler, "warmup", None)
-    if warmup_rejection is not None:
-        warmup_rejection(
-            vocab_size=vocab_size,
-            dtype=runner.model_config.dtype,
-            max_num_reqs=runner.max_num_reqs,
-        )
+    if rejection_sampler is not None and vocab_size is not None:
+        logger.info_once("Warming up V2 speculative decoding Triton kernels.")
+        warmup_rejection = getattr(rejection_sampler, "warmup", None)
+        if warmup_rejection is not None:
+            warmup_rejection(
+                vocab_size=vocab_size,
+                dtype=runner.model_config.dtype,
+                max_num_reqs=runner.max_num_reqs,
+            )
 
     speculator = getattr(runner, "speculator", None)
     if speculator is None:
         speculator = getattr(runner, "drafter", None)
     warmup_prepare_inputs = getattr(speculator, "warmup_prepare_inputs", None)
-    if (
-        spec_config.use_dflash() or spec_config.use_dspark()
-    ) and warmup_prepare_inputs is not None:
+    use_dflash = getattr(spec_config, "use_dflash", lambda: False)
+    use_dspark = getattr(spec_config, "use_dspark", lambda: False)
+    if (use_dflash() or use_dspark()) and warmup_prepare_inputs is not None:
         warmup_prepare_inputs()
+
+    _warmup_v2_spec_decode_postprocess_kernels(runner)
+
+
+def _warmup_v2_spec_decode_postprocess_kernels(runner: "GPUModelRunner") -> None:
+    req_states = getattr(runner, "req_states", None)
+    model_state = getattr(runner, "model_state", None)
+    device = getattr(runner, "device", None)
+    spec_config = getattr(runner, "speculative_config", None)
+    if req_states is None or model_state is None or device is None:
+        return
+
+    num_spec_tokens = getattr(spec_config, "num_speculative_tokens", 0)
+    if num_spec_tokens <= 0:
+        return
+
+    from vllm.v1.worker.gpu.input_batch import post_update
+
+    idx_mapping = torch.full((1,), -1, dtype=torch.int64, device=device)
+    sampled_tokens = torch.zeros(
+        (1, num_spec_tokens + 1), dtype=torch.int64, device=device
+    )
+    num_sampled = torch.ones(1, dtype=torch.int32, device=device)
+    num_rejected = torch.zeros_like(num_sampled)
+    query_start_loc = torch.tensor(
+        (0, num_spec_tokens + 1), dtype=torch.int32, device=device
+    )
+
+    output_bin_counts = None
+    sampler = getattr(runner, "sampler", None)
+    if getattr(runner, "is_last_pp_rank", False) and sampler is not None:
+        output_bin_counts = sampler.penalties_state.output_bin_counts
+
+    post_update_args = (
+        idx_mapping,
+        req_states.num_computed_tokens.gpu,
+        req_states.last_sampled_tokens,
+        output_bin_counts,
+        sampled_tokens,
+        num_sampled,
+        num_rejected,
+    )
+
+    # Non-final PP ranks consume the broadcast result without query offsets;
+    # the final rank also executes the normal request-local update with them.
+    post_update(
+        *post_update_args, None, req_states.all_token_ids.gpu, req_states.total_len.gpu
+    )
+    if getattr(runner, "is_last_pp_rank", False):
+        post_update(
+            *post_update_args,
+            query_start_loc,
+            req_states.all_token_ids.gpu,
+            req_states.total_len.gpu,
+        )
+
+    num_accepted_tokens = getattr(model_state, "num_accepted_tokens_gpu", None)
+    if num_accepted_tokens is not None:
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+            _scatter_num_accepted_kernel,
+        )
+
+        _scatter_num_accepted_kernel[(1,)](
+            idx_mapping,
+            num_sampled,
+            num_accepted_tokens,
+        )
+
+
+def _warmup_glm5_vision_kernels(worker: "Worker") -> None:
+    """Compile the common GLM-5 image-grid encoder variants before serving."""
+    model = worker.get_model()
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "glm5_next":
+        return
+
+    visual = getattr(model, "visual", None)
+    if visual is None or visual.__class__.__name__ == "StageMissingLayer":
+        return
+
+    patch_proj = getattr(getattr(visual, "patch_embed", None), "proj", None)
+    weight = getattr(patch_proj, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 5:
+        return
+
+    channels_per_patch = int(weight[0].numel())
+    device = weight.device
+    dtype = weight.dtype
+    logger.info_once("Warming up GLM-5 vision kernels for image grids 28x28 and 38x38.")
+    with torch.inference_mode():
+        for grid_size in (28, 38):
+            pixel_values = torch.zeros(
+                (grid_size * grid_size, channels_per_patch),
+                dtype=dtype,
+                device=device,
+            )
+            image_grid_thw = torch.tensor(
+                [[1, grid_size, grid_size]], dtype=torch.int32, device=device
+            )
+            model.embed_multimodal(
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        torch.accelerator.synchronize()
+    del pixel_values, image_grid_thw
+    torch.accelerator.empty_cache()
 
 
 def _warmup_spec_decode_triton_kernels(runner: "GPUModelRunner") -> None:
@@ -336,6 +443,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=cudagraph_capture_sizes,
     )
+    _warmup_glm5_vision_kernels(worker)
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:

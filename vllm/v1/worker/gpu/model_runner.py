@@ -1680,6 +1680,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            envs.VLLM_DFLASH_EAGER_TARGET
+            and speculative_config is not None
+            and speculative_config.method == "dflash"
+            and bool(scheduler_output.scheduled_spec_decode_tokens)
+        ):
+            # Keep the DFlash drafter's independent CUDA graphs enabled while
+            # opting target verification out of graph replay. This is useful
+            # on stacks where the target graph is unsafe for a changing active
+            # request set; it does not alter ordinary prefill/decode dispatch.
+            skip_compiled = True
+
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,

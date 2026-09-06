@@ -182,7 +182,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         input_temperature = torch.zeros_like(self.temperature)
         input_seeds = torch.zeros_like(seeds)
         idx_mapping = torch.arange(
-            self.max_num_reqs, dtype=torch.int32, device=self.device
+            self.max_num_reqs, dtype=torch.int64, device=self.device
         )
         for block_tokens in (16, 32, 64, 128, 256):
             context_tokens_per_req = max(1, block_tokens - self.num_query_per_req)

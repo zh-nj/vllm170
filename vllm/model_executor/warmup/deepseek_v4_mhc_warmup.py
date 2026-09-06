@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests.
+"""Warm up model-specific mHC TileLang kernels before serving requests.
 
 Ported from lucifer1004/vllm-jasl with the two env-var knobs removed
 (`VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP`, `VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES`).
-Gating is intrinsic: non-DSv4 models and layers without hc_* attributes
-return early, so the warmup is a no-op except where it's needed.
+Gating is intrinsic: models and layers without hc_* attributes return early,
+so the warmup is a no-op except where it's needed.
 """
 
 import time
@@ -18,6 +18,8 @@ from vllm.tracing import instrument
 
 logger = init_logger(__name__)
 
+_MHC_MODEL_TYPES = frozenset(("deepseek_v4", "glm5_next"))
+_MHC_LAYER_CLASS_NAMES = frozenset(("DeepseekV4DecoderLayer", "Glm5NextDecoderLayer"))
 _AUTO_WARMUP_MAX_TOKENS = 16_384
 _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     1,
@@ -63,7 +65,7 @@ def _select_mhc_warmup_token_sizes(
 
 def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
     for module in model.modules():
-        if module.__class__.__name__ != "DeepseekV4DecoderLayer":
+        if module.__class__.__name__ not in _MHC_LAYER_CLASS_NAMES:
             continue
         if all(
             hasattr(module, attr)
@@ -100,7 +102,9 @@ def _warmup_layer_mhc(
 ) -> None:
     max_tokens = max(token_sizes)
     hidden_size = int(layer.hidden_size)
-    hc_mult = int(layer.hc_mult)
+    hc_mult = int(getattr(layer, "hc_mult", getattr(layer, "n", 0)))
+    if hc_mult <= 0:
+        return
     device = layer.hc_attn_fn.device
     residual = torch.zeros(
         max_tokens,
@@ -112,16 +116,37 @@ def _warmup_layer_mhc(
 
     for size in token_sizes:
         residual_slice = residual[:size]
-        for fn, scale, base in (
-            (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
-            (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
+        for fn, scale, base, norm in (
+            (
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                getattr(layer, "input_layernorm", None),
+            ),
+            (
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                getattr(layer, "post_attention_layernorm", None),
+            ),
         ):
-            layer_input, post_mix, comb_mix = layer.hc_pre(
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs = {
+                    "norm_weight": norm.weight.data,
+                    "norm_eps": norm.variance_epsilon,
+                }
+            outputs = layer.hc_pre(
                 residual_slice,
                 fn,
                 scale,
                 base,
+                **norm_kwargs,
             )
+            if layer.__class__.__name__ == "Glm5NextDecoderLayer":
+                post_mix, comb_mix, layer_input = outputs
+            else:
+                layer_input, post_mix, comb_mix = outputs
             layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
 
@@ -161,19 +186,17 @@ def _warmup_hc_head(
         )
 
 
-@instrument(span_name="DeepSeek V4 mHC warmup")
+@instrument(span_name="mHC warmup")
 def deepseek_v4_mhc_warmup(
     model: torch.nn.Module,
     *,
     max_tokens: int,
     cudagraph_capture_sizes: list[int] | None = None,
 ) -> None:
-    # Cheap model-type gate before walking ``model.modules()``. The class
-    # walk below is O(num_layers) and shows up in startup time on very
-    # large checkpoints; bail out for any model that is not DeepSeek V4.
+    # Avoid walking all layers for models that cannot use this warmup.
     config = getattr(model, "config", None)
     model_type = getattr(config, "model_type", None) if config is not None else None
-    if model_type is not None and model_type != "deepseek_v4":
+    if model_type is not None and model_type not in _MHC_MODEL_TYPES:
         return
 
     layer = _find_first_mhc_layer(model)
@@ -194,7 +217,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up mHC TileLang kernels for token sizes: %s",
         token_sizes,
     )
     with torch.inference_mode():
@@ -203,6 +226,6 @@ def deepseek_v4_mhc_warmup(
             _warmup_hc_head(deepseek_model, token_sizes)
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "mHC TileLang warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )

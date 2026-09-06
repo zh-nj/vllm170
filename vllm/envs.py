@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DSPARK_PROB_AUDIT_SAMPLES: int = 64
     VLLM_DFLASH_Q1_AUDIT: bool = False
     VLLM_DFLASH_Q1_AUDIT_SAMPLES: int = 64
+    VLLM_DFLASH_EAGER_TARGET: bool = False
     VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH: str = ""
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT: bool = False
     VLLM_DEEPSEEK_V4_Q6_TOPK_AUDIT_MIN_LEN: int = 0
@@ -1234,6 +1235,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_Q1_AUDIT": lambda: bool(int(os.getenv("VLLM_DFLASH_Q1_AUDIT", "0"))),
     "VLLM_DFLASH_Q1_AUDIT_SAMPLES": lambda: int(
         os.getenv("VLLM_DFLASH_Q1_AUDIT_SAMPLES", "64")
+    ),
+    "VLLM_DFLASH_EAGER_TARGET": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_EAGER_TARGET", "0"))
     ),
     "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_DSPARK_REFERENCE_DUMP_PATH", ""
