@@ -18,6 +18,7 @@ expansion consequences via the pure-torch expand/append pair that the fused
 kernel is documented to replicate.
 """
 
+import pytest
 import torch
 
 # Bootstrap the glm5next package before entering the indexer module: its
@@ -36,12 +37,28 @@ import vllm.model_executor.layers.sparse_attn_indexer_kpool as indexer_mod
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
     _decode_topk_seq_lens,
     _fill_short_decode_causal_indices,
+    _prefill_workspace_shapes,
 )
 from vllm.platforms import current_platform
 
 KPOOL = 4
 TOPK_TOKENS = 16
 SELECT_K = TOPK_TOKENS // KPOOL
+
+
+def test_prefill_workspace_reserves_caller_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_INDEXER_PREFILL_CALLER_LOGITS", True)
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 96)
+
+    shapes = _prefill_workspace_shapes(128, 64, torch.float8_e4m3fn, False)
+
+    assert shapes == [
+        ((128, 64), torch.float8_e4m3fn),
+        ((128, 4), torch.uint8),
+        ((96 * 1024 * 1024 // 4,), torch.float32),
+    ]
 
 
 def test_kpool_ops_dispatch_matches_platform():

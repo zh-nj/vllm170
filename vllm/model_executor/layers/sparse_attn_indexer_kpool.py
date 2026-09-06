@@ -241,6 +241,21 @@ def _gather_workspace_shapes(
     )
 
 
+def _prefill_workspace_shapes(
+    total_seq_lens: int,
+    head_dim: int,
+    fp8_dtype: torch.dtype,
+    use_fp4_cache: bool,
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    shapes: list[tuple[tuple[int, ...], torch.dtype]] = list(
+        _gather_workspace_shapes(total_seq_lens, head_dim, fp8_dtype, use_fp4_cache)
+    )
+    if envs.VLLM_INDEXER_PREFILL_CALLER_LOGITS:
+        logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+        shapes.append(((logits_elems,), torch.float32))
+    return shapes
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -299,14 +314,15 @@ def sparse_attn_indexer_kpool(
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
-        # Reserve workspace for indexer during profiling run
-        values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+        # Prefill must not grow the shared MoE workspace after graph capture:
+        # resizing frees addresses already recorded by the decode graphs.
+        current_workspace_manager().get_simultaneous(
+            *_prefill_workspace_shapes(
+                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            )
         )
         current_workspace_manager().get_simultaneous(
-            values_spec,
-            scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8)
         )
 
         # Reserve profiler-visible memory for the worst-case decode logits,
@@ -327,7 +343,11 @@ def sparse_attn_indexer_kpool(
             )
         # float32 logits -> 4 bytes/element; uint8 sentinel so elems == bytes.
         decode_logits_elems = worst_decode_tokens * max_model_len * 4
-        prefill_cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        prefill_cap_elems = (
+            0
+            if envs.VLLM_INDEXER_PREFILL_CALLER_LOGITS
+            else envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        )
         max_logits_elems = max(decode_logits_elems, prefill_cap_elems)
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
@@ -465,17 +485,11 @@ def sparse_attn_indexer_kpool(
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
-        values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+        workspace = workspace_manager.get_simultaneous(
+            *_prefill_workspace_shapes(
+                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            )
         )
-        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-            values_spec,
-            scales_spec,
-        ]
-        if envs.VLLM_INDEXER_PREFILL_CALLER_LOGITS:
-            max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
-            workspace_specs.append(((max_logits_elems,), torch.float32))
-        workspace = workspace_manager.get_simultaneous(*workspace_specs)
         k_quant_full, k_scale_full = workspace[:2]
         logits_workspace = (
             workspace[2] if envs.VLLM_INDEXER_PREFILL_CALLER_LOGITS else None
