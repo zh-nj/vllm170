@@ -503,7 +503,8 @@ def _ple_spec_short_conv_kernel(
     channel = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)[None, :]
     token_offset = tl.arange(0, QUERY_LEN)[:, None]
     channel_mask = channel < CHANNELS
-    state_index = tl.load(state_indices_ptr)
+    # State slots can be far enough apart for slot offsets to overflow int32.
+    state_index = tl.load(state_indices_ptr).to(tl.int64)
     valid_state = state_index != 0
     query_start = tl.load(query_start_loc_ptr)
     query_end = tl.load(query_start_loc_ptr + 1)

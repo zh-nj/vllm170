@@ -11,6 +11,7 @@ from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
+from tests.utils import large_gpu_test
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
@@ -703,6 +704,60 @@ def test_fused_ple_spec_short_conv_matches_fallback(
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, reference_state, rtol=0, atol=0)
+
+
+@large_gpu_test(min_gb=8)
+def test_fused_ple_spec_short_conv_large_state_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_index = 188
+    state_slot_stride = 11_468_800
+    state = torch.empty_strided(
+        (state_index + 1, 10240, 12),
+        (state_slot_stride, 1, 10240),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    target_state = torch.randn((10240, 12), device="cuda", dtype=torch.bfloat16)
+    state[state_index].copy_(target_state)
+
+    x = torch.randn((4, 10240), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((10240, 4), device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor([state_index], device="cuda", dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4], device="cuda", dtype=torch.int32)
+    accepted = torch.tensor([1], device="cuda", dtype=torch.int32)
+
+    reference_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(reference_layer)
+    reference_layer.conv_state_len = 9
+    reference_layer.short_conv_dilation = 3
+    reference_state = torch.zeros((2, 10240, 12), device="cuda", dtype=torch.bfloat16)
+    reference_state[1].copy_(target_state)
+    monkeypatch.setattr(
+        ple_layer_module, "can_use_fused_ple_spec_short_conv", lambda *args: False
+    )
+    expected = reference_layer._short_conv_dilated_spec_batched(
+        x,
+        reference_state,
+        weight,
+        torch.tensor([1], device="cuda", dtype=torch.int32),
+        query_start_loc,
+        accepted,
+        spec_query_len=4,
+    )
+
+    actual = fused_ple_spec_short_conv(
+        x,
+        state,
+        state_indices,
+        query_start_loc,
+        accepted,
+        weight,
+        spec_query_len=4,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state[state_index], reference_state[1], rtol=0, atol=0)
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
