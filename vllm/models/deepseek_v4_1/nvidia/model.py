@@ -370,26 +370,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             # copies and the identity pre-mix selects copy 0.
             assert self.hc_attn_fn_broadcast is not None
             residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
-            post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
-                residual,
-                self.hc_attn_fn_broadcast,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                x=x,
-                norm_weight=self.attn_norm.weight,
-                norm_eps=self.attn_norm.variance_epsilon,
-            )
+            with phase_profile_stage("hc.pre_attn", x, level="module"):
+                post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                    residual,
+                    self.hc_attn_fn_broadcast,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    x=x,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
         else:
-            residual = (
-                x
-                if residual is None
-                else mhc_post_tilelang(x, residual, post_mix, res_mix)
-            )
+            if residual is None:
+                residual = x
+            else:
+                with phase_profile_stage("hc.post_prev", x, level="module"):
+                    residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
             if self.engram is not None and engram_hashes is not None:
                 # Engram injection happens between the previous sublayer's
                 # post and this block's pre, on the full hc stream, so the
@@ -399,43 +400,47 @@ class DeepseekV4DecoderLayer(nn.Module):
                     engram_hashes[:, self.engram.layer_hash_index],
                     engram_mask,
                 )
-            post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+            with phase_profile_stage("hc.pre_attn", x, level="module"):
+                post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                    residual,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    pre_mix=pre_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
+
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+
+        with phase_profile_stage("attn.total", x, level="module"):
+            x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
+
+        with phase_profile_stage("hc.post_attn", x, level="module"):
+            residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+        with phase_profile_stage("hc.pre_ffn", x, level="module"):
+            post_mix, res_mix, x, ffn_pre = mhc_pre_delayed_tilelang(
                 residual,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
-                pre_mix=pre_mix,
-                norm_weight=self.attn_norm.weight,
-                norm_eps=self.attn_norm.variance_epsilon,
+                pre_mix=attn_pre,
+                norm_weight=self.ffn_norm.weight,
+                norm_eps=self.ffn_norm.variance_epsilon,
             )
-
-        if self.use_sequence_parallel:
-            x = sp_all_gather(x)[: positions.shape[0]]
-
-        x = self.attn(positions, x, None)
-        if self.use_sequence_parallel:
-            x = sp_reduce_scatter(x)
-
-        residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
-        post_mix, res_mix, x, ffn_pre = mhc_pre_delayed_tilelang(
-            residual,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            pre_mix=attn_pre,
-            norm_weight=self.ffn_norm.weight,
-            norm_eps=self.ffn_norm.variance_epsilon,
-        )
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix, ffn_pre
 

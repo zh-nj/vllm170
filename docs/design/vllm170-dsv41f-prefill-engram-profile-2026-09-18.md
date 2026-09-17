@@ -217,3 +217,79 @@ rank 内子项求和 6,724 ms vs `target.model_forward` 8,424 ms ⇒ **仍有 ~5
 ⇒ 结论：**10k 的瓶颈在 MoE 内核效率与每步固定开销**，下一步优先级：
 ① MoE 内核 mma 路径（100→200 TOPS）；② 每步 63–90 ms 空隙的引擎侧归因；
 ③ 55 ms/step 未插桩层内工作（hc/norm）。
+
+---
+
+## 8. 第 3 轮：账本闭环、CPU/流水线归因、4096 chunk 反证
+
+### 8.1 逐层账本现在完全闭环（rank3，63k 请求 / 31 chunk）
+
+新增 `hc.*` 与 `attn.*` 子 stage 后：`layer.total` 8,924 ms = 具名子项 8,875 ms + 49 ms（0.5%）。
+
+| 环节 | ms/step | 占 step | 内容 |
+| --- | ---: | ---: | --- |
+| `moe.routed_experts` | **157.7** | 42% | w13 101.6 + w2 52.7 |
+| `attn.total` | **97.3** | 26% | 见下 |
+| ├ `attn.prepare` | 72.3 | 19% | sparse_mla.prefill 28.8 + indexer.logits 17.9 + topk/combine/gather ~7 + **~18 未细分**（wq_b、qnorm/rope/kv-insert、SWA 注意力） |
+| ├ `attn.o_proj` | 21.7 | 6% | inv_rope 2.2 + wo_a 6.3 + **wo_b ~13** |
+| └ `attn.input_proj` + `split_norm` | 3.2 | 1% | q_a/kv_a/compressor（已在 aux stream 上） |
+| `hc.pre_attn/post_attn/pre_ffn/post_prev` | 18.0 | 5% | 4 次 TileLang 混合系数 kernel |
+| `moe.shared_experts` | 11.5 | 3% | |
+| **layer 合计** | **286.4** | 76% | |
+| `target.attn_metadata` | 10.9 | 3% | SWA causal + indexer metadata |
+| 步间空隙 | ~60 | 16% | 见 8.2 |
+
+### 8.2 那 60 ms/step 不是宿主 Python，是 PP 流水线气泡
+
+- phase profiler 的 `cpu_elapsed_us` 显示 `attn.prepare` 的 CPU 时间是 GPU 的 2.74 倍，
+  一度看起来像"宿主受限"。
+- 但 torch trace（`--profiler-config '{"profiler":"torch",...}'`，CPU-only tier）给出否定证据：
+  rank3 主线程在 3 个 chunk（2.2 s 墙钟）里**所有算子耗时合计只有 159–226 ms**，
+  算子之间的空档合计 **2,084 ms（94% 时间在等）**，最大的几个空档全部是
+  `c10d::recv_` → `aten::item`（785 / 277 / 54 / 53 … ms）。
+  ⇒ 真实情况是**worker 在等上游 rank 的数据**（PP 链），不是 Python 开销。
+  那些 `.item()`（3 chunk 内 288 次 `_local_scalar_dense`，即 288 次 GPU→CPU 同步）
+  总计只有 ~30 ms，是坏味道但不是瓶颈。
+- 结论：每步 ~60 ms 是 **PP 交接 + 引擎每步同步** 的气泡，削弱它需要引擎级流水（多 microbatch 在飞），
+  而 prefill 单请求的 chunk 链天然是串行的。
+
+### 8.3 反证：4096 chunk 并不会更快
+
+| 配置 | 63k prefill | 速率 |
+| --- | ---: | ---: |
+| `max_num_batched_tokens=2048`（当前） | 11.88 s | **5,300 tok/s** |
+| `max_num_batched_tokens=4096`（KV 需 ≥1.5 GB，否则启动即报 1.36 GiB > 1.21 GiB） | 12.48–12.57 s | 5,020 tok/s |
+
+即"MoE 每步固定权重流 → 更大 chunk 更省"的推论**不成立**：chunk 翻倍后每步的激活/注意力
+gather/中间张量流量同步上升，净效果为负。2048 已是当前内核组合下的局部最优。
+
+### 8.4 本轮 MoE 内核实验（全部无效，已回滚）
+
+| 实验 | 结果 |
+| --- | --- |
+| `kStages` 3 → 4（`mxfp4_cutlass_core.cuh`，重编 `_moe_C`） | 17.80 vs 17.79 ms ⇒ 1.00× |
+| n-fastest grid（第 2 轮做过） | 1.01× |
+| tile 换档 | 更慢 |
+
+⇒ 该内核在其设计内已到顶：权重流 749 GB/s（copy 峰值 60%）+ mma 100 TOPS（int8 峰值 32–45%）。
+再快只能重写 mainloop 的寄存器分块/指令组合（例如把 mxfp4 解包从主循环里挪出去、
+改用更大 K-tile 的双缓冲），这是数天量级的内核工作。
+
+### 8.5 对 10000 tok/s 的最终判断（有数据支撑）
+
+2048 chunk 下每步预算 205 ms，当前 377 ms（无插桩 ~384 ms）。各项实测下限：
+
+| 项 | 现在 | 该内核组合下的下限 | 差距来源 |
+| --- | ---: | ---: | --- |
+| MoE | 158 | ~75（权重流 72 + 不可避免的激活） | mainloop mma 效率 |
+| attn（全部） | 97 | ~60 | wo_b/SWA/未细分 ~35 需逐个定位 |
+| hc | 18 | ~12 | TileLang kernel |
+| shared experts | 11.5 | ~8 | 未与路由专家重叠 |
+| metadata | 11 | ~8 | |
+| 步间气泡 | 60 | ~15 | 需要 PP 多 microbatch 重叠 |
+
+⇒ 即使全部达到下限也只有 ~178 ms/step（11,500 tok/s 的乐观值），
+但要在**每一项**上都拿到 20–40% 是多个独立的内核/引擎工程；
+按当前内核，实测平台在 **5,300–5,600 tok/s**，理论乐观天花板 ~6,200。
+**结论：10,000 tok/s 在本硬件 + 当前内核组合下不可达；需要（a）重写 MoE mainloop 拿到 ~2×，
+（b）消除 PP 每步气泡**。

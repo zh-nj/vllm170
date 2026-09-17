@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.models.deepseek_v4_1.common.ops import (
     MXFP4_BLOCK_SIZE,
     fused_indexer_q_rope_quant,
@@ -602,25 +603,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Keep the attention input preparation in the captured graph. Only the
         # sparse indexer and MLA attention run in the eager break below.
-        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
-            hidden_states
-        )
-        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        with optional_phase_profile_stage("attn.input_proj", hidden_states):
+            qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+                hidden_states
+            )
+        with optional_phase_profile_stage("attn.split_norm", hidden_states):
+            qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
 
-        self._prepare_and_attn_fn(
-            hidden_states,
-            qr,
-            kv,
-            qr_scale,
-            kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
-        )
+        with optional_phase_profile_stage("attn.prepare", hidden_states):
+            self._prepare_and_attn_fn(
+                hidden_states,
+                qr,
+                kv,
+                qr_scale,
+                kv_score,
+                indexer_weights,
+                positions,
+                o_padded,
+            )
         o = o_padded[:, : self.n_local_heads, :]
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+        with optional_phase_profile_stage("attn.o_proj", o):
+            return self._o_proj(o, positions)
 
     @cached_property
     def _can_fuse_query_quant(self) -> bool:
