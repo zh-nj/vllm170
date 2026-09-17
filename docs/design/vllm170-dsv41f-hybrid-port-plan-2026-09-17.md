@@ -267,3 +267,33 @@ complete`（engine init 73.7 s）。
 - DSpark 投机：drafts 91 / draft tokens 455（=K×drafts，K=5 生效）/ accepted 250，
   **接受率 54.9%**，逐位 0.86/0.66/0.48/0.43/0.36，平均接受长度 3.78
   —— 对比移植前本项目分布式 DSpark 的 17.71%，接受率已恢复到正常水平
+
+### 6.4 显存账本：63,918 MiB 是怎么来的
+
+三个数据源：`nvidia-smi` 的 per-process 占用、`MemorySnapshot`/`memory_profiling` 的
+`torch` 账本（用 `VLLM_DSV41_MEM_DEBUG` 临时插桩打印）、以及分配器 block 直方图
+（`torch.cuda.memory_snapshot()`）。PP2 = rank2 = GPU3，标称 65,024 MiB / torch 侧 63.07 GiB。
+
+| 项 | GiB | MiB | 来源 |
+| --- | --- | --- | --- |
+| CUDA context + 驱动 + NCCL（non-torch） | 0.47 → 0.55 | 481 → 560 | init snapshot（62.6/63.07）；稳态 `device_used − torch_reserved` |
+| 权重（8 层 + 本 rank 的 draft stage） | 56.06 | 57,405 | `Model loading took` |
+| KV cache（`kv_cache_memory_bytes=1.3e9`） | 1.21 | 1,240 | `reserved ... for KV Cache` |
+| CUDA graphs（FULL_DECODE_ONLY，7 档） | 0.32 | 328 | `Graph capturing finished` |
+| 常驻工作区/激活池（本 rank 实测激活峰值 1.28 GiB，含 `max_model_len` 尺寸的 indexer workspace） | ~3.8 | ~3,900 | `torch_alloc` 61.414 − 上三项 57.59 |
+| torch 已缓存但空闲（可复用） | 0.33 | 338 | `torch_reserved − torch_alloc` |
+
+权重那 57,405 MiB 的主体是**每层路由专家**：block 直方图显示 rank2 上是
+`4320 MiB × 9 + 2160 MiB × 8`，而 4320 MiB = 384 专家 × 2 × 2304 × 5120 × 0.5 B（fp4），
+2160 MiB = 384 × 5120 × 2304 × 0.5 B，正好对上 `moe_intermediate_size=2304`、
+`expert_dtype=fp4`；剩下 ~500 个 32–64 MiB 小块（合计 ~2.3 GiB）是每层的 scales/norm/hc。
+
+关键推论（解释"为什么 2048 chunk 必 OOM"）：**稳态空闲 = 65,024 − 63,892 ≈ 1.1 GiB，且其中
+0.33 GiB 处于碎片化缓存池**。默认分配器要 128 MiB 连续块时只能 `cudaMalloc`（free 118 MiB →
+失败）；1024 chunk 的 prefill 峰值只要 ~450 MiB，2048 chunk 直接翻倍。
+
+**还测到一个反直觉的杠杆**：把 `--max-model-len` 从 1M 降到 262k，PP0 的
+`Available KV cache memory` 从 3.62 GiB 涨到 5.38 GiB —— 涨的 ~1.8 GiB 是 SM80 稀疏
+indexer 的常驻 workspace（`(max_model_len, index_head_dim=128)` bf16 = 256 MiB/份）。
+也就是说 **1M 上下文不是白拿的，它每卡吃掉约 1.8 GiB 的 KV/激活余量**。
+

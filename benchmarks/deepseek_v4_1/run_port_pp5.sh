@@ -42,7 +42,8 @@ export VLLM_DSV41_HOST_HEADROOM_GIB=${VLLM_DSV41_HOST_HEADROOM_GIB:-12}
 PORT_PORT=${PORT_PORT:-26663}
 PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
 PORT_MAX_MODEL_LEN=${PORT_MAX_MODEL_LEN:-1048576}
-PORT_KV_BYTES=${PORT_KV_BYTES:-1300000000}
+# Empty means "let the engine profile and size the KV cache itself" (see kv_args).
+PORT_KV_BYTES=${PORT_KV_BYTES-1300000000}
 PORT_MAX_BATCHED=${PORT_MAX_BATCHED:-1024}
 PORT_MAX_SEQS=${PORT_MAX_SEQS:-8}
 PORT_DSPARK_TOKENS=${PORT_DSPARK_TOKENS:-5}
@@ -51,6 +52,14 @@ PORT_EXTRA_ARGS=${PORT_EXTRA_ARGS:-}
 
 spec_config=$(printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"greedy","moe_backend":"%s","enforce_eager":true,"enable_adaptive_verification":false,"dspark_pipeline_stage_ranks":[1,2,3]}' \
     "${PORT_DSPARK_TOKENS}" "${PORT_MOE_BACKEND}")
+
+# An empty PORT_KV_BYTES drops --kv-cache-memory-bytes, which is what makes the
+# engine run its memory profiler and log the per-rank ledger
+# (weights / peak activation / non-torch / KV) instead of skipping it.
+kv_args=()
+if [[ -n "${PORT_KV_BYTES}" ]]; then
+    kv_args=(--kv-cache-memory-bytes "${PORT_KV_BYTES}")
+fi
 
 exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --served-model-name dsv41f-port \
@@ -65,7 +74,7 @@ exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --limit-mm-per-prompt '{"image":0}' \
     --kv-cache-dtype fp8 \
     --block-size 128 \
-    --kv-cache-memory-bytes "${PORT_KV_BYTES}" \
+    "${kv_args[@]}" \
     --max-model-len "${PORT_MAX_MODEL_LEN}" \
     --max-num-batched-tokens "${PORT_MAX_BATCHED}" \
     --max-num-seqs "${PORT_MAX_SEQS}" \
