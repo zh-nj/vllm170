@@ -167,3 +167,50 @@ tokenizer/parser for `deepseek_v41`、以及多处 GLM/Qwen 共用的图捕获�
 5. **共享基建里的 dsv41 本地优化**：稀疏 prefill tiling、indexer top-k 确定性、
    Marlin/router 几何固定仍是本项目版本（它们是共享文件、被 GLM/Qwen 共用，
    字面 revert 会连带打断其它模型）。需要你决定是否也要退回。
+
+---
+
+## 5. 第 2 轮：结构性发现与跨 rank KV 补齐
+
+### 5.1 硬结论：分支的 dsv41 实现不支持「KV 共享组跨 rank」的 PP 切分
+
+| 证据 | 位置 |
+| --- | --- |
+| 消费层找不到源层 cache 时**直接抛错** | `attention.py`：`NotImplementedError("...PP splits inside a v4.1 kv-sharing group are not supported.")` |
+| `pp_kv_transfer` 的计划**显式拒绝** boundary ≥ `candidate_source_layer_id`(20) | `pp_kv.py::SharedKVTransferPlan.for_stage`：`raise ValueError("PP KV replicas require an encoder group with one index source")` |
+| 实测 | `8,8,8,8,8` 的边界 24、32 被拒；`[7,8,25]` 通过 |
+
+原因：解码组 21–39 有 4 个 index source（24/28/32/36），而分支的实现假设「源层与其消费者同 rank」，
+这正是它把 21 层解码段放末段（`[7,8,25]`）的前提——而该前提**只在 CPU/主机专家下成立**
+（21 层 ×≈7.4GB ≈155GB，单卡 63GB 装不下）。
+
+**因此"5 卡 PP + 全域 GPU 专家 + 分支 dsv41 实现"必须补上跨 rank 的 KV 共享传递。**
+
+### 5.2 已补齐（第 2 轮提交）
+
+在分支模型内并入本项目的跨 rank KV 机制：
+
+- `attention.py`：新增 `DeepseekV4PPCompressedCache`；源层记录 `_last_compressed_latent`；
+  indexer 增加 `export_normalized_k` / `_last_normalized_k`
+- `common/ops/indexer_k_store.py`：采用本项目版本（新增 `input_is_normalized` /
+  `return_normalized`，向后兼容）
+- `nvidia/model.py`：`_pp_incoming_{source,index,topk,candidates}` / `_pp_outgoing_*` 计划、
+  4 个 PP 张量、`_import_pp_attention_state` / `_append_pp_attention_state`，并接入 forward
+- 8,8,8,8,8 的计划实测：rank0/1 不发不收；rank1→2 传 topk+latent(源14)；
+  rank2→3 传 latent(源20)+归一化 index K+候选块；rank3→4 中继同一组（源 20 在 rank2）
+
+### 5.3 运行期适配（第 2 轮）
+
+- 分支模型用的 4 个 kernel wrapper（`_COMPUTE_SWA_INDICES_AND_LENS_KERNEL`、
+  `_COMPRESSED_SLOT_MAPPING_KERNEL`、`_PREPARE_UNIFORM_DECODE_KERNEL`、
+  `_COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL`）在本项目的后端文件里不存在
+  → warmup 注册改为容错（缺失只跳过预编译，不影响正确性），并保留原有 wrapper 的注册
+- 新增 `benchmarks/deepseek_v4_1/run_port_pp5.sh`：5 卡 PP5 启动脚本，
+  不开 CED/`pp_kv_transfer`（两者在 8,8,8,8,8 下均不可用），保留分布式 DSpark
+
+### 5.4 仍未完成
+
+1. **真机跑通**：仍在加载/启动阶段排错（当前已越过 import 层）。
+2. **CED 在 5 卡上不可用**：其约束（层 19 与全部解码层同段）在纯 GPU 驻留下无法满足，
+   `ced_prefill` 只能保持关闭。
+3. 分支 engram 只认 `cpu_offload`，不认 `cpu_cache_gb`/`ssd_offload_path`。

@@ -5,6 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 from abc import ABC, abstractmethod
+import importlib
 from collections.abc import Callable
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -498,45 +499,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.compressed_cache_prefix = None
 
         if vllm_config.kernel_config.enable_jit_warmup:
-            from vllm.v1.attention.backends.mla.sparse_swa import (
-                _COMPUTE_PREFILL_METADATA_KERNEL,
-                _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
-            )
-
-            _COMPUTE_PREFILL_METADATA_KERNEL.register_warmup()
-            _COMPUTE_SWA_INDICES_AND_LENS_KERNEL.register_warmup(
-                window_size=self.window_size,
-                block_size=self.swa_cache_layer.block_size,
-                max_image_tokens=self.max_image_tokens,
-            )
-
-            if self.compress_ratio > 1:
-                from vllm.v1.attention.backends.mla.compressor_utils import (
-                    _COMPRESSED_SLOT_MAPPING_KERNEL,
-                )
-
-                _COMPRESSED_SLOT_MAPPING_KERNEL.register_warmup()
-
-            if self.indexer is not None:
-                from vllm.v1.attention.backends.mla.indexer import (
-                    _BUILD_PREFILL_CHUNK_METADATA_KERNEL,
-                    _PREPARE_UNIFORM_DECODE_KERNEL,
-                )
-
-                _PREPARE_UNIFORM_DECODE_KERNEL.register_warmup()
-                _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
-
-            spec_config = vllm_config.speculative_config
-            if spec_config is not None and spec_config.use_dspark():
-                from vllm.v1.attention.backends.mla.sparse_swa import (
-                    _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
-                )
-
-                _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL.register_warmup(
-                    window_size=self.window_size,
-                    num_speculative_tokens=spec_config.num_speculative_tokens,
-                    block_size=self.swa_cache_layer.block_size,
-                )
+            self._register_swa_kernel_warmups(vllm_config)
 
             if self.backend_cls.get_name() in (
                 "FLASHMLA_SPARSE_DSV41",
@@ -547,6 +510,80 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 )
 
                 _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
+
+    def _register_swa_kernel_warmups(self, vllm_config: VllmConfig) -> None:
+        """Pre-compile the SWA/indexer kernels this layer will launch.
+
+        The backend modules come from this project, which exposes a subset of
+        the kernel wrappers the model was written against. A wrapper that is
+        absent only skips pre-compilation (the kernel then JITs on first use),
+        so each registration is optional.
+        """
+        spec_config = vllm_config.speculative_config
+        warmups: list[tuple[str, str, dict]] = [
+            (
+                "vllm.v1.attention.backends.mla.sparse_swa",
+                "_COMPUTE_PREFILL_METADATA_KERNEL",
+                {},
+            ),
+            (
+                "vllm.v1.attention.backends.mla.sparse_swa",
+                "_COMPUTE_SWA_INDICES_AND_LENS_KERNEL",
+                {
+                    "window_size": self.window_size,
+                    "block_size": self.swa_cache_layer.block_size,
+                    "max_image_tokens": self.max_image_tokens,
+                },
+            ),
+        ]
+        if self.compress_ratio > 1:
+            warmups.append(
+                (
+                    "vllm.v1.attention.backends.mla.compressor_utils",
+                    "_COMPRESSED_SLOT_MAPPING_KERNEL",
+                    {},
+                )
+            )
+        if self.indexer is not None:
+            warmups.extend(
+                [
+                    (
+                        "vllm.v1.attention.backends.mla.indexer",
+                        "_PREPARE_UNIFORM_DECODE_KERNEL",
+                        {},
+                    ),
+                    (
+                        "vllm.v1.attention.backends.mla.indexer",
+                        "_BUILD_PREFILL_CHUNK_METADATA_KERNEL",
+                        {},
+                    ),
+                ]
+            )
+        if spec_config is not None and spec_config.use_dspark():
+            warmups.append(
+                (
+                    "vllm.v1.attention.backends.mla.sparse_swa",
+                    "_COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL",
+                    {
+                        "window_size": self.window_size,
+                        "num_speculative_tokens": spec_config.num_speculative_tokens,
+                        "block_size": self.swa_cache_layer.block_size,
+                    },
+                )
+            )
+
+        for module_name, symbol, kwargs in warmups:
+            try:
+                module = importlib.import_module(module_name)
+                kernel = getattr(module, symbol)
+            except (ImportError, AttributeError):
+                logger.debug_once(
+                    "No JIT warmup wrapper %s.%s in this build", module_name, symbol
+                )
+                continue
+            register = getattr(kernel, "register_warmup", None)
+            if register is not None:
+                register(**kwargs)
 
     def forward(
         self,
