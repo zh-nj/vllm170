@@ -29,6 +29,11 @@ export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-8,8,8,8,8}
 # This host has ~252 GiB RAM; the branch's default 64 GiB spare-RAM guard
 # would reject the two resident Engram tables (2 x 94.42 GiB) outright.
 export VLLM_DSV41_HOST_HEADROOM_GIB=${VLLM_DSV41_HOST_HEADROOM_GIB:-12}
+# The V4.1 prefill gather workspace is now sized from the batch being served;
+# this only caps what the warmup/profiling reservation asks for, so the rank
+# does not hold a full 1M-token bf16 gather (~2-4 GiB) while serving 6-32k
+# prompts. Raise it if you intend to serve megatoken prefills.
+export VLLM_DSV41_PREFILL_WORKSPACE_TOKENS=${VLLM_DSV41_PREFILL_WORKSPACE_TOKENS:-65536}
 # The PP2 rank (layers 16-23 plus its DSpark draft stage) keeps only ~1.1 GiB of
 # device memory free during serving, and the default allocator cannot satisfy a
 # 128 MiB request from its fragmented free pool: at 2048 prefill tokens that

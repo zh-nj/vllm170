@@ -7,6 +7,7 @@ from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -391,6 +392,25 @@ def _copy_ragged_to_graph_buffers(
     return ragged_out, indptr_out
 
 
+def _prefill_context_rows(
+    seq_lens_cpu: torch.Tensor | None,
+    compress_ratio: int,
+    fallback_rows: int,
+) -> int:
+    """Compressed context rows the prefill gather buffer has to hold.
+
+    Sizing this by ``max_model_len // compress_ratio`` reserves a full-context
+    gather on every rank, whatever the batch is; the batch metadata carries the
+    real bound (``prefill_seq_lens_cpu`` is the CPU mirror, so reading it costs
+    no sync). Without metadata the caller supplies a fallback.
+    """
+    if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        return max(0, fallback_rows)
+    longest = int(seq_lens_cpu.max().item())
+    ratio = max(1, compress_ratio)
+    return max(0, longest // ratio)
+
+
 @dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
@@ -677,12 +697,16 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             # gather workspace _forward_prefill would; the dequantize / topk
             # / sparse_fwd kernels are skipped this step.
             swa_only = self.compress_ratio == 0
-            N = (
-                0
-                if swa_only
-                else (self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio
-            )
+            if swa_only:
+                N = 0
+            else:
+                # A dummy run has no batch, so this reservation only feeds the
+                # memory profiler; _forward_prefill sizes the buffer from the
+                # real batch and grows it if a longer prompt arrives.
+                reserved = envs.VLLM_DSV41_PREFILL_WORKSPACE_TOKENS
+                if reserved <= 0 or reserved > self.max_model_len:
+                    reserved = self.max_model_len
+                N = reserved // max(1, self.compress_ratio)
             M = N + self.window_size + self.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
@@ -826,7 +850,11 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         topk_indices = topk_indices[:num_prefill_tokens]
         if not swa_only:
             top_k = topk_indices.shape[-1]
-            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+            N = _prefill_context_rows(
+                swa_metadata.prefill_seq_lens_cpu,
+                self.compress_ratio,
+                (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio,
+            )
         else:
             top_k = 0
             N = 0

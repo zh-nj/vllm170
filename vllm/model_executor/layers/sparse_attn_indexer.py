@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
@@ -472,6 +474,114 @@ def fused_indexer_q_rope_quant(
     return q_fp8, weights_out
 
 
+_DEEP_SELECT_ALIGNMENT: tuple[int, int] | None = None
+
+
+def _deep_select_alignment() -> tuple[int, int] | None:
+    """DeepSelect's (input, output) row-stride alignment in bytes, if installed."""
+    global _DEEP_SELECT_ALIGNMENT
+    if _DEEP_SELECT_ALIGNMENT is None:
+        try:
+            import deep_select
+        except ImportError:
+            return None
+        _DEEP_SELECT_ALIGNMENT = tuple(deep_select.get_stride_requirement())
+    return _DEEP_SELECT_ALIGNMENT
+
+
+def _padded_logits_view(
+    workspace: torch.Tensor,
+    num_rows: int,
+    num_cols: int,
+    pad_stride: bool,
+) -> torch.Tensor | None:
+    """``(num_rows, num_cols)`` view of ``workspace`` with an aligned row stride.
+
+    DeepSelect requires the input row stride to be a multiple of its alignment,
+    so the caller-owned logits buffer is padded instead of copied.
+    """
+    stride = num_cols
+    if pad_stride:
+        requirement = _deep_select_alignment()
+        if requirement is not None:
+            unit = max(1, requirement[0] // workspace.element_size())
+            stride = -(-num_cols // unit) * unit
+    if num_rows * stride > workspace.numel():
+        return None
+    return workspace[: num_rows * stride].view(num_rows, stride)[:, :num_cols]
+
+
+def _deep_select_topk_rows(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> bool:
+    """Top-k every row with DeepSelect; ``False`` means "use the fallback".
+
+    DeepSelect emits indices relative to the row start, the same convention
+    ``top_k_per_row_prefill`` uses when ``stride1 == 1``, and fills the tail of
+    rows shorter than ``topk`` with ``idx_oob_fill_value`` (-1, the sentinel the
+    sparse attention already expects). It has no ``begin`` argument, so rows
+    whose window does not start at column 0 must stay on the fallback.
+    """
+    alignment = _deep_select_alignment()
+    if alignment is None:
+        return False
+    input_alignment, output_alignment = alignment
+    if logits.dtype != torch.float32 or logits.stride(1) != 1:
+        return False
+    if (logits.stride(0) * logits.element_size()) % input_alignment:
+        return False
+    if topk_indices.dtype != torch.int32 or topk_indices.stride(1) != 1:
+        return False
+    if (topk_indices.stride(0) * topk_indices.element_size()) % output_alignment:
+        return False
+    if row_ends.dtype != torch.int32 or row_ends.stride(0) != 1:
+        return False
+
+    import deep_select
+
+    logger.info_once(
+        "Indexer prefill top-k uses DeepSelect (rows=%d, topk=%d)",
+        logits.shape[0],
+        topk_tokens,
+    )
+    deep_select.topk(
+        logits,
+        topk_tokens,
+        end=row_ends,
+        indices_type=torch.int32,
+        output_idx=topk_indices,
+        idx_oob_fill_value=-1,
+        return_value=False,
+        # A NaN traps the whole process; production must not abort here.
+        abort_when_nan_found=False,
+    )
+    return True
+
+
+def _prefill_gather_rows(
+    prefill_metadata: Any,
+    total_seq_lens: int,
+    max_model_len: int,
+) -> int:
+    """Rows of gathered K one prefill step can need.
+
+    ``total_seq_lens`` is the configured bound
+    (``max_model_len * min(max_num_seqs, 40) // compress_ratio``), i.e. a
+    full-context prefill for every concurrent request. A KV cache cannot hold
+    that many tokens, so the shared workspace would be reserved several times
+    larger than any batch can reach. Size it from the batch in hand and let it
+    grow only as far as real batches ask for; without metadata (profile run)
+    fall back to a single full-context request.
+    """
+    chunks = getattr(prefill_metadata, "chunks", None)
+    if chunks:
+        return max(int(chunk.max_local_total_seq_lens) for chunk in chunks)
+    return min(total_seq_lens, max_model_len)
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -582,7 +692,10 @@ def sparse_attn_indexer(
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
-        # Reserve workspace for indexer during profiling run
+        # Reserve workspace for indexer during profiling run. A dummy run has no
+        # batch metadata, so the best available bound is one full-context
+        # request rather than one per concurrent request.
+        total_seq_lens = min(total_seq_lens, max_model_len)
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
@@ -709,13 +822,28 @@ def sparse_attn_indexer(
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
+        # DeepSelect indexes a whole row and has no per-row start, so it only
+        # covers the single-rank, unmasked prefill case; everything else keeps
+        # top_k_per_row_prefill.
+        deep_select_rows = (
+            envs.VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK
+            and current_platform.is_cuda()
+            and dcp_world_size == 1
+            and not use_pcp
+            and candidate_blocks is None
+            and topk_tokens <= 4096
+        )
+
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
+        gather_rows = _prefill_gather_rows(
+            prefill_metadata, total_seq_lens, max_model_len
+        )
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            gather_rows, head_dim, fp8_dtype, use_fp4_cache
         )
         workspace_specs = [values_spec, scales_spec]
         if envs.VLLM_INDEXER_PREFILL_CALLER_LOGITS:
@@ -724,7 +852,7 @@ def sparse_attn_indexer(
         workspace_specs.extend(
             _triton_prefill_bf16_workspace_shapes(
                 q_quant,
-                max_model_len,
+                gather_rows,
                 topk_indices_buffer,
             )
         )
@@ -742,6 +870,12 @@ def sparse_attn_indexer(
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
+            if chunk.max_local_total_seq_lens > k_quant_full.shape[0]:
+                raise RuntimeError(
+                    "indexer gather workspace holds "
+                    f"{k_quant_full.shape[0]} rows but this prefill chunk needs "
+                    f"{chunk.max_local_total_seq_lens}"
+                )
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
@@ -841,11 +975,11 @@ def sparse_attn_indexer(
                                 )
                             logits_out = None
                             if logits_workspace is not None:
-                                num_logits = (
-                                    q_slice_cast.shape[0] * k_quant_cast.shape[0]
-                                )
-                                logits_out = logits_workspace[:num_logits].view(
-                                    q_slice_cast.shape[0], k_quant_cast.shape[0]
+                                logits_out = _padded_logits_view(
+                                    logits_workspace,
+                                    q_slice_cast.shape[0],
+                                    k_quant_cast.shape[0],
+                                    pad_stride=deep_select_rows,
                                 )
                             k_bf16_out = None
                             if (
@@ -893,16 +1027,22 @@ def sparse_attn_indexer(
                     with optional_phase_profile_stage(
                         "indexer.topk", logits, flow="prefill"
                     ):
-                        ops.top_k_per_row_prefill(
-                            logits,
-                            cu_seqlen_ks,
-                            cu_seqlen_ke,
-                            topk_indices,
-                            num_rows,
-                            logits.stride(0),
-                            logits.stride(1),
-                            topk_tokens,
-                        )
+                        if not (
+                            deep_select_rows
+                            and _deep_select_topk_rows(
+                                logits, cu_seqlen_ke, topk_indices, topk_tokens
+                            )
+                        ):
+                            ops.top_k_per_row_prefill(
+                                logits,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                topk_indices,
+                                num_rows,
+                                logits.stride(0),
+                                logits.stride(1),
+                                topk_tokens,
+                            )
 
             with optional_phase_profile_stage(
                 "indexer.dcp_merge", logits, flow="prefill"

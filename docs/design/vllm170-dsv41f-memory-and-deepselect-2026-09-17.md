@@ -70,34 +70,6 @@ ratio=1 的层（20–39）拿到 8,388,608，ratio=2 的层（2–19）拿到 4
 
 ## 3. 修法 A：按本 rank 实际能装下的量定尺（推荐先做）
 
-**核心**：gather buffer 只需要覆盖"这一层 indexer 的 K cache 里**可能同时存在的压缩槽**"。
-KV cache 的真实容量在运行时已知（`DeepseekV4IndexerCache.kv_cache` 的形状），
-所以正确上界是 `num_blocks × block_size`（该层压缩槽数），而不是
-`max_model_len × max_num_seqs // ratio`。
-
-```python
-# deepseek_v4_1/attention.py:1205 附近（草图）
-raw = get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
-slots = int(self.k_cache_shape[0]) * int(self.k_cache_shape[1])   # 该层 K cache 的槽数
-self.max_total_seq_len = min(raw, slots)
-```
-
-预期收益（每 rank）：
-
-| 项 | 现在 | 改后 | 省 |
-| --- | --- | --- | --- |
-| gather values + scales | 1.107 GB | ~0.15 GB（按 1.17M token 容量） | **0.92 GiB** |
-| Triton 反量化 K | 256 MiB（按 max_model_len） | 按 tile（几 MiB） | **0.25 GiB** |
-| logits | 96 MiB | 8–16 MiB（配合分块） | 0.08 GiB |
-| **合计** | | | **≈1.2 GiB/rank** |
-
-PP2 的空闲从 ~1.1 GiB 涨到 ~2.3 GiB ⇒ **2048-token prefill chunk（峰值多 ~0.5 GiB）就装得下了**，
-而 2048 chunk 正是 9-17 那次 OOM 的直接原因。
-
-**风险**：上界必须严格成立（越界会写出垃圾 attention）。验证手段：
-`tests/models/test_deepseek_v41_ced.py` 里的 suffix/gather 单测 + 长上下文捞针 + 8 路并发压测，
-并在 set 之后断言 `total_seq_lens <= slots`。
-
 ## 4. DeepSelect 研究报告
 
 ### 4.1 是什么
@@ -160,3 +132,92 @@ gather/反量化/logits 这些大块是"算 logits"必需的，仍要按 §3 单
 3. **C（可选）**：把 `VLLM_INDEXER_PREFILL_STREAMING_TOPK` 的融合路径与 "triton logits +
    DeepSelect" 做一次正面对比，决定 prefill 最终走哪条（前者省 logits 物化显存，
    后者快；§3 做完后前者的显存优势会变小）。
+
+---
+
+## 7. 实测：真正的元凶与已落地的修改（2026-09-17 晚）
+
+### 7.1 §2.1 的估算错了：元凶是 `forward_mqa`，不是 indexer workspace
+
+用 `VLLM_DEBUG_WORKSPACE=1`（workspace manager 自带的 resize 日志）量到真实调用点：
+
+```
+Resized workspace from 'rocm.py:687:forward_mqa': 0.00 MB -> 2052.50 MB
+Resized workspace from 'rocm.py:687:forward_mqa': 2052.50 MB -> 4100.50 MB
+Resized workspace from 'sparse_attn_indexer.py:712:sparse_attn_indexer': 0.00 MB -> 493.00 MB
+Resized workspace from 'modular_kernel.py:1175:_allocate_buffers': 4.50 MB -> 141.00 MB
+```
+
+`vllm/models/deepseek_v4_1/amd/rocm.py::forward_mqa` 在 `attn_metadata is None`（warmup/dummy）
+时预留：
+
+```python
+N = (max_model_len + compress_ratio - 1) // compress_ratio
+M = N + window_size + max_num_batched_tokens
+workspace_manager.get_simultaneous(((PREFILL_CHUNK_SIZE, M, q.shape[-1]), bfloat16))
+```
+
+即 **每个 rank 都按"最大上下文的一整份 bf16 gather"预留 2.05–4.10 GB**（`PREFILL_CHUNK_SIZE`
+= min(4, max_num_seqs)），与"这个 rank 只持有 8 层、实际 chunk 是 1024/2048 token"完全无关。
+`_forward_prefill`（真实 prefill）里也是同一个 `N = max_model_len // ratio`。
+
+### 7.2 已落地的三处修改
+
+| 位置 | 改动 |
+| --- | --- |
+| `deepseek_v4_1/amd/rocm.py::_forward_prefill` | `N` 改为按**本 batch** 的 `prefill_seq_lens_cpu.max() // ratio`（CPU 镜像，无同步）——只分配这次 prefill 真正需要的行数 |
+| `deepseek_v4_1/amd/rocm.py::forward_mqa`（dummy 分支） | dummy 无 batch，预留量改为 `VLLM_DSV41_PREFILL_WORKSPACE_TOKENS`（默认 0 = 旧行为；启动脚本设 65536），真实 prefill 再按需增长 |
+| `model_executor/layers/sparse_attn_indexer.py` | gather/scales/bf16 反量化 workspace 按**本 step 的** `max(chunk.max_local_total_seq_lens)` 定尺（dummy 路径退化为 `min(total, max_model_len)`），并加越界断言 |
+
+### 7.3 效果（`nvidia-smi` per-process，MiB）
+
+| rank | 修改前 | 修改后 | 省 |
+| --- | --- | --- | --- |
+| PP0 | 59,988 | 58,234 | −1,754 |
+| PP1 | 62,938 | 61,184 | −1,754 |
+| **PP2** | **63,892** | **60,284** | **−3,608** |
+| PP3 | 63,512 | 59,904 | −3,608 |
+| PP4 | 62,406 | 58,798 | −3,608 |
+
+PP2 空闲 **1.1 GiB → 4.7 GiB**；最大 workspace 从 4.1 GB 降到 493 MB。
+验证：qa 正确、6.8k/21.7k/63k 三档长上下文捞针全中、decode 25.3 tok/s（无回退）。
+`PORT_MAX_BATCHED=2048` 现在**能起来**（2048 下 63k prefill 5385 tok/s）。
+
+### 7.4 仍存在的坑：warmup 阶段偶发 NCCL OOM（与显存无关）
+
+6 次 2048 启动里 2 次成功、3 次在 `Warm up ... mixed tokens=16` 之后报
+`Cuda failure 2 'out of memory'`（NCCL 建 2-rank communicator 时）。此时各卡仍空闲 4.5 GiB，
+**真正的瓶颈是宿主内存**：engram 两张 94.42 GiB 表常驻 → `free` 只剩 1–2 GiB、swap 2G 用满、
+available ≈21 GiB。上一轮失败的 worker（各 101 GB RSS）没杀干净会让它必失败。
+→ 启停纪律：`pkill -f "[v]llm serve"; pkill -f "VLLM::Worker"`，确认 `free` 恢复到 ~46 GiB
+可用后再拉起；2048 失败一次重试即可（1024 未观察到失败）。
+
+### 7.5 DeepSelect 实测（本机 sm_80 cubin，真实形状）
+
+第一版集成**其实没生效**：venv 里没有 `deep_select`（`import` 失败 → 静默回退）。
+补上 `.venv/.../site-packages/deep_select_repo.pth`（指向 `/mnt/data/apps/vllma100/DeepSelect`，复用已编译的
+sm_80 扩展）后，日志出现 `Indexer prefill top-k uses DeepSelect (rows=1020, topk=512)`。
+
+真实形状（fp32 logits、按 256 元素对齐 stride、`end=cu_seqlen_ke`、`output_idx=topk_indices`）：
+
+| 形状 | `top_k_per_row_prefill` | DeepSelect | 加速 |
+| --- | --- | --- | --- |
+| R=1020, V=6841 | 0.163 ms | 0.082 ms | 1.99× |
+| R=1020, V=21752 | 0.452 ms | 0.221 ms | 2.05× |
+| R=1020, V=63053 | 1.278 ms | 0.487 ms | 2.63× |
+| R=2040, V=63053 | 2.442 ms | 0.917 ms | 2.66× |
+| R=8, V=63053（decode 型） | 0.128 ms | 0.038 ms | 3.39× |
+
+正确性：与 `torch.topk` 的索引集合逐位一致；`end <= topk` 的短行按 `idx_oob_fill_value=-1` 填充，
+与 `top_k_per_row_prefill` 的 `-1` 语义一致。
+**但要修正 §4.2 的口径**：仓库 README 的 13× 是在 R=128/V=262144 那种"行少列长"的形状上，
+我们真实 prefill 形状只有 **2.0–2.7×**，折算到端到端 ≈1–2%（indexer top-k 只占 prefill 的一小片）。
+因此 DeepSelect 默认仍**关闭**，用 `VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK=1` 灰度开启。
+
+### 7.6 开关一览
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `VLLM_DSV41_PREFILL_WORKSPACE_TOKENS` | 0（=max_model_len） | dummy/warmup 预留的上下文行数上限；启动脚本设 65536 |
+| `VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK` | 0 | 用 DeepSelect 替换 prefill 的 `top_k_per_row_prefill` |
+| `VLLM_DEBUG_WORKSPACE` | 0 | 打印每次 workspace resize 的调用点与大小（排查显存的必备工具） |

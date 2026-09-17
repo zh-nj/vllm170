@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     VLLM_INDEXER_PREFILL_STREAMING_MIN_LEN: int = 16384
     VLLM_INDEXER_PREFILL_STREAMING_TILE_SIZE: int = 16384
     VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS: int = 512
+    VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK: bool = False
+    VLLM_DSV41_PREFILL_WORKSPACE_TOKENS: int = 0
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
     VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK: bool = True
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT: bool = False
@@ -1215,6 +1217,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
         os.getenv("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
+    ),
+    # DeepSeek's DeepSelect TopK kernels (SM80 tier) for the indexer's per-row
+    # selection, replacing top_k_per_row_prefill.
+    "VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK": lambda: (
+        os.getenv("VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK", "0") == "1"
+    ),
+    # Context length the DeepSeek V4.1 prefill gather workspace reserves when no
+    # batch metadata exists (warmup/profiling). 0 keeps the max_model_len bound.
+    "VLLM_DSV41_PREFILL_WORKSPACE_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_WORKSPACE_TOKENS", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
