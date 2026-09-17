@@ -463,3 +463,44 @@ return 16, 128                                       # 兜底
 | `attn.o_proj`（wo_a+wo_b） | 19.6 | 三个 fp8 内核等价 ⇒ 无便宜可捡 |
 | `hc.*` | 16.1 | 生产配置已在最优附近（±0.8%） |
 | 步间气泡 | ~60 | 需要 PP 多 microbatch，引擎级 |
+
+---
+
+## 12. 第 7 轮：又一个"编译了但不可达"的配置（bm32）—— 测了，是输的；以及两个默认关闭的开关
+
+### 12.1 `block_m=32` 格子在核心里编译了但 dispatch 不允许（沿用第 5 轮的思路找的）
+
+`mxfp4_moe_cutlass_core.cuh` 实例化了 `(TM=32, WM=16, TN=128, WN=64)`，
+但 `mxfp4_int8_moe_entry.cu` 的 dispatch 只有 `(16,64) (16,128) (64,128) (128,128)`，
+Python 侧的 `_TILE_TABLE` 也选不到 32。2048 token 时每个专家正好 32 行 ⇒ bm32 既不浪费
+padding 又保持"每专家 1 个 M tile"，看起来是缺失的最优点。
+
+本轮把它接上（dispatch + benchmark 校验）并实测（3080 Ti，2048 token，block_n=128）：
+
+| block_m | w13 | w2 | 合计 |
+| ---: | ---: | ---: | ---: |
+| 16 | 32.56 | 16.80 | 49.36 |
+| **32** | 33.69 | 17.48 | **51.17** |
+| 64 | 28.75 | 15.08 | **43.83** |
+
+**bm32 比 bm64 差 17%** —— 大 tile 的每 CTA 效率超过 padding 浪费，padding 假说不成立。
+改动已回滚。至此 MoE tile 四个档（16/32/64/128）全部实测过：2048 token 最优是 **bm64**，
+4096 token 最优是 **bm128**，与现在的选择一致。
+
+### 12.2 两个默认关闭的开关，测了/查了都不动
+
+| 开关 | 结论 |
+| --- | --- |
+| `VLLM_INDEXER_PREFILL_STREAMING_TOPK=1`（SM80 融合 logits+topk 流式路径） | 端到端 5,850–5,869 vs 默认 5,841–5,881，**中性**；且它要求 `max_row_len ≥ 16384` 且 `candidate_blocks is None`，只有部分层/部分 chunk 会走到 |
+| `VLLM_INDEXER_LOGITS_MAXNREG` | 代码注释里已记录重新测量结果：内核现在吃 162 寄存器，cap 128 会溢出，"中性到更差，实际服务的形状上 −4.0%" ⇒ 保持 0 |
+| `VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT` | 全仓库只有 envs.py 声明，没有任何使用点（死开关）；engram 的 dequant 本来就在 `_engram_lookup_kernel` 里走 GPU |
+
+另外 `indexer.logits` 的 `@triton.autotune`（BLOCK_N=128 / num_warps=4 / stages∈{2,4}）注释里写明已扫过
+M 1..2048 × N 2048..131072，"BN=64 差 1.25–1.40×、BN=32 差最多 2.41×"，也已经在其最优点。
+
+### 12.3 步间空隙的量级修正
+
+用"profiled vs unprofiled 同一 prompt"两个数对齐后：每 step 墙钟 ≈ 345 ms（unprofiled，
+2048 chunk，63k 请求），其中 forward ≈ 255 + metadata ≈ 11 ⇒ **空隙 ≈ 79 ms/step（~23%）**，
+比第 3 轮估的 60 ms 更大（当时把 profiler 自身开销算进了 forward）。这部分在引擎/PP 流水线里，
+第 3 轮的 torch trace 已证明 worker 主线程 94% 时间在 `c10d::recv_` 上等上游 rank。
