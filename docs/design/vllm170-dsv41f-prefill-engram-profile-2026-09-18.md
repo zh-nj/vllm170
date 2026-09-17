@@ -933,3 +933,67 @@ worker 启动阶段报了 `Cuda failure 2 'out of memory'`。**这与 §11.3 记
 - 数值复核：用 `compare_moe_numerics.py` 把重建后的实例与内核改动前的抓取逐项对照 ——
   **贪心 384/384 token 相同，prompt-token argmax 5,094/5,094 相同，|Δlogprob| 全为 0.0000**。
   ⇒ 重建/回滚没有改变任何数值；这个脚本可以直接当作"换内核/换后端没改变数值"的回归门。
+
+---
+
+## 20. 第 14 轮：A8W4 vs A16W4 的线上对照（含对 §19.2 那句"装不下"的更正）
+
+### 20.1 更正：marlin 那次失败不是内存，是 PP 接收缓冲的状态错
+
+带重试复跑 `--moe-backend marlin`：**第 1 次就起来了**（`host_free=168GiB`），8 条短请求的抓取全部完成
+⇒ §19.2 里那句"bf16 路线装不下 / int8 是唯一装得下的路线"**作废**（已就地改成"单次失败，签名与 §11.3 的
+已知启动 flake 相同，不作结论"）。
+
+它真正的失败点在**长 prefill**：同一个 marlin 实例在跑 63k 请求时死掉，栈是
+
+```
+vllm/v1/worker/gpu/pp_utils.py:103  _transition
+  RuntimeError: Cannot start a receive while PP receive buffer is model; expected free.
+```
+
+随后引擎卡死（`No available shared memory broadcast block found in 60 seconds`），rank1 的 GPU 100% 占用但只有
+61 W（自旋），其余卡空闲。这与 marlin 的 MoE 内存无关，是本仓库 PP 缓冲生命周期那类问题在 marlin 的每步
+时序下被暴露出来。⇒ **结论：bf16 marlin 路线在本构建上不能用于长上下文 prefill（短请求可用），
+线上继续用 int8**。
+
+### 20.2 线上对照：同一批 prompt，两个后端的数值差多少
+
+工具：`benchmarks/deepseek_v4/compare_moe_numerics.py`（随机词 prompt，每个 prompt 的**全部 prompt token
+logprob** 共 5,094 个位置 + 贪心 384 个 token）。A = `mxfp4_int8_sm80`（A8W4），B = `marlin`（A16W4）。
+
+| 指标 | 结果 |
+| --- | --- |
+| **prompt token 的 argmax 一致率** | **5,094 / 5,094 = 100.000%** |
+| prompt logprob 差 | mean 0.1805 nats，median 0.1215，max 2.90 |
+| 贪心续写逐 token 一致率 | 192 / 384 = 50% |
+
+前两行是结论性的：**换后端后，模型对真实文本的 top-1 预测一个都没变**，分布的移动只有 ~0.18 nats（中位 0.12）。
+第三行看起来吓人但不可用作质量指标：这些 prompt 是随机词串，续写本身就是随机的，任何 1e-3 量级的扰动都会让
+两条贪心轨迹进入不同上下文后彻底分叉；它衡量的是混沌放大，不是精度。**要看质量必须看真实 prompt**。
+
+### 20.3 真实 prompt 的答案正确性（线上 int8 路线）
+
+`benchmarks/deepseek_v4/compare_real_prompts.py`（10 条语义确定的短 prompt，greedy，32 token）：
+
+| prompt | 输出 | 判定 |
+| --- | --- | --- |
+| 17 × 23 = ? | `391` | ✓ |
+| 红色行星 = ? | `Mars` | ✓ |
+| `def add(a, b): return` | `a + b` | ✓ |
+| 译成法语 | `Le chat est assis sur le tapis.` | ✓ |
+| 前五个素数 | `2, 3, 5, 7, 11` | ✓ |
+| 金的化学符号 | `Au` | ✓ |
+| 二战结束年份 | `1945` | ✓ |
+| 俳句续写 | `the wind blows through the branches.` | 通顺 |
+
+8/10 条给出正确答案（另两条是"填空/一句话总结"格式，模型直接输出 EOS —— 是 prompt 格式问题，与 MoE 无关）。
+结合 §19.1/§19.2 的内核级分解（权重无损、总代价 = 激活 int8 的 2.7% rel-L2、cosine 0.9996），
+**int8 路线的精度可以放心用**。
+
+### 20.4 本轮新增/更新的产物与最终状态
+
+- 新增 `benchmarks/deepseek_v4/compare_real_prompts.py`（真实 prompt 的答案级对照，可跨后端跑）。
+- 服务已回到默认 int8 配置（run83，`STARTUP_OK`，`/health` 200）。
+- 目标状态：MoE 主循环（§19.3/§19.4）与精度（§19 + §20）两条线都已闭环；
+  距离 10,000 tok/s 的剩余差距仍是 §17.3 里那条"更大 chunk 摊薄每 step 权重流"的算法级路线，
+  它要把注意力/索引器随上下文增长的账一起还。
