@@ -42,18 +42,31 @@ _TILE_TABLE: tuple[tuple[int, int, int], ...] = (
 )
 
 
+# Block-M candidates the kernel is instantiated for, ascending.
+_BLOCK_M_CANDIDATES: tuple[int, ...] = (16, 64, 128)
+_BLOCK_N = 128
+
+
 def select_mxfp4_int8_sm80_tile(
     num_tokens: int,
     topk: int,
     num_experts: int,
 ) -> tuple[int, int]:
-    """Static starting point; the server benchmark must validate this table."""
+    """Smallest supported block_m that covers the rows each expert receives.
+
+    Sizing block_m to the *average* rows per expert keeps one M tile per expert,
+    so its mxfp4 weights are read from DRAM once per step. The previous table
+    lookup capped block_m at the largest power of two <= the average and had no
+    entry covering (2048, 1<<30) with community block_m, so 2048- and
+    4096-token prefill chunks silently fell through to the ``16`` fallback --
+    the slowest tiling measured (20.6 ms/layer against 17.8 ms for block_m=64
+    at 2048 tokens on a CMP 170HX, and worse at 4096).
+    """
     average = max(1, (num_tokens * topk + num_experts - 1) // num_experts)
-    max_block_m = min(128, max(16, 1 << (average - 1).bit_length()))
-    for max_tokens, block_m, block_n in _TILE_TABLE:
-        if num_tokens <= max_tokens and block_m <= max_block_m:
-            return block_m, block_n
-    return 16, 128
+    for block_m in _BLOCK_M_CANDIDATES:
+        if block_m >= average:
+            return block_m, _BLOCK_N
+    return _BLOCK_M_CANDIDATES[-1], _BLOCK_N
 
 
 def make_mxfp4_int8_sm80_decode_metadata(

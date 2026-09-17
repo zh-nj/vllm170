@@ -348,3 +348,60 @@ torch trace 显示 fp8 线性层（wo_a/wo_b/wq_b/fused_wqa_wkv/共享专家）�
 overlap 阈值、hc 调参）**全部 ≤1.01×**；唯一找到的确定性收益是 fp8→bf16 的 1.44×（约 3%，
 代价 1 GB 常驻）。**10,000 tok/s 需要重写 MoE mainloop（目标 2×）+ 消除 PP 每步气泡**，
 不是配置或调参能达到的。
+
+---
+
+## 10. 第 5 轮：找到并修复 MoE tile 选择 bug（+10~11%）
+
+### 10.1 bug：prefill 一直在用最慢的 tile
+
+`vllm/model_executor/layers/fused_moe/experts/mxfp4_int8_sm80.py::select_mxfp4_int8_sm80_tile`
+的两步逻辑互相打架：
+
+```python
+average = ceil(num_tokens * topk / num_experts)      # 2048 token -> 32 行/专家
+max_block_m = min(128, max(16, 1 << (average - 1).bit_length()))   # -> 32（向下取幂）
+for max_tokens, block_m, block_n in _TILE_TABLE:     # (1,16) (1024,16) (2048,64) (1<<30,128)
+    if num_tokens <= max_tokens and block_m <= max_block_m: return ...
+return 16, 128                                       # 兜底
+```
+
+- 2048 token：`max_block_m = 32` ⇒ 表里 `block_m=64` 的两项（2048 和 1<<30）都不可达 ⇒ **落到兜底 (16,128)**。
+- 4096 token：`average = 64 → max_block_m = 64`，但 `(2048,64)` 要求 `num_tokens ≤ 2048` 不满足、
+  `(1<<30,128)` 要求 `block_m ≤ 64` 不满足 ⇒ **同样落到兜底 (16,128)**。
+- 实测（CMP 170HX，2048 token 单层 w13+w2）：**bm16 = 20.64 ms vs bm64 = 17.77 ms**，
+  且 bm16 在每个 token 上重读专家权重（M tile 数 ×4）——4096 token 时差距更大。
+
+生产与 benchmark 的偏差也印证了这一点：2048 时生产 19.7 ms/层（≈bm64 的 17.8 的 1.11 倍），
+4096 时生产 286.8 ms/step（=35.9 ms/层）而其 benchmark 的 bm64 只有 25.6、bm128 只有 24.4。
+
+### 10.2 修复
+
+改为"取 ≥ 平均行数/专家的最小受支持 block_m"（16/64/128），并把越界情形写清楚：
+
+| tokens | 修复前 | 修复后 | 说明 |
+| ---: | --- | --- | --- |
+| ≤1024 | (16,128) | (16,128) | 不变（实测 bm16 最优） |
+| 2048 | **(16,128) 兜底** | **(64,128)** | 实测 17.77 vs 20.64 ms/层 |
+| 4096 | **(16,128) 兜底** | **(64,128)** | 修复前每 token 重读 4 遍专家权重 |
+| ≥8192 | (128,128) | (128,128) | 不变 |
+
+只影响 prefill（decode/投机路径 m 很小，average≤16，仍选 bm16，与持久 decode metadata 的
+`_DECODE_BLOCK_M=16` 一致）。tile 只改分块，不改数值（benchmark 里的 `check_tile_equivalence` 已覆盖）。
+
+### 10.3 端到端效果（63,053 token 单请求，同一 prompt，针全中）
+
+| 配置 | 修复前 | 修复后 | 提升 |
+| --- | ---: | ---: | ---: |
+| **2048 chunk（目标要求保持）** | 5,300–5,346 tok/s | **5,867–5,916 tok/s** | **+10~11%** |
+| 4096 chunk | 5,020 tok/s | 5,914–5,952 tok/s | +18% |
+| 8192 chunk | — | 不可行 | 显存不足：warmup 阶段 NCCL collective timeout |
+
+（4096 需 `PORT_KV_BYTES=1500000000`，8192 试过 1.9e9 仍不够；本机 PP 卡余量不够大 chunk。）
+
+### 10.4 其他
+
+- 起服务前必须确认宿主内存干净：8192 崩溃后残留进程让 `free` 只剩 2 GiB，下一次启动
+  在 warmup 阶段报 NCCL `unhandled cuda error`；杀掉全部 worker 等 `free` 回到 ~200 GiB 后再起即可。
+- 至此累计：MoE tile 修复 **+10%**；其余 7 个实验（grid 顺序、kStages、overlap 阈值、hc 调参、
+  tile 换档、512/4096 chunk）全部 ≤1.01×；fp8→bf16 线性层 1.44×（约 3%，代价 1 GB）仍为可选。
