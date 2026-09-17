@@ -408,7 +408,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
-        self.has_own_embed_tokens = self.model.is_embedding_rank
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
@@ -422,6 +421,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         )
         self.is_dspark_head_rank = self.model.is_head_rank
         self.is_dspark_embedding_rank = self.model.is_embedding_rank
+        # Only the first distributed draft stage loads a private embedding copy;
+        # later stages do not need one at all.
+        self.has_own_embed_tokens = self.model.is_embedding_rank
         # PP aliases the target head after draft loading, avoiding a transient
         # full-vocabulary duplicate on every draft stage.
         self.lm_head = (
@@ -518,8 +520,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         The input embedding is also loaded on later PP stages. Other target
         weights are skipped; the output head remains shared with the target.
         """
-        first_layer = self.model.layers[0]
-        use_mega_moe = first_layer.ffn.use_mega_moe
+        local_layers = [
+            layer
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+        ]
+        use_mega_moe = bool(local_layers and local_layers[0].ffn.use_mega_moe)
         # Draft MoE layers use the dspark_* expert counts, not the
         # backbone's (see DeepseekV4MoE and the reference
         # ModelArgs.get_moe_config).
@@ -527,7 +533,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts
         )
-        if use_mega_moe:
+        if not local_layers:
+            expert_mapping = []
+        elif use_mega_moe:
             expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
         else:
             expert_mapping = fused_moe_make_expert_params_mapping(
@@ -595,7 +603,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
+                    param = params_dict.get(name_mapped)
+                    if param is None:
+                        # This rank does not own the draft block that holds it.
+                        continue
                     success = param.weight_loader(
                         param,
                         loaded_weight,
@@ -617,21 +628,29 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 if not is_layer_param or weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    break
                 param.weight_loader(param, loaded_weight, stacked_shard_id)
                 loaded_params.add(name)
                 break
             else:
                 if "attn_sink" in name:
+                    sink = params_dict.get(name)
+                    if sink is None:
+                        continue
                     narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    sink[: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    # Owned by another distributed draft stage.
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
@@ -649,6 +668,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             layer.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
