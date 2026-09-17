@@ -405,3 +405,61 @@ return 16, 128                                       # 兜底
   在 warmup 阶段报 NCCL `unhandled cuda error`；杀掉全部 worker 等 `free` 回到 ~200 GiB 后再起即可。
 - 至此累计：MoE tile 修复 **+10%**；其余 7 个实验（grid 顺序、kStages、overlap 阈值、hc 调参、
   tile 换档、512/4096 chunk）全部 ≤1.01×；fp8→bf16 线性层 1.44×（约 3%，代价 1 GB）仍为可选。
+
+---
+
+## 11. 第 6 轮：修复后的账本、fp8 线性层三个内核等价、启动flake 的处理
+
+### 11.1 修复后的每 step 账本（2048 chunk，rank3，profile 开着）
+
+| 环节 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| `target.model_forward` | 288.6 | **254.9** |
+| ├ `moe.routed_experts` | 157.7 | **125.9**（w13 80.0 + w2 42.5） |
+| ├ `attn.total` | 96.9 | 96.9 |
+| │　├ `attn.prepare` | 71.8 | 71.8（sparse_mla.prefill 28.4 + indexer.logits 18.0 + ~25 未细分） |
+| │　└ `attn.o_proj` | 21.8 | 21.8（wo_a 6.3 + wo_b ~13 + inv_rope 2.2） |
+| ├ `hc.*`（4 个 kernel） | 16.1 | 16.1 |
+| └ `moe.shared_experts` | 11.6 | 11.6 |
+| `target.attn_metadata` | 10.8 | 10.8 |
+
+修复把 MoE 每 step 从 157.7 降到 125.9 ms（−20%），已低于其单层 benchmark 换算值（8×17.77=142），
+说明 MoE 已在其内核极限上。
+
+### 11.2 fp8 线性层：Marlin / Humming / Triton 端到端等价
+
+`_POSSIBLE_FP8_BLOCK_KERNELS` 里前四个（FlashInfer/DeepGEMM/Cutlass/B12x）对 v4.1 的
+"32×32 block + 每 32 token 一组的激活量化" 全部拒绝（它们只支持 `(1,128)` 激活分组），
+**Marlin / Humming / Triton 三个都能实现**，而列表顺序让 Marlin 永远被选中。
+
+本轮加了 `VLLM_FP8_LINEAR_KERNEL=<名字子串>` 开关（运维/A-B 用，默认不改变行为）并实测：
+
+| 内核 | 63k prefill |
+| --- | ---: |
+| Marlin（默认） | 5,841–5,881 tok/s |
+| Humming | 5,874–5,934 tok/s |
+| Triton | 5,877–5,948 tok/s |
+
+**三者等价**（差异在噪声内）。即 §9.1 里 bf16 cuBLAS 的 1.44× 只存在于隔离 benchmark，
+端到端换不来（fp8 线性层不在关键路径上，且激活量化开销抵消），**并且 bf16 方案还要多占 1 GB 常驻**，
+因此明确放弃该路线。
+
+### 11.3 启动 flake 的处理（运维要点）
+
+- 现象：重启后 warmup（`mixed tokens=16`）阶段偶发 `ncclUnhandledCudaError`，或引擎卡在
+  `No available shared memory broadcast block found in 60 seconds`。
+- 原因：上一个实例的 Engram 宿主表（2×94.4 GiB）被 kill 后需要 ~20–30 s 才被内核回收；
+  过早启动时新实例的建表 + warmup 的 JIT 编译会去抢最后几 GiB 宿主内存。
+- 处理：`/tmp/start_pp5.sh`（本轮写的重试脚本）先 `pkill` 再等 `free ≥ 150 GiB`，然后启动；
+  同时把 60 s 无 shm 广播、engine init failed 都当作失败信号重试。有了它之后 4 次启动全部一次成功。
+
+### 11.4 剩余可动项（按大小）
+
+| 项 | ms/step | 现状/可行性 |
+| --- | ---: | --- |
+| `attn.prepare` 未细分部分 | ~25 | 含 wq_b（另一处 Marlin fp8）、qkv_insert、indexer 的 produce_k；未插桩 |
+| `indexer.logits` | 18.0 | Triton fp8 MQA logits，实测 ≈6 TFLOPS（fp8 峰值 ~3%），有内核空间但属内核工程 |
+| `sparse_mla.prefill` | 28.4 | 已在 read-once tiling（FlashMLA 文档实测水平） |
+| `attn.o_proj`（wo_a+wo_b） | 19.6 | 三个 fp8 内核等价 ⇒ 无便宜可捡 |
+| `hc.*` | 16.1 | 生产配置已在最优附近（±0.8%） |
+| 步间气泡 | ~60 | 需要 PP 多 microbatch，引擎级 |

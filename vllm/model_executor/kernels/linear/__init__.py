@@ -672,6 +672,35 @@ def choose_scaled_mm_linear_kernel(
     )
 
 
+def _forced_fp8_block_kernel() -> type | None:
+    """FP8 block-scaled kernel named by ``VLLM_FP8_LINEAR_KERNEL``, if any.
+
+    The candidate order in ``_POSSIBLE_FP8_BLOCK_KERNELS`` picks Marlin for the
+    32x32-block / per-32-token-group scheme DeepSeek-V4.1 uses, but Humming and
+    Triton can implement the same config and are not ordered. This lets an
+    operator A/B them without editing the list.
+    """
+    import os
+
+    wanted = os.getenv("VLLM_FP8_LINEAR_KERNEL", "").strip().lower()
+    if not wanted:
+        return None
+    try:
+        from vllm.platforms import current_platform
+
+        enum = getattr(current_platform, "_enum", None)
+        candidates = _POSSIBLE_FP8_BLOCK_KERNELS.get(enum, [])
+    except Exception:  # pragma: no cover - platform lookup must never break init
+        return None
+    for kernel in candidates:
+        if wanted in kernel.__name__.lower():
+            return kernel
+    raise ValueError(
+        f"VLLM_FP8_LINEAR_KERNEL={wanted!r} matches none of "
+        f"{[k.__name__ for k in candidates]}"
+    )
+
+
 def init_fp8_linear_kernel(
     activation_quant_key: QuantKey,
     weight_quant_key: QuantKey,
@@ -693,7 +722,7 @@ def init_fp8_linear_kernel(
         kernel_type = choose_scaled_mm_linear_kernel(
             config=scaled_mm_linear_kernel_config,
             possible_kernels=_POSSIBLE_FP8_BLOCK_KERNELS,  # type: ignore[misc]
-            force_kernel=force_kernel,
+            force_kernel=_forced_fp8_block_kernel() or force_kernel,
         )
         if module_name:
             logger.info_once(
