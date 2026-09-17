@@ -214,3 +214,56 @@ tokenizer/parser for `deepseek_v41`、以及多处 GLM/Qwen 共用的图捕获�
 2. **CED 在 5 卡上不可用**：其约束（层 19 与全部解码层同段）在纯 GPU 驻留下无法满足，
    `ced_prefill` 只能保持关闭。
 3. 分支 engram 只认 `cpu_offload`，不认 `cpu_cache_gb`/`ssd_offload_path`。
+
+## 6. 第 3 轮：真机跑通（已完成）
+
+### 6.1 最后一个启动阻塞：`prepare_attn` 签名
+
+```
+TypeError: DefaultModelState.prepare_attn() takes from 7 to 8 positional arguments but 9 were given
+  at vllm/models/deepseek_v4_1/nvidia/model_state.py:142
+```
+
+分支时代的 `ModelState.prepare_attn` 多一个 `ubatch_idx` 参数，本项目的
+`DefaultModelState.prepare_attn`（以及 `model_runner.py:1819`、`cudagraph_utils.py:711`
+两个调用点）都没有。该参数在本仓库中只出现在这个 override 里，直接删除即可。
+删掉后引擎正常启动：加载 → KV 预留 → CUDA graph 捕获 → warmup → `Application startup
+complete`（engine init 73.7 s）。
+
+### 6.2 显存包线：PP2 只剩 ~1.1 GiB，2048 chunk 必 OOM
+
+各 rank 稳态占用（`nvidia-smi`，单卡 65024 MiB）：
+
+| rank | GPU | weights（加载报告） | 稳态占用 | 空闲 | 峰值 |
+|------|-----|--------------------|----------|------|------|
+| PP0  | 1   | 55.10 GiB          | 60204 MiB | 4.8 GiB | 60650 |
+| PP1  | 2   | 57.48 GiB          | 63154 MiB | 1.9 GiB | 63540 |
+| PP2  | 3   | 56.06 GiB          | 63918 MiB | **1.1 GiB** | **64368** |
+| PP3  | 4   | 56.06 GiB          | 63538 MiB | 1.5 GiB | 63986 |
+| PP4  | 5   | 54.92 GiB          | 62432 MiB | 2.6 GiB | 62816 |
+
+默认 `--max-num-batched-tokens 2048` 时首次长提示词（6841 token，chunked prefill）在 PP2 上：
+
+```
+[rank2] memory allocation failed with OOM on device 2 while trying to allocate
+134217728 bytes (free: 118226944, total: 67725885440)
+→ RuntimeError: torch_call_dispatcher("aten::new_empty"...) failed
+   at .../torch/csrc/stable/ops.h, line 939
+   （栈：attention.py:916 fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert）
+```
+
+即权重之外只剩 ~1.1 GiB 设备空闲，而 1024 chunk 的一次 prefill 峰值就要 ~450 MiB，
+2048 chunk 直接翻倍超出。**结论：1024 是这台机器的安全 chunk；实际用
+`expandable_segments:True` 把约 4.8 GiB 的碎片化缓存池回收后再试 2048。**
+
+### 6.3 已验证的行为（run10，`PORT_MAX_BATCHED=1024`）
+
+- 单请求 43 token 提示 → 答案正确（Paris），含 reasoning 段
+- 单请求 300 token 生成：11.5 s ≈ 26 tok/s，代码片段正确
+- 6841 token 长上下文大海捞针：**答对**（`QUARTZ-9182`），3.8 s
+- 800 token 生成：33.1 s ≈ **24.2 tok/s**
+- 8 路并发（提示 1.9k–10.6k token，各 120 token 输出）：31.7 s 全部完成，8/8 捞针答对，
+  峰值显存与单请求持平（PP2 64372 MiB）
+- DSpark 投机：drafts 91 / draft tokens 455（=K×drafts，K=5 生效）/ accepted 250，
+  **接受率 54.9%**，逐位 0.86/0.66/0.48/0.43/0.36，平均接受长度 3.78
+  —— 对比移植前本项目分布式 DSpark 的 17.71%，接受率已恢复到正常水平

@@ -28,9 +28,11 @@ export VLLM_DSV41_HOST_HEADROOM_GIB=${VLLM_DSV41_HOST_HEADROOM_GIB:-12}
 # device memory free during serving, and the default allocator cannot satisfy a
 # 128 MiB request from its fragmented free pool: at 2048 prefill tokens that
 # raised "memory allocation failed with OOM on device 2 while trying to allocate
-# 134217728 bytes (free: 118226944)". Expandable segments remove the
-# fragmentation, which is what lets the chunk size below stay at 1024.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# 134217728 bytes (free: 118226944)".
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True does NOT rescue 2048 (same
+# OOM, and it raises the resident pool by ~450 MiB per rank), so the chunk size
+# below stays at 1024 with the stock allocator. Override PORT_MAX_BATCHED only
+# after PP2 gains real headroom (fewer layers, smaller KV, or no draft stage).
 
 PORT_PORT=${PORT_PORT:-26663}
 PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
