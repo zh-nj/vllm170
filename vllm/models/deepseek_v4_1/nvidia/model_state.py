@@ -137,7 +137,6 @@ class DeepseekV41ModelState(DefaultModelState):
         attn_groups,
         kv_cache_config,
         for_capture=False,
-        ubatch_idx=0,
     ):
         metadata = super().prepare_attn(
             input_batch,
@@ -147,7 +146,6 @@ class DeepseekV41ModelState(DefaultModelState):
             attn_groups,
             kv_cache_config,
             for_capture,
-            ubatch_idx,
         )
         self.ced_step = None
         if self.ced_metadata is not None and not all(

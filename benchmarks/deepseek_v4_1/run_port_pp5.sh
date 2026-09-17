@@ -24,12 +24,19 @@ export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-8,8,8,8,8}
 # This host has ~252 GiB RAM; the branch's default 64 GiB spare-RAM guard
 # would reject the two resident Engram tables (2 x 94.42 GiB) outright.
 export VLLM_DSV41_HOST_HEADROOM_GIB=${VLLM_DSV41_HOST_HEADROOM_GIB:-12}
+# The PP2 rank (layers 16-23 plus its DSpark draft stage) keeps only ~1.1 GiB of
+# device memory free during serving, and the default allocator cannot satisfy a
+# 128 MiB request from its fragmented free pool: at 2048 prefill tokens that
+# raised "memory allocation failed with OOM on device 2 while trying to allocate
+# 134217728 bytes (free: 118226944)". Expandable segments remove the
+# fragmentation, which is what lets the chunk size below stay at 1024.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 PORT_PORT=${PORT_PORT:-26663}
 PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
 PORT_MAX_MODEL_LEN=${PORT_MAX_MODEL_LEN:-1048576}
 PORT_KV_BYTES=${PORT_KV_BYTES:-1300000000}
-PORT_MAX_BATCHED=${PORT_MAX_BATCHED:-2048}
+PORT_MAX_BATCHED=${PORT_MAX_BATCHED:-1024}
 PORT_MAX_SEQS=${PORT_MAX_SEQS:-8}
 PORT_DSPARK_TOKENS=${PORT_DSPARK_TOKENS:-5}
 PORT_MOE_BACKEND=${PORT_MOE_BACKEND:-mxfp4_int8_sm80}
