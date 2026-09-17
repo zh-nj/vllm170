@@ -504,3 +504,35 @@ M 1..2048 × N 2048..131072，"BN=64 差 1.25–1.40×、BN=32 差最多 2.41×"
 2048 chunk，63k 请求），其中 forward ≈ 255 + metadata ≈ 11 ⇒ **空隙 ≈ 79 ms/step（~23%）**，
 比第 3 轮估的 60 ms 更大（当时把 profiler 自身开销算进了 forward）。这部分在引擎/PP 流水线里，
 第 3 轮的 torch trace 已证明 worker 主线程 94% 时间在 `c10d::recv_` 上等上游 rank。
+
+### 12.4 并发不会提高 prefill 吞吐（反而下降）
+
+同一 prompt 长度（12,450 token）下并发 k 个请求（`max_num_seqs=8`，`max_num_batched_tokens=2048`）：
+
+| 并发数 | 墙钟 | 聚合吞吐 | 单请求延迟 |
+| ---: | ---: | ---: | ---: |
+| 1 | 3.1 s | 4,000 tok/s | 3.1 s |
+| 2 | 6.5 s | 3,847 tok/s | 6.5 s |
+| 4 | 15.0 s | 3,317 tok/s | 15.0 s |
+
+两个现象：
+1. **每个请求的延迟随并发数线性增长**（3.1 → 6.5 → 15.0 s）⇒ 请求是被**合并进同一个 2048-token step 预算**里串行消费的，
+   而不是并行推进。所以聚合吞吐 ≈ 单流速率，不随并发提升。
+2. 聚合吞吐**随并发下降**（4,000 → 3,317）：每 step 的**活跃序列数**变多，indexer 的 gather/logits、
+   SWA metadata 等按"序列 × 上下文"计费的部分变大，而 tokens/step 被 2048 卡死。
+
+⇒ 对 "prefill 达到 10000" 的直接含义：**并发不是出路**，唯一的出路是降低"每 2048 token 的固定成本"
+（MoE 权重流 126 ms + 注意力 97 ms + 空隙 ~79 ms），也就是本文件 §7.5/§9 算术里的那些内核/引擎工作。
+
+### 12.5 运维教训：不要在服务运行时 `cp` 覆盖已 mmap 的 `.so`
+
+第 7 轮中途我把回滚后的 `vllm/_moe_C_stable_libtorch.abi3.so` 用 `cp` 覆盖回去，
+而 5 个 worker 仍然 mmap 着这个文件；worker 空闲时没问题，下一次请求触发缺页时命中被改写的页
+→ SIGBUS，日志表现为 `Worker proc VllmWorker-0 died unexpectedly (exit code: None)`，
+随后 `Cannot start a receive while the PP receive buffer still has owner stream` 等连锁报错。
+**结论：改 `.so` 前后必须重启服务（或用 `mv` 换文件而不是原地覆盖）。** 不是 vLLM 的 PP bug。
+
+### 12.6 本轮之后的稳定配置复核
+
+默认 2048 chunk：63k 请求 5,817–5,843 tok/s；21.7k 请求 4,416 tok/s；
+4 个 12.4k 并发请求逐题正确（捞针全中）。
