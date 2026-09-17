@@ -453,6 +453,41 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(aux_hidden_states)
 
+    def prepare_pipeline_query(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.prepare_pipeline_query(input_ids)
+
+    def forward_local_stage(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.model.forward_local_stage(
+            hidden_states,
+            positions,
+            input_ids,
+            residual,
+            post_mix,
+            res_mix,
+            pre_mix,
+        )
+
+    def finish_pipeline_query(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        pre_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.finish_pipeline_query(
+            hidden_states, residual, post_mix, res_mix, pre_mix
+        )
+
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
         # layer, named by its prefix.
