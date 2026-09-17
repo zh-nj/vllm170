@@ -132,3 +132,38 @@ tokenizer/parser for `deepseek_v41`、以及多处 GLM/Qwen 共用的图捕获�
 另需确认一件事：**工作区里未提交的分布式 DSpark 改动**（`run_cmp170hx_pp5.sh`、
 `dspark/speculator.py` +368、`dflash/cudagraph.py`）是否先由你提交到 main，再在其上做移植？
 （我未改动这三个文件；若由我提交，会把它们单独作为一笔提交，不混进移植提交。）
+
+---
+
+## 4. 执行进度（路线 A，已落地第一笔提交）
+
+**分支**：`port/dsv41f-hybrid`（基于 `7783087333`，即 dsv41 之前的基线；9 个 dsv41 提交不在历史里）
+**提交**：`99d653fde9` — 183 文件，+31538/−1578
+
+### 已完成
+
+| 项 | 结果 |
+| --- | --- |
+| 安全网 | tag `backup/main-20260917-pre-dsv41f-port`、分支 `backup/wip-dspark-graph-20260917`（含被移除的未提交分布式 DSpark 图捕获改动，可随时恢复） |
+| 工作区未提交改动 | 已按指示移除（备份在上一行分支） |
+| dsv41 实现 | `vllm/models/deepseek_v4_1/**` 整体取分支版本（32 个文件） |
+| CPU 混推剔除 | 删除 6 个模块；`nvidia/model.py`、`nvidia/model_state.py`、`nvidia/vl_model.py` 三处引用已剥离 |
+| 分布式 DSpark | 保留（本项目实现），并叠加分支的 Q/K 解耦增强 |
+| 0.27 适配 | `is_cutedsl_supported()`（SM90 门）、注册 `TRITON_MLA_SPARSE_DSV41` 后端 |
+| 验证 | 18 个模块导入通过；模型类解析 `DeepseekV41ForCausalLM`；后端解析通过；DSpark 配置矩阵 K∈{3,5,7,10} 与 Q=5/K=3 可构造，K=7 已解禁，Q<K 仍拒绝 |
+
+### 尚未完成（下一轮）
+
+1. **真机跑通（最关键）**：5 卡 PP 加载模型 + 推理。目前只到"导入/配置层通过"，
+   尚未证明权重加载与一次前向。
+2. **launcher 适配**：`benchmarks/deepseek_v4_1/run_cmp170hx_pp5.sh` 是为主项目模型写的
+   （env 旋钮、engram 配置），需与分支实现对齐。
+3. **Engram 集成风险**：分支的 `Engram` 只读 `engram_config.cpu_offload`，
+   不认 `cpu_cache_gb` / `ssd_offload_path`（本项目的全量主存 + SSD 转换文件方案）。
+   直接用本项目 launcher 会让它退回 pinned host 常驻（每 rank ≈94 GiB），
+   需要么改 launcher、么补这三个字段的语义。
+4. **`prepare_full_cudagraph_inputs` 钩子**：本项目的 runner 会调用它做 Engram staging；
+   分支模型没有对应实现（默认 no-op），FULL cudagraph 下需要确认是否可行。
+5. **共享基建里的 dsv41 本地优化**：稀疏 prefill tiling、indexer top-k 确定性、
+   Marlin/router 几何固定仍是本项目版本（它们是共享文件、被 GLM/Qwen 共用，
+   字面 revert 会连带打断其它模型）。需要你决定是否也要退回。
