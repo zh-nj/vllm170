@@ -68,6 +68,7 @@ def _capture(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--m", type=int, nargs="+", default=[1])
     parser.add_argument("--k", type=int, default=8192)
     parser.add_argument("--n", type=int, default=5120)
     parser.add_argument("--warmup", type=int, default=20)
@@ -77,9 +78,6 @@ def main() -> None:
     args = parser.parse_args()
 
     generator = torch.Generator(device="cuda").manual_seed(20260914)
-    inputs = torch.randn(
-        (1, args.k), dtype=torch.bfloat16, device="cuda", generator=generator
-    )
     packed_weight = (
         torch.randn(
             (args.n, args.k),
@@ -99,31 +97,37 @@ def main() -> None:
     layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
     prepare_mxfp8_layer_for_marlin(layer)
 
-    bf16_output = torch.empty((1, args.n), dtype=torch.bfloat16, device="cuda")
+    results = []
+    for m in args.m:
+        inputs = torch.randn((m, args.k), dtype=torch.bfloat16, device="cuda", generator=generator)
+        bf16_output = torch.empty((m, args.n), dtype=torch.bfloat16, device="cuda")
 
-    def bf16() -> object:
-        return torch.mm(inputs, bf16_weight.t(), out=bf16_output)
+        def bf16() -> object:
+            return torch.mm(inputs, bf16_weight.t(), out=bf16_output)
 
-    def marlin() -> object:
-        return apply_mxfp8_marlin_linear(
-            input=inputs,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            workspace=layer.workspace,
-            size_n=args.n,
-            size_k=args.k,
-        )
+        def marlin() -> object:
+            return apply_mxfp8_marlin_linear(
+                input=inputs,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=args.n,
+                size_k=args.k,
+            )
 
-    reference = bf16()
-    candidate = marlin()
-    torch.accelerator.synchronize()
-    torch.testing.assert_close(candidate, reference, rtol=2e-2, atol=1.0)
-
-    calls = {"bf16": bf16, "marlin_mxfp8": marlin}
+        reference = bf16()
+        candidate = marlin()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(candidate, reference, rtol=2e-2, atol=1.0)
+        results.append((m, bf16, marlin))
+    calls = {}
+    for m, bf16, marlin in results:
+        calls[f"bf16_m{m}"] = bf16
+        calls[f"marlin_mxp8_m{m}"] = marlin
     result = {
         "gpu": torch.cuda.get_device_name(),
         "capability": list(torch.cuda.get_device_capability()),
-        "shape": {"m": 1, "n": args.n, "k": args.k},
+        "shape": {"ms": args.m, "n": args.n, "k": args.k},
         "graph": {
             name: _measure(
                 _capture(call, args.warmup, args.graph_calls),
