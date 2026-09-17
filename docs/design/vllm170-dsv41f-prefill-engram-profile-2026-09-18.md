@@ -764,3 +764,67 @@ PP 载荷/引擎往返（94 ms → ~30 ms）。两条都不是"调参"能拿到�
 所以第 16 轮那句"10k 在当前硬件下不可达"要作废：它用的是被污染的 326 ms/step 与
 被污染的 232 ms forward。**修正后的结论是：10k 就在 MoE 主循环一件工程之内（短上下文），
 不再是"两件工程同时做到极限"才够。** 下一轮的目标因此从"收口"改成"MoE 主循环"。
+
+---
+
+## 18. 收尾状态（2026-09-18 05:3x，暂停点）
+
+### 18.1 一句话状态
+
+prefill 优化在**修正过的基线**上收在一个明确的单点上：2048 chunk、PP5、无 CPU 混推、
+分布式 DSpark 在位、当前内核 —— **63k prompt 实测 7,064–7,173 tok/s（3 次重复，±0.8%），
+稳态 259 ms/step（0–63k 上下文）/ 313 ms/step（63–127k），短上下文边际 7,896 tok/s**。
+到 10,000 tok/s（= 205 ms/step）的差距是 **−54 ms/step**，而它正好等于
+MoE 路由专家从现在的 126 ms 掉到实测带宽地板 72 ms 所能让出的量。
+
+### 18.2 做过的事（第 1–12 轮，13 个实验，1 个是正的）
+
+| # | 实验 | 结果 |
+| ---: | --- | --- |
+| 0 | 集成 `/mnt/data/apps/vllma100/FlashMLA` | **SM80 无 kernel**（目录只有 README）；等价的"读一次"分块早已在本仓库 Triton 路径里，结论已闭环 |
+| 1 | **MoE tile 可达性 bug**（2048/4096 token 掉进 (16,128) 兜底） | **+10–11%，唯一胜出**，已提交 `79270ec6fc` |
+| 2 | MoE grouped GEMM grid m-fastest → n-fastest | 1.01×（A tile 重读本来就被 L2 吃掉） |
+| 3 | MoE kStages 3 → 4 | 1.00× |
+| 4 | MoE tile 扫描 16×64 / 16×128 / 128×128 | 都更慢 |
+| 5 | 新实例化 block_m=32 | 慢 17% |
+| 6 | 共享专家 / 多流重叠阈值 | 中性 |
+| 7 | `VLLM_INDEXER_PREFILL_STREAMING_TOPK` | 中性 |
+| 8 | `VLLM_INDEXER_LOGITS_MAXNREG` | 中性到更差（服务形状 −4.0%） |
+| 9 | fp8 线性层三内核 Humming / Triton vs Marlin | 等价 |
+| 10 | hc（TileLang）调参 | ±0.8% |
+| 11 | chunk 512 / 4096 / 8192 | 2048 最好（4096 边际 +3% 但要更多 KV；8192 因内存挂） |
+| 12 | `NCCL_P2P_DISABLE=0` | +1%（8 vs 3 样本，仍在噪声里，**未定论**） |
+| 13 | batch queue 深度 6 → 10 | 更差；且深度 × chunk 会吃穿 KV 池（见 §16） |
+
+方法学上最值钱的一条不是某个实验，而是 §17：**"每 step 成本"不能用"请求墙钟 ÷ step 数"**，
+那样会把 ~0.8–1.5 s 的请求级固定开销摊进每个 step（这就是"326 ms/step"的来历）。
+本文件 §14/§15/§16 的绝对数字请以 §17 的重测为准，相对结论（谁快谁慢）不受影响。
+
+### 18.3 未闭环的两件事（恢复工作时从这里接）
+
+1. **MoE 主循环**（唯一的性能路径，见 §17.3）。已知事实：权重流地板 72 ms/step
+   （54 GB/rank ÷ 749 GB/s 实测），当前 126 ms；每 token 项 4.26 µs/token/层 ≈ 70 ms/step，
+   对应 mma 路径 ~100 TOPS（sm_80 int8 峰值的 ~25%）+ 2048 token 时每个 64 行 tile 平均只有
+   ~32 个有效行。迭代方式：改 `csrc/libtorch_stable/moe/mxfp4_int8_sm80/` →
+   `cmake --build cmake-build-release --target _moe_C_stable_libtorch -j 8` → **必须重启服务**
+   （运行中 `cp` 覆盖 `.so` 会让 worker SIGBUS，见 §12.5）→ 用斜率法量。
+2. **decode 期 CUDA illegal memory access（1 次，未复现）**。现象：一次
+   prompt≈48.5k token、`max_tokens=24` 的请求（即本实例上第一**次多 token decode**）在
+   `05:07:22` 触发 rank2 的 NCCL watchdog `cudaErrorIllegalAddress`，Worker_PP3 的栈落在
+   `spec_decode/dspark/speculator.py::participate_distributed` → `recv_tensor_dict`；
+   引擎随后整体退出（HTTP 500）。**已经确认与 MoE tile 改动无关**：decode/spec 路径
+   `average ≤ 16` 时新旧选择器都返回 (16,128)，且 `m == 1` 走的是持久 metadata 分支（§17.2 的
+   提交信息里也记了这一点）。复现顺序建议：① 短 prompt + `max_tokens=64`；
+   ② 长 prompt（~48k）+ `max_tokens=24`；③ 需要定位就用 `debug-ima`（CUDA core dump + cuda-gdb）。
+   在此之前，**任何"这个服务可以正常聊天/解码"的说法都不成立** —— prefill 一直是好的。
+
+### 18.4 运维现状
+
+- 服务：`bash /tmp/start_pp5.sh <log> PORT_MAX_BATCHED=2048`（会先杀 worker、等宿主
+  free ≥ 150 GiB、失败自动重试 3 次）；健康检查 `curl 127.0.0.1:26663/health`；
+  停止：`pkill -9 -f 'VLLM::'` + `pkill -9 -f 'vllm serve'`。
+- 本轮重启（run81）第 1、2 次尝试都没能在 10 分钟内打印 `Application startup complete`
+  （模型加载本身就要 240–350 s），第 3 次成功 —— **`/tmp/start_pp5.sh` 的 60×10 s
+  超时对这台机器偏紧，恢复工作时把它放宽到 120 次**。
+- 宿主内存是硬约束：PP0/PP1 各占 96.7 GB（engram 表），加服务约 220 GiB，
+  重启前必须等到 free ≥ 150 GiB。
