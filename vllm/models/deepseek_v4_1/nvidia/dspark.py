@@ -267,10 +267,18 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
+        # ``context_slot_mappings`` is indexed by *local* draft block, because a
+        # distributed rank only owns a subset of ``self.layers``.
+        local_index = 0
+        for layer in self.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             slot_mapping = (
-                None if context_slot_mappings is None else context_slot_mappings[i]
+                None
+                if context_slot_mappings is None
+                else context_slot_mappings[local_index]
             )
+            local_index += 1
             attn = layer.attn
             # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
             # (q_lora part discarded), then RoPE/quant/insert via the fused op.
@@ -448,7 +456,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
         # layer, named by its prefix.
-        return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
+        return [
+            layer.attn.swa_cache_layer.prefix
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+        ]
 
     def precompute_and_store_context_kv(
         self,
