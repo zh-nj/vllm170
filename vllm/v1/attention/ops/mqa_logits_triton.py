@@ -502,6 +502,8 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
     logits_out: torch.Tensor | None = None,
+    q_bf16_out: torch.Tensor | None = None,
+    k_bf16_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -514,6 +516,8 @@ def fp8_mqa_logits_triton(
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
         logits_out: optional caller-owned float32 output with shape `[M, N]`.
+        q_bf16_out: optional caller-owned BF16 Q decode buffer shaped like `q`.
+        k_bf16_out: optional caller-owned BF16 K decode buffer shaped like `kv[0]`.
     Returns:
         logits:       [M, N] float32
     """
@@ -525,6 +529,8 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke,
         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
         logits_out=logits_out,
+        q_bf16_out=q_bf16_out,
+        k_bf16_out=k_bf16_out,
     )
 
 
@@ -536,11 +542,27 @@ def _fp8_mqa_logits_triton_impl(
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
     logits_out: torch.Tensor | None = None,
+    q_bf16_out: torch.Tensor | None = None,
+    k_bf16_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
+    if q_bf16_out is None:
+        q_bf16 = q.to(torch.bfloat16)
+    else:
+        if q_bf16_out.shape != q.shape or q_bf16_out.dtype != torch.bfloat16:
+            raise ValueError("q_bf16_out must match q shape and use bfloat16")
+        q_bf16_out.copy_(q)
+        q_bf16 = q_bf16_out
+    if k_bf16_out is None:
+        k_bf16 = k_fp8.to(torch.bfloat16)
+    else:
+        if k_bf16_out.shape != k_fp8.shape or k_bf16_out.dtype != torch.bfloat16:
+            raise ValueError("k_bf16_out must match K shape and use bfloat16")
+        k_bf16_out.copy_(k_fp8)
+        k_bf16 = k_bf16_out
     return _fp8_mqa_logits_bf16_impl(
-        q.to(torch.bfloat16),
-        k_fp8.to(torch.bfloat16),
+        q_bf16,
+        k_bf16,
         k_scales,
         weights,
         cu_seqlen_ks,

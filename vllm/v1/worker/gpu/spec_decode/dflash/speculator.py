@@ -116,7 +116,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        wants_full = (
+            not self.draft_model_config.enforce_eager
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        )
         supports_full = (
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value
@@ -837,6 +840,7 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    request_idx_mapping: torch.Tensor | None = None,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
@@ -861,7 +865,7 @@ def prepare_dflash_inputs(
         seeds,
         input_batch.positions,
         input_batch.query_start_loc,
-        input_batch.idx_mapping,
+        input_batch.idx_mapping if request_idx_mapping is None else request_idx_mapping,
         last_sampled,
         next_prefill_tokens,
         num_sampled,

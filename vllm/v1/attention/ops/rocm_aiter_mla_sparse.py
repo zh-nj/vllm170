@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
@@ -808,6 +809,32 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
+def _max_decode_logits_rows(num_batched_tokens: int) -> int:
+    """Upper bound on decode rows the paged-MQA logits buffer can ever hold.
+
+    ``rocm_fp8_paged_mqa_logits`` sizes its workspace as
+    ``(batch_size * next_n, max_model_len)``. ``batch_size`` is bounded by
+    ``max_num_seqs`` and ``next_n`` by ``1 + num_speculative_tokens``, which is
+    far tighter than ``max_num_batched_tokens`` -- 192 vs 16384 for a typical
+    32-seq DSpark-5 deployment. The loose bound is harmless at short contexts
+    but scales with ``max_model_len``, so at the model's full context it asks
+    for tens of TiB and the engine cannot start. Take whichever valid bound is
+    smaller; the workspace is locked after profiling, so it must not be under-
+    estimated.
+    """
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return num_batched_tokens
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+    if not max_num_seqs:
+        return num_batched_tokens
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_spec = getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    return min(num_batched_tokens, max_num_seqs * (1 + num_spec))
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -824,6 +851,9 @@ def rocm_aiter_sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
     compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -863,6 +893,9 @@ def rocm_aiter_sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
     compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -888,15 +921,15 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
-        # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
+        decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
         if _ON_GFX942 or _ON_GFX950:
             workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
+                ((decode_rows, max_model_len), torch.float32),
             )
         else:
             workspace_manager.get_simultaneous(
                 (
-                    (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
+                    (q_fp8.shape[1], decode_rows, max_model_len),
                     torch.float32,
                 ),
             )
@@ -926,6 +959,9 @@ def rocm_aiter_sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             compress_ratio,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
@@ -974,6 +1010,30 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
+            if candidate_blocks is not None:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    _apply_candidate_mask,
+                    _select_candidate_blocks,
+                )
+
+                chunk_candidates = candidate_blocks[chunk.token_start : chunk.token_end]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates,
+                        candidate_block_size,
+                    )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
@@ -1041,6 +1101,37 @@ def rocm_aiter_sparse_attn_indexer(
             max_model_len=max_model_len,
         )
 
+        if candidate_blocks is not None:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                _apply_candidate_mask,
+                _select_candidate_blocks,
+            )
+
+            num_rows = logits.shape[0]
+            visible = decode_metadata.seq_lens.reshape(-1)
+            if visible.numel() != num_rows:
+                visible = visible.repeat_interleave(next_n)
+            visible = visible[:num_rows].to(torch.int64)
+            row_starts = torch.zeros_like(visible)
+            decode_candidates = candidate_blocks[:num_rows]
+            if candidate_write:
+                _select_candidate_blocks(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates.shape[1],
+                    candidate_block_size,
+                    decode_candidates,
+                )
+            else:
+                _apply_candidate_mask(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates,
+                    candidate_block_size,
+                )
+
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
@@ -1097,6 +1188,10 @@ def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
         )
 
         return _upcast_e8m0_to_fp32(scale).contiguous()
+    if scale.dtype == torch.uint8:
+        # MXFP8 parameters preserve E8M0 scales as their raw exponent bytes.
+        # They are biased exponents, not numeric uint8 scale values.
+        return torch.exp2(scale.to(torch.int16).to(torch.float32) - 127.0)
     return scale.to(torch.float32)
 
 
@@ -1230,14 +1325,23 @@ def _get_cached_wo_a_bf16(
         )
         wo_a._dsv4_wo_a_bf16 = bmm_weight
         return bmm_weight
-    if hasattr(wo_a, "weight_scale_inv"):
+    if wo_a.weight.element_size() >= 2:
+        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+            torch.bfloat16
+        )
+        wo_a._dsv4_wo_a_bf16 = cached
+        return cached
+    wo_a_scale_param = getattr(wo_a, "weight_scale_inv", None)
+    if wo_a_scale_param is None:
+        # ModelOpt MXFP8 stores the multiplicative E8M0 scale without the
+        # historical ``_inv`` suffix.
+        wo_a_scale_param = getattr(wo_a, "weight_scale", None)
+    if wo_a_scale_param is not None:
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )
         wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
+            wo_a_scale_param.view(n_local_groups, -1, wo_a_scale_param.shape[-1]),
             o_lora_rank,
             hidden_dim,
         )
@@ -1276,6 +1380,33 @@ def rocm_inv_rope_einsum(
 
     with optional_phase_profile_stage("attention.output_projection.wo_a", o_ref):
         return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+
+
+# Name of the env var that overrides the sparse-prefill BLOCK_K. Checked with
+# `os.environ` directly so a value left at its default can be told apart from
+# one the operator exported on purpose.
+_PREFILL_BLOCK_K_ENV = "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K"
+
+# Shared memory the tuned sm_80 sparse-prefill tiling needs, read from Triton's
+# own compiled-kernel metadata on a CMP 170HX: block_h=64 / block_k=64 /
+# num_stages=2 with bf16 KV emits 139264 B (136 KB) against the 166912 B
+# available. The fp8 lookup-table path needs more than 163 KB for a tiling of
+# this width, which is why that path is excluded separately below.
+_SM80_PREFILL_TUNED_SMEM_BYTES = 139264
+
+
+@functools.lru_cache
+def _prefill_smem_limit_bytes() -> int:
+    """Opt-in shared memory per block for the current device, 0 if unknown.
+
+    Mirrors v1/attention/backends/flex_attention.py: ROCm does not expose
+    `shared_memory_per_block_optin`, so the attribute is read defensively and a
+    missing value disables the sm_80 tuning rather than guessing.
+    """
+    if not torch.cuda.is_available():
+        return 0
+    props = torch.cuda.get_device_properties()
+    return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
 _DSV4_SPARSE_NOPE_DIM = 448
@@ -1363,8 +1494,11 @@ def build_ragged_indices_from_dense(
     max_width = indices.shape[1] if indices.ndim == 2 else 0
     lengths = lengths.clamp(min=0, max=max_width).contiguous()
 
-    indptr = torch.zeros(indices.shape[0] + 1, dtype=torch.int32, device=indices.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    with optional_phase_profile_stage("sparse_mla.ragged_indptr", indices):
+        indptr = torch.zeros(
+            indices.shape[0] + 1, dtype=torch.int32, device=indices.device
+        )
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
 
     if indices.numel() == 0:
         flat = torch.empty(0, dtype=torch.int32, device=indices.device)
@@ -1376,18 +1510,19 @@ def build_ragged_indices_from_dense(
         )
         if flat.numel() > 0:
             block_size = 128
-            _pack_dense_prefix_to_ragged_kernel[
-                (indices.shape[0], triton.cdiv(max_width, block_size))
-            ](
-                indices,
-                lengths,
-                indptr,
-                flat,
-                indices.stride(0),
-                int(num_rows),
-                max_width,
-                BLOCK_SIZE=block_size,
-            )
+            with optional_phase_profile_stage("sparse_mla.ragged_pack", indices):
+                _pack_dense_prefix_to_ragged_kernel[
+                    (indices.shape[0], triton.cdiv(max_width, block_size))
+                ](
+                    indices,
+                    lengths,
+                    indptr,
+                    flat,
+                    indices.stride(0),
+                    int(num_rows),
+                    max_width,
+                    BLOCK_SIZE=block_size,
+                )
 
     return flat, indptr
 
@@ -1431,6 +1566,8 @@ def _sparse_attn_prefill_ragged_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # None keeps Triton's own loop default, i.e. exactly the pre-tuning kernel.
+    NUM_STAGES: tl.constexpr = None,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -1462,7 +1599,11 @@ def _sparse_attn_prefill_ragged_kernel(
     slot = tl.load(
         kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1
     )
-    for k_start in tl.range(0, kv_len, BLOCK_K):
+    # NUM_STAGES > 1 software-pipelines the gathered KV loads. On sm_80 the
+    # gather is the bottleneck (the kernel is DRAM-bound), and pipelining plus a
+    # wider BLOCK_K lifts it from ~500 GB/s to ~1100 GB/s of the 1361 GB/s
+    # achievable peak. Measured 1.53x on CMP 170HX at s_q=2048, topk=512.
+    for k_start in tl.range(0, kv_len, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
         valid = in_range & (slot >= 0) & (slot < num_kv)
@@ -1850,6 +1991,8 @@ def _sparse_attn_decode_partial_kernel(
     extra_cache_ptr,
     extra_indices_ptr,
     extra_indptr_ptr,
+    main_block_table_ptr,
+    main_seq_lens_ptr,
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
@@ -1858,6 +2001,7 @@ def _sparse_attn_decode_partial_kernel(
     q_stride1,
     main_cache_stride0,
     extra_cache_stride0,
+    main_block_table_stride,
     pm_stride0,
     pm_stride_s,
     pa_stride0,
@@ -1867,9 +2011,11 @@ def _sparse_attn_decode_partial_kernel(
     extra_num_rows,
     main_block_size,
     extra_block_size,
+    main_window_size,
     scale,
     num_heads,
     HAS_EXTRA: tl.constexpr,
+    HAS_PAGED_MAIN: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -1919,9 +2065,16 @@ def _sparse_attn_decode_partial_kernel(
     # Each split processes a contiguous slice of this query's main (SWA) and
     # extra (topk) segments. Slices are handled independently so a block never
     # straddles the main/extra boundary.
-    main_start = tl.load(main_indptr_ptr + query_idx)
-    main_end = tl.load(main_indptr_ptr + query_idx + 1)
-    main_len = main_end - main_start
+    if HAS_PAGED_MAIN:
+        main_seq_len = tl.load(main_seq_lens_ptr + query_idx)
+        main_start = 0
+        main_len = tl.minimum(main_seq_len, main_window_size)
+        main_pos_start = main_seq_len - main_len
+    else:
+        main_start = tl.load(main_indptr_ptr + query_idx)
+        main_end = tl.load(main_indptr_ptr + query_idx + 1)
+        main_len = main_end - main_start
+        main_pos_start = 0
     main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
     main_lo = split_id * main_chunk
     main_hi = tl.minimum(main_lo + main_chunk, main_len)
@@ -1929,7 +2082,19 @@ def _sparse_attn_decode_partial_kernel(
     for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offsets
         in_range = k_pos < main_hi
-        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        if HAS_PAGED_MAIN:
+            logical_pos = main_pos_start + k_pos
+            page_idx = logical_pos // main_block_size
+            block_id = tl.load(
+                main_block_table_ptr + query_idx * main_block_table_stride + page_idx,
+                mask=in_range,
+                other=-1,
+            )
+            slot = block_id * main_block_size + logical_pos % main_block_size
+        else:
+            slot = tl.load(
+                main_indices_ptr + main_start + k_pos, mask=in_range, other=-1
+            )
         valid = in_range & (slot >= 0) & (slot < main_num_rows)
         safe_slot = tl.where(valid, slot, 0)
 
@@ -2607,9 +2772,10 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     output: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     *,
-    block_h: int = 16,
+    block_h: int | None = None,
     block_k: int | None = None,
-    num_warps: int = 4,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -2647,11 +2813,72 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     )
 
     block_d = triton.next_power_of_2(head_dim)
+    # CUDA sm_8x runs this kernel through the ROCm-derived path, so it never got
+    # a tiling of its own. Interleaved A/B (round-robin, to cancel thermal
+    # drift), under CUDA graph replay on CMP 170HX, sm_80, 70 SMs, at the
+    # production shape (s_q=2048, topk=512, h_q=64, head_dim=512, bf16 KV),
+    # with the device asserted to be a CMP 170HX:
+    #     block_h=16 block_k=32 num_warps=4  (pre-change)  3428 us  40.1 TFLOPS
+    #     block_h=32 block_k=64 num_warps=8 num_stages=2   2826 us  48.6 TFLOPS
+    #     block_h=64 block_k=64 num_warps=8 num_stages=2   2269 us  60.6 TFLOPS
+    # i.e. 1.51x over the pre-change tiling, max relative output deviation
+    # 6.0e-3. (Note the pre-change default is block_k=32, taken from the envs.py
+    # fallback; block_k=16 is only reachable by exporting the env var as 0, and
+    # using that as a baseline overstates the gain.)
+    #
+    # The kernel is DRAM-bound: with one head-block per CTA the same KV
+    # selection is re-read once per head-block, a measured 4.3x traffic
+    # amplification. block_h=64 puts all 64 heads in one CTA, so each query
+    # token's KV is read exactly once, and the software-pipelined gather plus
+    # the wider BLOCK_K lift it toward the 1361 GB/s achievable peak. An earlier
+    # revision stopped at block_h=32 because block_h=64 had only been tried
+    # without pipelining, where it looks like a register-wall dead end.
+    #
+    # Only the bf16 KV path is tuned. The fp8 lookup-table path stages an extra
+    # bf16 copy of the gathered tile and needs well over the available shared
+    # memory at this width (Triton raises OutOfResources). Everything outside
+    # the tuned case keeps its previous behaviour exactly, so ROCm
+    # (gfx942/gfx950) and the fp8 path are untouched.
+    #
+    # Exporting VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K opts out of the whole
+    # sm_80 tuning -- not just BLOCK_K -- so the pre-tuning behaviour stays
+    # reachable for A/B work and as an operator escape hatch. Note that the
+    # cmp170hx PP3 launchers in benchmarks/deepseek_v4/ export it at 32, so they
+    # opt out by default; the V4.1 PP5 launcher does not and gets the tuning.
+    # Explicit caller-supplied kernel arguments always win as well.
+    #
+    # is_device_capability_family(80) is true for every 8.x part, but the tuning
+    # is sized for a datacentre Ampere SM: the 170HX allows 166912 B of opt-in
+    # shared memory while an sm_86 consumer part allows 101376 B, which the
+    # tiling does not fit in. Gate on the actual limit so it can never be
+    # selected where it cannot compile.
+    tuning_opted_out = _PREFILL_BLOCK_K_ENV in os.environ or block_h is not None
+    sm80_prefill = (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+        and _prefill_smem_limit_bytes() >= _SM80_PREFILL_TUNED_SMEM_BYTES
+        # Exactly the shape the tiling was measured on. BLOCK_D is
+        # next_power_of_2(head_dim), so a 576-wide head (V3.2) would double the
+        # gathered tile to BLOCK_D=1024 and blow the budget the check above
+        # cleared -- the smem figure is only known for BLOCK_D=512.
+        and head_dim == 512
+        and not kv_is_fp8
+        and not tuning_opted_out
+    )
+    if block_h is None:
+        block_h = 64 if sm80_prefill else 16
+    if num_warps is None:
+        num_warps = 8 if sm80_prefill else 4
+    if num_stages is None:
+        # None -> tl.range keeps Triton's default, matching the pre-tuning kernel.
+        num_stages = 2 if sm80_prefill else None
     if block_k is None:
-        block_k = envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K
-        if block_k not in (0, 16, 32):
+        # The env var default (32) is the ROCm tuning; on sm_80 the wider
+        # BLOCK_K is what lets the pipelined gather reach ~1100 GB/s.
+        block_k = 64 if sm80_prefill else envs.VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K
+        if block_k not in (0, 16, 32, 64):
             raise ValueError(
-                "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K must be 0, 16, or 32"
+                "VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K must be 0, 16, 32, or 64"
             )
         if block_k == 0:
             block_k = 16 if head_dim >= 256 else 32
@@ -2689,6 +2916,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        NUM_STAGES=num_stages,
         num_warps=num_warps,
     )
     return output
@@ -2705,9 +2933,10 @@ def _rocm_sparse_attn_prefill_triton(
     topk_length: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
-    block_h: int = 16,
+    block_h: int | None = None,
     block_k: int | None = None,
-    num_warps: int = 4,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
@@ -2730,6 +2959,7 @@ def _rocm_sparse_attn_prefill_triton(
         block_h=block_h,
         block_k=block_k,
         num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -2886,6 +3116,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    main_block_table: torch.Tensor | None = None,
+    main_seq_lens: torch.Tensor | None = None,
+    main_window_size: int = 0,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -2911,9 +3144,19 @@ def _rocm_sparse_attn_decode_ragged_triton(
         attn_sink = attn_sink.contiguous()
 
     num_queries, num_heads, head_dim = q.shape
-    assert main_indptr.numel() == num_queries + 1, (
-        f"expected main_indptr shape [{num_queries + 1}], got {main_indptr.shape}"
-    )
+    use_paged_main = main_block_table is not None and main_seq_lens is not None
+    if use_paged_main:
+        assert main_block_table is not None
+        assert main_seq_lens is not None
+        assert main_block_table.ndim == 2
+        assert main_seq_lens.numel() == num_queries
+        assert main_window_size > 0
+    else:
+        assert main_indptr.numel() == num_queries + 1, (
+            f"expected main_indptr shape [{num_queries + 1}], got {main_indptr.shape}"
+        )
+        main_block_table = main_indices
+        main_seq_lens = main_indptr
     _validate_dsv4_sparse_dims(
         head_dim,
         nope_head_dim,
@@ -2972,6 +3215,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
         and current_platform.is_cuda()
         and current_platform.is_device_capability_family(80)
     )
+    assert not use_paged_main or use_sm80_split, (
+        "paged-direct SWA decode requires the SM80 split decode kernel"
+    )
     if not (_ON_GFX942 or _ON_GFX950 or use_sm80_split):
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
@@ -3011,9 +3257,20 @@ def _rocm_sparse_attn_decode_ragged_triton(
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
-    if _ON_GFX950:
+    sm80_num_splits = (
+        envs.VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS if use_sm80_split else 0
+    )
+    if not 0 <= sm80_num_splits <= 64:
+        raise ValueError(
+            "VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS must be between 0 and 64"
+        )
+    if sm80_num_splits:
+        num_splits = sm80_num_splits
+    elif _ON_GFX950:
         inv_q = 1.0 / max(1, num_queries)
-        avg_main_len = main_indices.numel() * inv_q
+        avg_main_len = (
+            float(main_window_size) if use_paged_main else main_indices.numel() * inv_q
+        )
         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
         num_splits = _decode_gfx950_num_splits(
             num_queries,
@@ -3026,7 +3283,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
         # Average per-query segment lengths, read sync-free from the ragged
         # index sizes, let the split heuristic avoid over-splitting.
         inv_q = 1.0 / max(1, num_queries)
-        avg_main_len = main_indices.numel() * inv_q
+        avg_main_len = (
+            float(main_window_size) if use_paged_main else main_indices.numel() * inv_q
+        )
         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
@@ -3111,6 +3370,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             extra_cache,
             extra_indices,
             extra_indptr,
+            main_block_table,
+            main_seq_lens,
             part_m,
             part_l,
             part_acc,
@@ -3119,6 +3380,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             q.stride(1),
             main_cache.stride(0),
             extra_cache.stride(0),
+            main_block_table.stride(0),
             part_m.stride(0),
             part_m.stride(1),
             part_acc.stride(0),
@@ -3128,9 +3390,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
             extra_cache.shape[0] * extra_cache.shape[1],
             main_cache.shape[1],
             extra_cache.shape[1],
+            main_window_size,
             scale,
             num_heads,
             HAS_EXTRA=has_extra,
+            HAS_PAGED_MAIN=use_paged_main,
             NOPE_DIM=nope_head_dim,
             NOPE_BLOCK=nope_block,
             ROPE_DIM=rope_head_dim,
@@ -3192,8 +3456,14 @@ def _rocm_sparse_attn_decode_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    main_block_table: torch.Tensor | None = None,
+    main_seq_lens: torch.Tensor | None = None,
+    main_window_size: int = 0,
 ) -> torch.Tensor:
-    if main_ragged_indices is None or main_ragged_indptr is None:
+    use_paged_main = main_block_table is not None and main_seq_lens is not None
+    if not use_paged_main and (
+        main_ragged_indices is None or main_ragged_indptr is None
+    ):
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
             main_indices,
             main_lengths
@@ -3201,6 +3471,12 @@ def _rocm_sparse_attn_decode_triton(
             else (main_indices >= 0).sum(dim=-1, dtype=torch.int32),
             num_rows=main_cache.shape[0] * main_cache.shape[1],
         )
+    elif use_paged_main:
+        main_ragged_indices = main_indices.reshape(-1)
+        main_ragged_indptr = main_lengths
+
+    assert main_ragged_indices is not None
+    assert main_ragged_indptr is not None
 
     if (
         (extra_ragged_indices is None or extra_ragged_indptr is None)
@@ -3230,6 +3506,9 @@ def _rocm_sparse_attn_decode_triton(
         out=out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
+        main_block_table=main_block_table,
+        main_seq_lens=main_seq_lens,
+        main_window_size=main_window_size,
     )
 
 
@@ -3247,9 +3526,10 @@ def rocm_sparse_attn_prefill(
     ragged_indices: torch.Tensor | None = None,
     ragged_indptr: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
-    block_h: int = 16,
+    block_h: int | None = None,
     block_k: int | None = None,
-    num_warps: int = 4,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> None:
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
@@ -3278,6 +3558,7 @@ def rocm_sparse_attn_prefill(
             block_h=block_h,
             block_k=block_k,
             num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
         assert indices is not None
@@ -3296,6 +3577,7 @@ def rocm_sparse_attn_prefill(
             block_h=block_h,
             block_k=block_k,
             num_warps=num_warps,
+            num_stages=num_stages,
         )
     if caller_output is None:
         output.copy_(output_chunk)
@@ -3322,6 +3604,10 @@ def rocm_sparse_attn_decode(
     output: torch.Tensor,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    swa_block_table: torch.Tensor | None = None,
+    swa_seq_lens: torch.Tensor | None = None,
+    swa_window_size: int = 0,
+    swa_paged_direct: bool = False,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -3351,7 +3637,16 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
+    use_sm80_caller_output = (
+        envs.VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+    )
+    direct_out = (
+        output
+        if output.dtype == torch.bfloat16 and (_ON_GFX950 or use_sm80_caller_output)
+        else None
+    )
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,
@@ -3371,6 +3666,9 @@ def rocm_sparse_attn_decode(
         out=direct_out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
+        main_block_table=swa_block_table if swa_paged_direct else None,
+        main_seq_lens=swa_seq_lens if swa_paged_direct else None,
+        main_window_size=swa_window_size if swa_paged_direct else 0,
     )
     if direct_out is None:
         output.copy_(attn_out.to(output.dtype))

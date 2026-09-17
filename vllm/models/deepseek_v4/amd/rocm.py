@@ -665,6 +665,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+    def _requires_dense_c128a_decode_indices(self) -> bool:
+        return not (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128
+            and current_platform.is_device_capability_family(80)
+        )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._use_direct_ragged_c128 = not self._requires_dense_c128a_decode_indices()
@@ -817,6 +823,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
     # Keep fused multi-step decode disabled until update_draft_decode_metadata()
     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
     supports_draft_decode_metadata_update = False
+
+    def _requires_dense_decode_swa_indices(self) -> bool:
+        return not (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA
+            and current_platform.is_device_capability_family(80)
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

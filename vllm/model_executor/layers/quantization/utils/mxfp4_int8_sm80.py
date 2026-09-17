@@ -367,6 +367,7 @@ def _remap_mxfp4_weight_for_int8_triton(
     scale_u8: torch.Tensor,
     *,
     headroom_bits: int,
+    reuse_weight_storage: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     e, n, packed_k = weight.shape
     k_blocks = packed_k * 2 // 32
@@ -374,45 +375,77 @@ def _remap_mxfp4_weight_for_int8_triton(
     shift_stride = triton.cdiv(k_blocks, 4)
     max_exp = torch.empty((e, n), device=weight.device, dtype=torch.int16)
     channel_scale = torch.empty((e, n), device=weight.device, dtype=torch.float32)
-    b_mxfp4 = torch.zeros(
-        (e, k_blocks, n_groups8, 128), device=weight.device, dtype=torch.uint8
-    )
+    if reuse_weight_storage:
+        if n % 8 != 0:
+            raise ValueError(
+                "weight output channels must be divisible by 8 when reusing "
+                f"storage, got {n}"
+            )
+        b_mxfp4 = weight.view(e, k_blocks, n_groups8, 128)
+    else:
+        b_mxfp4 = torch.empty(
+            (e, k_blocks, n_groups8, 128),
+            device=weight.device,
+            dtype=torch.uint8,
+        )
     b_shift2 = torch.zeros(
         (e, shift_stride, n_groups8, 8), device=weight.device, dtype=torch.uint8
     )
     block_k = triton.next_power_of_2(k_blocks)
-    _remap_mxfp4_channel_kernel[(e * n,)](
-        scale_u8,
-        max_exp,
-        channel_scale,
-        e * n,
-        k_blocks,
-        headroom_bits,
-        BLOCK_K=block_k,
-    )
-    _pack_shift2_kernel[(e, shift_stride, triton.cdiv(n, 128))](
-        scale_u8,
-        max_exp,
-        b_shift2,
-        e * n,
-        n,
-        k_blocks,
-        shift_stride,
-        n_groups8,
-        headroom_bits,
-        BLOCK_N=128,
-    )
-    _repack_mxfp4_weight_kernel[(e, k_blocks, n_groups8)](
-        weight,
-        scale_u8,
-        max_exp,
-        b_mxfp4,
-        n,
-        k_blocks,
-        n_groups8,
-        headroom_bits,
-        BLOCK=128,
-    )
+    # The 384-expert checkpoint exceeds the practical SM80 Triton grid size.
+    # When reusing storage, each chunk must be fully repacked before its source
+    # expert storage is overwritten.
+    expert_chunk = 16 if reuse_weight_storage else 256
+    for expert_start in range(0, e, expert_chunk):
+        expert_end = min(e, expert_start + expert_chunk)
+        chunk_e = expert_end - expert_start
+        weight_chunk = weight[expert_start:expert_end]
+        scale_chunk = scale_u8[expert_start:expert_end]
+        max_exp_chunk = max_exp[expert_start:expert_end]
+        channel_scale_chunk = channel_scale[expert_start:expert_end]
+        if reuse_weight_storage:
+            b_mxfp4_chunk = torch.empty(
+                (chunk_e, k_blocks, n_groups8, 128),
+                device=weight.device,
+                dtype=torch.uint8,
+            )
+        else:
+            b_mxfp4_chunk = b_mxfp4[expert_start:expert_end]
+        b_shift2_chunk = b_shift2[expert_start:expert_end]
+        _remap_mxfp4_channel_kernel[(chunk_e * n,)](
+            scale_chunk,
+            max_exp_chunk,
+            channel_scale_chunk,
+            chunk_e * n,
+            k_blocks,
+            headroom_bits,
+            BLOCK_K=block_k,
+        )
+        _pack_shift2_kernel[(chunk_e, shift_stride, triton.cdiv(n, 128))](
+            scale_chunk,
+            max_exp_chunk,
+            b_shift2_chunk,
+            chunk_e * n,
+            n,
+            k_blocks,
+            shift_stride,
+            n_groups8,
+            headroom_bits,
+            BLOCK_N=128,
+        )
+        _repack_mxfp4_weight_kernel[(chunk_e, k_blocks, n_groups8)](
+            weight_chunk,
+            scale_chunk,
+            max_exp_chunk,
+            b_mxfp4_chunk,
+            n,
+            k_blocks,
+            n_groups8,
+            headroom_bits,
+            BLOCK=128,
+        )
+        if reuse_weight_storage:
+            b_mxfp4[expert_start:expert_end].copy_(b_mxfp4_chunk)
     return b_mxfp4, b_shift2, channel_scale, max_exp
 
 
@@ -458,6 +491,7 @@ def remap_mxfp4_weight_for_int8(
     *,
     headroom_bits: int = 3,
     use_triton: bool = True,
+    reuse_weight_storage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert packed MXFP4 + UE8M0 scale into mxfp4_int8 persistent format.
 
@@ -468,8 +502,12 @@ def remap_mxfp4_weight_for_int8(
     if headroom_bits < 0 or headroom_bits > 7:
         raise ValueError(f"invalid headroom_bits={headroom_bits}")
 
-    w_u8 = weight.data if hasattr(weight, "data") else weight
-    w_u8 = w_u8.view(torch.uint8).contiguous()
+    weight_data = weight.data if hasattr(weight, "data") else weight
+    if reuse_weight_storage and not weight_data.is_contiguous():
+        raise ValueError("weight must be contiguous when reusing storage")
+    w_u8 = weight_data.view(torch.uint8)
+    if not reuse_weight_storage:
+        w_u8 = w_u8.contiguous()
     scale_u8 = _as_uint8_storage(scale)
     if w_u8.dim() != 3 or scale_u8.dim() != 3:
         raise ValueError(
@@ -484,11 +522,15 @@ def remap_mxfp4_weight_for_int8(
     if w_u8.shape[2] * 2 != scale_u8.shape[2] * 32:
         raise ValueError(f"K mismatch: {tuple(w_u8.shape)} vs {tuple(scale_u8.shape)}")
 
+    if reuse_weight_storage and (not use_triton or not w_u8.is_cuda):
+        raise ValueError("reusing weight storage requires the CUDA Triton path")
+
     if use_triton and w_u8.is_cuda:
         b_mxfp4, b_shift2, channel_scale, _ = _remap_mxfp4_weight_for_int8_triton(
             w_u8,
             scale_u8,
             headroom_bits=headroom_bits,
+            reuse_weight_storage=reuse_weight_storage,
         )
     else:
         e, n, packed_k = w_u8.shape

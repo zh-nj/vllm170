@@ -30,11 +30,21 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.phase_profile import phase_profile_stage
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
+    prepare_dflash_inputs,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    dspark_backbone_vllm_config,
+    load_dspark_model,
+)
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
 
@@ -55,6 +65,27 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+        query_tokens = self.speculative_config.dspark_num_query_tokens
+        if query_tokens is not None:
+            if not self.sample_from_anchor:
+                raise ValueError(
+                    "A separate DSpark query length requires sample_from_anchor=True"
+                )
+            if query_tokens * self.max_num_reqs > self.max_num_tokens:
+                raise ValueError("DSpark queries exceed the token buffer capacity")
+            trained = getattr(
+                self.draft_model_config.hf_config, "dspark_block_size", query_tokens
+            )
+            if query_tokens > trained:
+                if self.draft_model_config.hf_config.model_type != "deepseek_v41":
+                    raise ValueError("DSpark queries exceed the checkpoint block size")
+                logger.info(
+                    "DeepSeek V4.1 DSpark uses %d query tokens "
+                    "(checkpoint block size: %d)",
+                    query_tokens,
+                    trained,
+                )
+            self.num_query_per_req = query_tokens
 
         draft_hidden = self.draft_model_config.get_hidden_size()
         self.hidden_states = torch.zeros(
@@ -88,6 +119,26 @@ class DSparkSpeculator(DFlashSpeculator):
         self._reference_dump_active = False
         self._reference_dump_written = False
         self._reference_dump: dict[str, Any] | None = None
+
+        self.distributed = self.speculative_config.use_distributed_dspark()
+        self._distributed_step_id = -1
+        if self.distributed:
+            self._pp_group = get_pp_group()
+            stage_ranks = self.speculative_config.dspark_pipeline_stage_ranks
+            assert stage_ranks is not None
+            self._stage_ranks = tuple(stage_ranks)
+            self._pp_rank = self._pp_group.rank_in_group
+            self._head_rank = self._pp_group.world_size - 1
+            self._stage_index = (
+                self._stage_ranks.index(self._pp_rank)
+                if self._pp_rank in self._stage_ranks
+                else None
+            )
+        else:
+            self._stage_ranks = ()
+            self._pp_rank = 0
+            self._head_rank = 0
+            self._stage_index = None
 
     def _capture_reference_tensor(self, name: str, tensor: torch.Tensor) -> None:
         if not self._reference_dump_active:
@@ -160,12 +211,17 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         return hidden_states[:num_target_tokens]
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        return dspark_backbone_vllm_config(super().attn_vllm_config)
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        self._ced_context_source = getattr(target_model, "take_ced_draft_context", None)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -190,6 +246,334 @@ class DSparkSpeculator(DFlashSpeculator):
                 " a fixed number of drafts instead."
             )
         return model
+
+    def set_attn(self, *args: Any, **kwargs: Any) -> None:
+        if not self.distributed or self.draft_attn_layer_names:
+            super().set_attn(*args, **kwargs)
+            return
+        DraftModelSpeculator.set_attn(self, *args, **kwargs)
+        self.draft_kv_cache_group_ids = []
+        self.draft_kv_cache_group_id = -1
+        self._context_slot_mappings = torch.empty(
+            (0, self.max_num_tokens), dtype=torch.int64, device=self.device
+        )
+        self._layer_group_idx = []
+        self._group_causal = not self.requires_non_causal
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if not self.distributed:
+            super().init_cudagraph_manager(cudagraph_mode)
+            return
+        self.query_cudagraph_manager = None
+        logger.info_once(
+            "Distributed DSpark uses eager rank-local draft stages during "
+            "initial validation."
+        )
+
+    def capture(self) -> None:
+        if self.distributed:
+            return
+        super().capture()
+
+    def set_distributed_step_id(self, scheduler_step_id: int) -> None:
+        self._distributed_step_id = scheduler_step_id
+
+    def _validate_distributed_package(
+        self, package: dict[str, Any], input_batch: Any
+    ) -> None:
+        if package["scheduler_step_id"] != self._distributed_step_id:
+            raise RuntimeError(
+                "Distributed DSpark scheduler step mismatch: "
+                f"expected {self._distributed_step_id}, got "
+                f"{package['scheduler_step_id']}."
+            )
+        is_dummy = package["dummy_run"]
+        if is_dummy != (self._distributed_step_id == -1):
+            raise RuntimeError("Distributed DSpark dummy-run marker mismatch.")
+        if not is_dummy and package["req_ids"] != tuple(input_batch.req_ids):
+            raise RuntimeError("Distributed DSpark request batch mismatch.")
+        if package["num_reqs"] != input_batch.num_reqs:
+            raise RuntimeError("Distributed DSpark request count mismatch.")
+
+    def _prepare_distributed_stage(
+        self,
+        input_batch: Any,
+        package: dict[str, Any],
+    ) -> tuple[int, dict[str, Any] | None, dict[str, torch.Tensor] | None]:
+        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        num_query_tokens = num_reqs * self.num_query_per_req
+        self.draft_max_seq_len = min(
+            int(input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item())
+            + self.num_query_per_req,
+            self.max_model_len,
+        )
+        if package["skip_attn"]:
+            self.model.precompute_and_store_context_kv(
+                package["context_main_x"],
+                self.context_positions[:num_target_tokens],
+            )
+            return num_query_tokens, None, None
+
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                package["num_sampled"],
+                package["num_rejected"],
+                package["last_sampled"],
+                package["next_prefill_tokens"],
+                package["temperature"],
+                package["seeds"],
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.block_tables.cp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+                request_idx_mapping=package["idx_mapping"],
+            )
+
+        layer_group_idx = self._layer_group_idx or []
+        context_slots = [
+            self._context_slot_mappings[group_idx][:num_target_tokens]
+            for group_idx in layer_group_idx
+        ]
+        self.model.precompute_and_store_context_kv(
+            package["context_main_x"],
+            self.context_positions[:num_target_tokens],
+            context_slots,
+        )
+        draft_attn_metadata = self._build_draft_attn_metadata(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs,
+            num_tokens_padded=num_query_tokens,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            step=self.num_query_per_req,
+            causal=self._group_causal,
+        )
+        slot_mappings = build_slot_mappings_by_layer(
+            self.block_tables.slot_mappings[:, :num_query_tokens],
+            self.kv_cache_config,
+        )
+        return num_query_tokens, draft_attn_metadata, slot_mappings
+
+    @torch.inference_mode()
+    def participate_distributed(self, input_batch: Any) -> None:
+        if not self.distributed or self._stage_index is None:
+            return
+        src = (
+            self._head_rank
+            if self._stage_index == 0
+            else self._stage_ranks[self._stage_index - 1]
+        )
+        package = self._pp_group.recv_tensor_dict(src=src)
+        assert package is not None
+        self._validate_distributed_package(package, input_batch)
+        num_query_tokens, attn_metadata, slot_mappings = (
+            self._prepare_distributed_stage(input_batch, package)
+        )
+
+        if self._stage_index == 0:
+            hidden_states = self.model.prepare_pipeline_query(
+                self.input_buffers.input_ids[:num_query_tokens]
+            )
+            residual = post_mix = res_mix = pre_mix = None
+        else:
+            hidden_states = package["hidden_states"]
+            residual = package["residual"]
+            post_mix = package["post_mix"]
+            res_mix = package["res_mix"]
+            pre_mix = package["pre_mix"]
+
+        batch_descriptor = BatchDescriptor(num_tokens=num_query_tokens)
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_query_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=slot_mappings,
+            batch_descriptor=batch_descriptor,
+        ):
+            hidden_states, residual, post_mix, res_mix, pre_mix = (
+                self.model.forward_local_stage(
+                    hidden_states,
+                    self.input_buffers.positions[:num_query_tokens],
+                    self.input_buffers.input_ids[:num_query_tokens],
+                    residual,
+                    post_mix,
+                    res_mix,
+                    pre_mix,
+                )
+            )
+
+        package.update(
+            hidden_states=hidden_states,
+            residual=residual,
+            post_mix=post_mix,
+            res_mix=res_mix,
+            pre_mix=pre_mix,
+            query_input_ids=self.input_buffers.input_ids[:num_query_tokens],
+            sample_indices=self.sample_indices[
+                : input_batch.num_reqs * self.num_speculative_steps
+            ],
+            sample_pos=self.sample_pos[
+                : input_batch.num_reqs * self.num_speculative_steps
+            ],
+            sample_idx_mapping=self.sample_idx_mapping[
+                : input_batch.num_reqs * self.num_speculative_steps
+            ],
+        )
+        is_last_stage = self._stage_index == len(self._stage_ranks) - 1
+        if is_last_stage:
+            for key in (
+                "context_main_x",
+                "num_sampled",
+                "num_rejected",
+                "last_sampled",
+                "next_prefill_tokens",
+                "temperature",
+                "seeds",
+            ):
+                package.pop(key)
+        dst = (
+            self._head_rank
+            if is_last_stage
+            else self._stage_ranks[self._stage_index + 1]
+        )
+        self._pp_group.send_tensor_dict(package, dst=dst)
+
+    def _publish_ced_draft_context(self, input_batch: Any) -> None:
+        """Write the CED-replayed suffix into the draft KV cache before proposing.
+
+        CED keeps a bounded per-request suffix of encoder hidden states and
+        replays the decoder layers on it once per request; the replay produced
+        exactly the states the drafter needs for its context KV, so publishing
+        them here skips a redundant projection on the draft side.
+        """
+        source = getattr(self, "_ced_context_source", None)
+        if source is None:
+            return
+        context = source()
+        if context is None:
+            return
+        request_ids = context.request_ids or (context.request_id,)
+        if not set(request_ids).issubset(input_batch.req_ids):
+            raise ValueError("CED draft context belongs to another request")
+        states = self.model.combine_hidden_states(
+            torch.cat(context.auxiliary, dim=-1)
+        )
+        assert self._layer_group_idx is not None
+        slots = [
+            context.slots[self.draft_kv_cache_group_ids[index]]
+            for index in self._layer_group_idx
+        ]
+        self.model.precompute_and_store_context_kv(
+            states, context.positions, slots
+        )
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch: Any,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dp_sync: Any = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: Any = None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        if not dummy_run:
+            self._publish_ced_draft_context(input_batch)
+        if not self.distributed:
+            return super().propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dp_sync=dp_sync,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                mm_inputs=mm_inputs,
+                is_profile=is_profile,
+            )
+        if self._pp_rank != self._head_rank:
+            raise RuntimeError("Only the final PP rank can initiate DSpark drafting.")
+        if not aux_hidden_states:
+            raise RuntimeError("Distributed DSpark requires target auxiliary states.")
+
+        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        num_query_tokens = num_reqs * self.num_query_per_req
+        context_main_x = self._prepare_context_hidden_states(
+            last_hidden_states, aux_hidden_states, num_target_tokens
+        )
+        self._copy_request_inputs(num_reqs, input_batch.idx_mapping, temperature, seeds)
+        package: dict[str, Any] = {
+            "scheduler_step_id": self._distributed_step_id,
+            "dummy_run": dummy_run,
+            "req_ids": tuple(input_batch.req_ids),
+            "num_reqs": num_reqs,
+            "idx_mapping": input_batch.idx_mapping[:num_reqs],
+            "skip_attn": dummy_run and skip_attn_for_dummy_run,
+            "context_main_x": context_main_x,
+            "num_sampled": num_sampled,
+            "num_rejected": num_rejected,
+            "last_sampled": last_sampled,
+            "next_prefill_tokens": next_prefill_tokens,
+            "temperature": temperature,
+            "seeds": seeds,
+        }
+        self._pp_group.send_tensor_dict(package, dst=self._stage_ranks[0])
+        result = self._pp_group.recv_tensor_dict(src=self._stage_ranks[-1])
+        assert result is not None
+        self._validate_distributed_package(result, input_batch)
+
+        self.input_buffers.input_ids[:num_query_tokens].copy_(result["query_input_ids"])
+        num_sample = num_reqs * self.num_speculative_steps
+        self.sample_indices[:num_sample].copy_(result["sample_indices"])
+        self.sample_pos[:num_sample].copy_(result["sample_pos"])
+        self.sample_idx_mapping[:num_sample].copy_(result["sample_idx_mapping"])
+        head_hidden = self.model.finish_pipeline_query(
+            result["hidden_states"],
+            result["residual"],
+            result["post_mix"],
+            result["res_mix"],
+            result["pre_mix"],
+        )
+        self._prepare_eplb_forward(num_query_tokens)
+        self._sample_sequential(num_reqs, head_hidden)
+        return self.draft_tokens[:num_reqs]
 
     def _sample_logits(
         self,

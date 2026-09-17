@@ -169,6 +169,7 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
         model=str(draft_path),
         method="dspark",
         num_speculative_tokens=8,
+        enforce_eager=True,
         target_model_config=target_config,
         target_parallel_config=ParallelConfig(),
     )
@@ -177,3 +178,4 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"
     assert speculative_config.draft_model_config.use_mla
+    assert speculative_config.draft_model_config.enforce_eager

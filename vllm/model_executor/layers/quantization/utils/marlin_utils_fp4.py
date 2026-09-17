@@ -685,6 +685,82 @@ def prepare_moe_mxfp4_layer_for_marlin(
     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
 
 
+def prepare_moe_mxfp4_layer_for_marlin_inplace(layer: torch.nn.Module) -> None:
+    """Repack an MXFP4 MoE layer for Marlin with bounded peak memory."""
+    from vllm.model_executor.utils import replace_parameter
+
+    input_dtype = get_marlin_input_dtype()
+    if (
+        input_dtype is not None
+        and input_dtype.itemsize == 1
+        and input_dtype != torch.float8_e4m3fn
+    ):
+        raise RuntimeError("MXFP4 weight + INT8 activation is not supported.")
+
+    w13_shape = layer.w13_weight.shape
+    e = w13_shape[0]
+    n = w13_shape[1] // 2
+    k = w13_shape[2] * 2
+    assert layer.w2_weight.shape == (e, k, n // 2)
+
+    device = layer.w13_weight.device
+    param_dtype = layer.params_dtype
+    is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
+    perm = torch.empty(0, dtype=torch.int, device=device)
+
+    for name, size_n, size_k in (
+        ("w13_weight", n * 2, k),
+        ("w2_weight", k, n),
+    ):
+        weight = getattr(layer, name)
+        assert weight.shape == (e, size_n, size_k // 2)
+        repacked = _repack_marlin_experts(weight, size_n, size_k, perm, is_a_8bit)
+        replace_parameter(layer, name, repacked)
+        del weight, repacked
+
+    for name, size_n, size_k in (
+        ("w13_weight_scale", n * 2, k),
+        ("w2_weight_scale", k, n),
+    ):
+        source = getattr(layer, name)
+        output = None
+        for expert_idx in range(e):
+            scale = source[expert_idx].view(torch.float8_e8m0fnu)
+            scale = scale.to(param_dtype).T
+            scale = marlin_permute_scales(
+                s=scale,
+                size_k=size_k,
+                size_n=size_n,
+                group_size=32,
+                is_a_8bit=is_a_8bit,
+            )
+            scale = mxfp4_marlin_process_scales(scale, input_dtype=input_dtype)
+            if output is None:
+                output = torch.empty(
+                    (e, *scale.shape), dtype=scale.dtype, device=scale.device
+                )
+            output[expert_idx] = scale
+        assert output is not None
+        replace_parameter(layer, name, output)
+        del source, output
+
+    for name in ("w13_bias", "w2_bias"):
+        if not hasattr(layer, name):
+            continue
+        source = getattr(layer, name)
+        output = None
+        for expert_idx in range(e):
+            bias = marlin_permute_bias(source[expert_idx].to(param_dtype))
+            if output is None:
+                output = torch.empty(
+                    (e, *bias.shape), dtype=bias.dtype, device=bias.device
+                )
+            output[expert_idx] = bias
+        assert output is not None
+        replace_parameter(layer, name, output)
+        del source, output
+
+
 def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 

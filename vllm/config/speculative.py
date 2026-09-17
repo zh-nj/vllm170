@@ -71,6 +71,30 @@ def verify_dspark_pp_layout(
         )
 
 
+def verify_distributed_dspark_stage_ranks(
+    stage_ranks: list[int],
+    num_draft_layers: int,
+    pipeline_parallel_size: int,
+) -> None:
+    """Validate rank ownership for a distributed DSpark draft pipeline."""
+    if pipeline_parallel_size <= 1:
+        raise ValueError("Distributed DSpark requires pipeline parallelism.")
+    if len(stage_ranks) != num_draft_layers:
+        raise ValueError(
+            "dspark_pipeline_stage_ranks must contain one rank per draft "
+            f"layer ({num_draft_layers}), got {stage_ranks}."
+        )
+    if stage_ranks != sorted(set(stage_ranks)):
+        raise ValueError(
+            "dspark_pipeline_stage_ranks must be unique and strictly increasing."
+        )
+    if stage_ranks[0] < 0 or stage_ranks[-1] >= pipeline_parallel_size - 1:
+        raise ValueError(
+            "DSpark decoder stages must be valid PP ranks before the final "
+            f"head rank {pipeline_parallel_size - 1}, got {stage_ranks}."
+        )
+
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "dots3_note_mtp",
@@ -453,6 +477,16 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
     target model's `--kv-cache-dtype`."""
+    dspark_pipeline_stage_ranks: list[int] | None = None
+    """Target PP ranks that own successive DSpark decoder blocks. When set,
+    the final target PP rank owns the DSpark projection and output heads. This
+    experimental mode currently applies only to DeepSeek-V4.1."""
+    dspark_num_query_tokens: int | None = None
+    """Optional DSpark backbone query length, including the predicting anchor.
+    It can exceed num_speculative_tokens to preserve a trained query block while
+    proposing only its prefix. Requires greedy DSpark with
+    sample_from_anchor=True and fixed-length verification. DeepSeek V4.1
+    supports query lengths beyond its checkpoint block size."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -712,12 +746,18 @@ class SpeculativeConfig:
                     ],
                 }
             )
-        if hf_config.model_type == "deepseek_v4":
+        if hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
+            # V4.1 has no classic-MTP draft: its checkpoints ship DSpark stages
+            # under ``mtp.*``, so only V4 gets an MTP architecture here. The
+            # DSpark path rewrites ``architectures`` itself and needs only
+            # ``n_predict``; ``method="mtp"`` on V4.1 is rejected below.
+            is_v41 = hf_config.model_type == "deepseek_v41"
             hf_config.model_type = "deepseek_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
-            )
+            overrides = {"n_predict": n_predict}
+            if not is_v41:
+                overrides["architectures"] = ["DeepSeekV4MTPModel"]
+            hf_config.update(overrides)
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":
@@ -1299,7 +1339,11 @@ class SpeculativeConfig:
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
-                    enforce_eager=self.target_model_config.enforce_eager,
+                    enforce_eager=(
+                        self.target_model_config.enforce_eager
+                        if self.enforce_eager is None
+                        else self.enforce_eager
+                    ),
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
@@ -1354,6 +1398,18 @@ class SpeculativeConfig:
                     MTPModelTypes
                 ):
                     self.method = "mtp"
+                    if (
+                        self.target_model_config is not None
+                        and self.target_model_config.hf_config.model_type
+                        == "deepseek_v41"
+                    ):
+                        raise ValueError(
+                            "DeepSeek V4.1 has no classic-MTP draft: its "
+                            "checkpoints ship DSpark stages under mtp.* "
+                            "(main_proj/markov_head/confidence_head) and carry "
+                            "no e_proj/h_proj/enorm/hnorm/hc_head weights. Use "
+                            "speculative method 'dspark' instead of 'mtp'."
+                        )
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
@@ -1417,21 +1473,25 @@ class SpeculativeConfig:
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
+                    # DeepSeek-V4(.1) DSpark reuses the full target config
                     # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    # DeepSeek-V4 exposes two independent depths: the three
-                    # auxiliary target layers used by DSpark and the trained
-                    # speculative block width. The latter is stored as
-                    # ``dspark_block_size`` and must drive ``n_predict``.
+                    is_v41 = (
+                        self.target_model_config.hf_config.model_type == "deepseek_v41"
+                    )
+                    draft_hf_config = self.draft_model_config.hf_config
+                    draft_hf_config.model_type = (
+                        "deepseek_v41" if is_v41 else "deepseek_v4"
+                    )
+                    draft_hf_config.architectures = [
+                        "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
+                    ]
+                    # DeepSeek V4 and V4.1 expose the auxiliary target-layer
+                    # depth separately from the trained speculative width.
                     dspark_block_size = getattr(
-                        self.draft_model_config.hf_config, "dspark_block_size", None
+                        draft_hf_config, "dspark_block_size", None
                     )
                     if dspark_block_size is not None:
-                        self.draft_model_config.hf_config.n_predict = dspark_block_size
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
-                    ]
+                        draft_hf_config.n_predict = dspark_block_size
                     self.draft_model_config.quantization = (
                         self.target_model_config.quantization
                     )
@@ -1474,6 +1534,11 @@ class SpeculativeConfig:
                     elif (
                         self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
+                        and not (
+                            self.use_dspark()
+                            and self.draft_model_config.hf_config.model_type
+                            == "deepseek_v41"
+                        )
                     ):
                         # Ensure divisibility for MTP module reuse.
                         raise ValueError(
@@ -1794,6 +1859,42 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.dspark_num_query_tokens is not None:
+            if (
+                not self.use_dspark()
+                or self.draft_sample_method != "greedy"
+                or self.enable_adaptive_verification
+            ):
+                raise ValueError(
+                    "dspark_num_query_tokens requires greedy DSpark with fixed "
+                    "verification length"
+                )
+            if self.dspark_num_query_tokens < self.num_speculative_tokens:
+                raise ValueError(
+                    "dspark_num_query_tokens must cover every proposed token"
+                )
+
+        if self.dspark_pipeline_stage_ranks is not None:
+            if self.method != "dspark" or self.draft_model_config is None:
+                raise ValueError(
+                    "dspark_pipeline_stage_ranks is only supported by DSpark."
+                )
+            draft_hf = self.draft_model_config.hf_config
+            if getattr(draft_hf, "model_type", None) != "deepseek_v41":
+                raise ValueError(
+                    "Distributed DSpark currently supports DeepSeek-V4.1 only."
+                )
+            num_draft_layers = (
+                getattr(draft_hf, "n_mtp_layers", None)
+                or getattr(draft_hf, "num_nextn_predict_layers", None)
+                or 3
+            )
+            verify_distributed_dspark_stage_ranks(
+                self.dspark_pipeline_stage_ranks,
+                num_draft_layers,
+                self.target_parallel_config.pipeline_parallel_size,
+            )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1870,6 +1971,8 @@ class SpeculativeConfig:
         ==================== ============= ======== ================
         """
         num_draft_tokens = self.num_speculative_tokens
+        if self.use_dspark() and self.dspark_num_query_tokens is not None:
+            return self.dspark_num_query_tokens - 1
 
         if self.use_dflash():
             # DFlash uses one bonus query followed by K mask queries.
@@ -1917,6 +2020,9 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_distributed_dspark(self) -> bool:
+        return self.use_dspark() and self.dspark_pipeline_stage_ranks is not None
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

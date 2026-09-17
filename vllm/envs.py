@@ -69,8 +69,14 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K: int = 32
     VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT: bool = True
     VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT: bool = True
+    VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS: int = 0
+    VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE: bool = False
+    VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP: bool = True
+    VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_VALIDITY: bool = True
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA: bool = True
+    VLLM_DEEPSEEK_V4_PAGED_DECODE_SWA: bool = True
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = True
+    VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT: bool = False
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
@@ -202,6 +208,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -231,6 +238,8 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_MARLIN_M_ALIGN: int = 0
+    VLLM_DSV41_ROUTER_GEMM_ALIGN: str = ""
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1156,11 +1165,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1"))
     ),
+    "VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", "0")
+    ),
+    "VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_VALIDITY": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_VALIDITY", "1"))
+    ),
     "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
     ),
+    "VLLM_DEEPSEEK_V4_PAGED_DECODE_SWA": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_PAGED_DECODE_SWA", "1"))
+    ),
     "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT", "0"))
     ),
     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
         os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
@@ -1709,6 +1736,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
     ),
+    # Pin Marlin's M-tile geometry so the K accumulation order no longer depends
+    # on the batch shape. Marlin derives thread_m_blocks from M, so the same rows
+    # accumulate in a different order for M<=16, 17..112 and >=128; the GEMM
+    # output therefore shifts by about one bf16 ULP with the batch shape. That is
+    # invisible for most models, but this one's logits sit on near ties, so a
+    # single ULP of reassociation flips the argmax and a batched prefill
+    # disagrees with a solo one.
+    #
+    # Value is the M rows per launch: 0 disables, and any positive value enables
+    # alignment with a 16-row chunk (a value above 1 widens the chunk, but the
+    # chunk must stay <= 16 rows: at 32 the kernel's `parallel` stride stops
+    # matching the solo geometry and the alignment silently stops working).
+    # Rows <= 8 (the decode m_block_size_8 path) and rows above 128 are never
+    # touched: the chunked launch re-reads the weight matrix once per launch,
+    # which measured +177% on this shape at M=2048, and aligning a long prefill
+    # changes its answer rather than stabilising it.
+    "VLLM_MARLIN_M_ALIGN": lambda: int(os.getenv("VLLM_MARLIN_M_ALIGN", "0")),
+    # Pins the MoE router GEMM to cuBLAS's small-M kernel geometry, which is the
+    # only one a single request's router logits are ever computed with today.
+    # cuBLAS selects its kernel from the problem shape, so without this a token's
+    # router logits depend on how many tokens share the batch (for
+    # layers.1.ffn.gate, M in [14, 64] is one kernel and 65..128 another, and a
+    # 5-request prefill of 14-token prompts is M=70). "split" uses a 16-way
+    # split-K Triton kernel that is bit-identical to that kernel for M > 64 and
+    # the plain call for M <= 64; "chunk" calls cuBLAS once per 64 rows instead,
+    # which is equally exact but one launch per chunk.
+    "VLLM_DSV41_ROUTER_GEMM_ALIGN": lambda: os.getenv(
+        "VLLM_DSV41_ROUTER_GEMM_ALIGN", ""
+    ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
@@ -2252,6 +2308,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_MODEL_INSPECTION": lambda: bool(
         int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))
     ),
+    # Keep Qwen4Exp PLE embedding tables in pinned CPU memory and gather their
+    # rows through UVA on a dedicated CUDA stream.
+    # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
+    # This environment variable may be removed in a future release.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))

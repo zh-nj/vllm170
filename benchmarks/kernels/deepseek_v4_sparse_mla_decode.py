@@ -31,7 +31,6 @@ HEAD_DIM = 512
 NOPE_DIM = 448
 ROPE_DIM = 64
 COMB_DIM = NOPE_DIM + ROPE_DIM
-BLOCK_SIZE = 256
 PARTIAL_CONFIGS: tuple[PartialConfig, ...] = (
     (8, 16, 4),
     (8, 16, 8),
@@ -76,11 +75,11 @@ def _measure_graph(
     return statistics.median(timings), timings[int(0.9 * (samples - 1))]
 
 
-def _make_cache(rows: int, generator: torch.Generator) -> torch.Tensor:
-    num_blocks = triton.cdiv(rows, BLOCK_SIZE)
+def _make_cache(rows: int, generator: torch.Generator, block_size: int) -> torch.Tensor:
+    num_blocks = triton.cdiv(rows, block_size)
     cache = torch.zeros(
         num_blocks,
-        BLOCK_SIZE,
+        block_size,
         584,
         dtype=torch.uint8,
         device="cuda",
@@ -95,7 +94,7 @@ def _make_cache(rows: int, generator: torch.Generator) -> torch.Tensor:
         * 0.125
     ).to(torch.bfloat16)
     slots = torch.arange(rows, dtype=torch.int64, device="cuda")
-    quantize_and_insert_k_cache(values, cache, slots, BLOCK_SIZE)
+    quantize_and_insert_k_cache(values, cache, slots, block_size)
     return cache
 
 
@@ -107,12 +106,20 @@ class DecodeCase:
         extra_len: int,
         splits: int,
         seed: int,
+        block_size: int,
+        paged_main_seq_len: int,
     ) -> None:
         self.num_queries = num_queries
         self.main_len = main_len
         self.extra_len = extra_len
         self.splits = splits
-        rows = max(4096, num_queries * max(main_len, extra_len, 1))
+        self.block_size = block_size
+        self.paged_main_seq_len = paged_main_seq_len
+        rows = max(
+            4096,
+            num_queries * max(main_len, extra_len, 1),
+            paged_main_seq_len,
+        )
         generator = torch.Generator(device="cuda").manual_seed(seed)
         self.q = torch.randn(
             num_queries,
@@ -121,12 +128,31 @@ class DecodeCase:
             device="cuda",
             generator=generator,
         ).to(torch.bfloat16)
-        self.main_cache = _make_cache(rows, generator)
-        self.main_indices = torch.arange(
-            num_queries * main_len,
+        self.main_cache = _make_cache(rows, generator, block_size)
+        main_start = max(0, paged_main_seq_len - main_len)
+        self.main_indices = (
+            torch.arange(
+                num_queries * main_len,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            + main_start
+        ).remainder_(rows)
+        self.main_block_table = (
+            torch.arange(
+                triton.cdiv(rows, block_size),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            .view(1, -1)
+            .expand(num_queries, -1)
+        )
+        self.main_seq_lens = torch.full(
+            (num_queries,),
+            paged_main_seq_len,
             dtype=torch.int32,
             device="cuda",
-        ).remainder_(rows)
+        )
         self.main_indptr = torch.arange(
             0,
             (num_queries + 1) * main_len,
@@ -134,7 +160,7 @@ class DecodeCase:
             dtype=torch.int32,
             device="cuda",
         )
-        self.extra_cache = _make_cache(rows, generator)
+        self.extra_cache = _make_cache(rows, generator, block_size)
         self.extra_indices = torch.arange(
             num_queries * extra_len,
             dtype=torch.int32,
@@ -186,10 +212,10 @@ class DecodeCase:
             self.out.stride(1),
             self.main_cache.stride(0),
             self.extra_cache.stride(0),
-            self.main_cache.shape[0] * BLOCK_SIZE,
-            self.extra_cache.shape[0] * BLOCK_SIZE,
-            BLOCK_SIZE,
-            BLOCK_SIZE,
+            self.main_cache.shape[0] * self.block_size,
+            self.extra_cache.shape[0] * self.block_size,
+            self.block_size,
+            self.block_size,
             HEAD_DIM**-0.5,
             HEADS,
             HAS_ATTN_SINK=True,
@@ -220,6 +246,8 @@ class DecodeCase:
             self.extra_cache,
             self.extra_indices,
             self.extra_indptr,
+            self.main_block_table,
+            self.main_seq_lens,
             self.part_m,
             self.part_l,
             self.part_acc,
@@ -228,18 +256,21 @@ class DecodeCase:
             self.q.stride(1),
             self.main_cache.stride(0),
             self.extra_cache.stride(0),
+            self.main_block_table.stride(0),
             self.part_m.stride(0),
             self.part_m.stride(1),
             self.part_acc.stride(0),
             self.part_acc.stride(1),
             self.part_acc.stride(2),
-            self.main_cache.shape[0] * BLOCK_SIZE,
-            self.extra_cache.shape[0] * BLOCK_SIZE,
-            BLOCK_SIZE,
-            BLOCK_SIZE,
+            self.main_cache.shape[0] * self.block_size,
+            self.extra_cache.shape[0] * self.block_size,
+            self.block_size,
+            self.block_size,
+            self.main_len,
             HEAD_DIM**-0.5,
             HEADS,
             HAS_EXTRA=self.extra_len > 0,
+            HAS_PAGED_MAIN=self.paged_main_seq_len > 0,
             NOPE_DIM=NOPE_DIM,
             NOPE_BLOCK=512,
             ROPE_DIM=ROPE_DIM,
@@ -271,6 +302,7 @@ class DecodeCase:
             self.part_acc.stride(2),
             HEADS,
             HAS_ATTN_SINK=True,
+            ADAPTIVE_SPLITS=False,
             COMB_DIM=COMB_DIM,
             BLOCK_H=block_h,
             NUM_SPLITS=self.splits,
@@ -293,6 +325,8 @@ def main() -> None:
     parser.add_argument("--main-len", type=int, default=128)
     parser.add_argument("--extra-len", type=int, default=512)
     parser.add_argument("--splits", type=int, default=2)
+    parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--paged-main-seq-len", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--samples", type=int, default=5)
@@ -306,6 +340,8 @@ def main() -> None:
         args.extra_len,
         args.splits,
         args.seed,
+        args.block_size,
+        args.paged_main_seq_len,
     )
     case.baseline()
     torch.accelerator.synchronize()

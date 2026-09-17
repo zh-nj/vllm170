@@ -29,6 +29,8 @@ def test_full_logits_uses_caller_output() -> None:
     ends = torch.full((M,), N, dtype=torch.int32, device="cuda")
     expected = fp8_mqa_logits_triton(q, (k, scales), weights, starts, ends)
     output = torch.empty_like(expected)
+    q_bf16 = torch.empty_like(q, dtype=torch.bfloat16)
+    k_bf16 = torch.empty_like(k, dtype=torch.bfloat16)
 
     actual = fp8_mqa_logits_triton(
         q,
@@ -37,9 +39,13 @@ def test_full_logits_uses_caller_output() -> None:
         starts,
         ends,
         logits_out=output,
+        q_bf16_out=q_bf16,
+        k_bf16_out=k_bf16,
     )
 
     assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(q_bf16, q.to(torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(k_bf16, k.to(torch.bfloat16), rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

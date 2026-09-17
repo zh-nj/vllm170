@@ -24,6 +24,7 @@ def _run_prepare(
     cp_rank: int = 0,
     cp_size: int = 1,
     cp_interleave: int = 1,
+    request_idx_mapping: torch.Tensor | None = None,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
@@ -67,10 +68,10 @@ def _run_prepare(
     temperature = torch.zeros(max_num_reqs, dtype=torch.float32, device=device)
     seeds = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
     input_temperature = torch.tensor(
-        [0.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=device
+        [0.0, 0.5, 1.0, 0.0], dtype=torch.float32, device=device
     )
-    input_seeds = torch.tensor([0, 0, 17, 0], dtype=torch.int64, device=device)
-    last_sampled = torch.tensor([0, 0, 99, 0], dtype=torch.int64, device=device)
+    input_seeds = torch.tensor([0, 23, 17, 0], dtype=torch.int64, device=device)
+    last_sampled = torch.tensor([0, 77, 99, 0], dtype=torch.int64, device=device)
     next_prefill_tokens = torch.zeros_like(last_sampled)
     block_table = torch.tensor([block_table_values], dtype=torch.int32, device=device)
 
@@ -103,6 +104,7 @@ def _run_prepare(
         max_num_tokens,
         128,
         sample_from_anchor=True,
+        request_idx_mapping=request_idx_mapping,
     )
     torch.accelerator.synchronize()
     return SimpleNamespace(
@@ -139,6 +141,19 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
     assert out.sample_idx_mapping[:3].tolist() == [2, 2, 2]
     assert out.temperature[2].item() == 1.0
     assert out.seeds[2].item() == 17
+
+
+def test_prepare_dflash_inputs_uses_canonical_request_slots():
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
+        request_idx_mapping=torch.tensor([1], dtype=torch.int32, device="cuda"),
+    )
+
+    assert out.input_buffers.input_ids[:3].cpu().tolist() == [77, 123, 123]
+    assert out.sample_idx_mapping[:3].tolist() == [1, 1, 1]
+    assert out.temperature[1].item() == 0.5
+    assert out.seeds[1].item() == 23
 
 
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():

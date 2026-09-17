@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
@@ -42,18 +43,26 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+# v4.1 ratio-1 / ratio-2 indexer layers: same indexer-path shape as C4A, but
+# their compressed page block is block_size // ratio, so each gets its own plan.
+# v4.1 builders classify layer types themselves (ratio 0 is SWA-only there); see
+# deepseek_v4_1/sparse_mla.py.
+_LAYER_TYPE_C1A = "c1a"
+_LAYER_TYPE_C2A = "c2a"
 
 
 def _layer_type_for(compress_ratio: int) -> str:
     if compress_ratio <= 1:
         return _LAYER_TYPE_SWAONLY
+    if compress_ratio == 2:
+        return _LAYER_TYPE_C2A
     if compress_ratio == 4:
         return _LAYER_TYPE_C4A
     if compress_ratio == 128:
         return _LAYER_TYPE_C128A
     raise ValueError(
         f"Unsupported DeepseekV4 compress_ratio={compress_ratio}; "
-        "expected 1, 4, or 128."
+        "expected 1, 2, 4, or 128."
     )
 
 
@@ -66,6 +75,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         backend_cls: "type[AttentionBackend] | None" = None,
+        block_size: int = 64,
     ):
         super().__init__()
         self.backend_cls = backend_cls or DeepseekSparseSWABackend
@@ -80,12 +90,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # Block size is constrained by tensor sharing between SWA and C4A KV blocks.
-        # Since both block types share the same physical tensor, they must use the
-        # same page size. The C4A KV block shape [256//4, head_dim] = [64, head_dim]
-        # determines the SWA block size of 64 tokens per block.
-        # TODO(yifan): make SWA block size automatically determined and configurable.
-        self.block_size = 64
+        # Any multiple of 32; the sparse decode kernels take the page size at
+        # runtime.
+        self.block_size = block_size
         # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:
         # contiguous full-cache layout.
         assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
@@ -126,7 +133,7 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(64)]
+        return [MultipleOf(32)]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -206,12 +213,17 @@ class DeepseekSparseSWAMetadata:
     tile_sched_swaonly: "FlashMLASchedMeta | None" = None
     tile_sched_c4a: "FlashMLASchedMeta | None" = None
     tile_sched_c128a: "FlashMLASchedMeta | None" = None
+    tile_sched_c1a: "FlashMLASchedMeta | None" = None
+    tile_sched_c2a: "FlashMLASchedMeta | None" = None
     flashinfer_sparse_index_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
 
     def get_prefill_chunk_plan(
-        self, compress_ratio: int, prefill_chunk_size: int
+        self,
+        compress_ratio: int,
+        prefill_chunk_size: int,
+        has_compressed: bool | None = None,
     ) -> list[tuple[int, int, int, int]]:
         if self.num_prefills == 0:
             return []
@@ -219,17 +231,20 @@ class DeepseekSparseSWAMetadata:
         assert self.prefill_seq_lens_cpu is not None
         assert self.prefill_query_lens_cpu is not None
 
+        # Whether the layer gathers a compressed-KV region into the prefill
+        # workspace. v4.0 callers keep the legacy default (ratio <= 1 means
+        # SWA-only); v4.1 passes has_compressed explicitly because its
+        # compress_ratio==1 layers DO have a full-length compressed cache.
+        if has_compressed is None:
+            has_compressed = compress_ratio > 1
+
         # query_len <= max_num_batched_tokens and
         # gather_len = query_len + min(prefix_len, window_size - 1), so the
         # worst-case gathered width is bounded by
         # max_num_batched_tokens + window_size - 1. The compressed prefix pool
         # is bounded by ceil(max_model_len / compress_ratio).
         max_workspace_area = prefill_chunk_size * (
-            (
-                0
-                if compress_ratio <= 1
-                else cdiv(self.prefill_max_model_len, compress_ratio)
-            )
+            (cdiv(self.prefill_max_model_len, compress_ratio) if has_compressed else 0)
             + self.prefill_window_size
             + self.prefill_max_num_batched_tokens
         )
@@ -238,13 +253,13 @@ class DeepseekSparseSWAMetadata:
             prefix_lens_cpu, min=0, max=self.prefill_window_size - 1
         )
         compressed_lens_cpu = (
-            torch.zeros_like(self.prefill_seq_lens_cpu)
-            if compress_ratio <= 1
-            else torch.div(
+            torch.div(
                 self.prefill_seq_lens_cpu,
                 compress_ratio,
                 rounding_mode="floor",
             )
+            if has_compressed
+            else torch.zeros_like(self.prefill_seq_lens_cpu)
         )
 
         chunk_plan: list[tuple[int, int, int, int]] = []
@@ -459,6 +474,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self._persist_single_req_token_map = (
+            envs.VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP
+        )
+        # Validity is always derived from the live slot mapping, so the former
+        # VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_VALIDITY fast path is gone. The
+        # env var is kept in envs.py so existing command lines keep working.
         decode_swa_index_width = (
             self.window_size if self._requires_dense_decode_swa_indices() else 0
         )
@@ -509,7 +530,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.span_ends = torch.zeros(
                 max_tokens, dtype=torch.int32, device=self.device
             )
-        self.is_valid_token = torch.zeros(
+        self.is_valid_token = torch.ones(
             max_tokens,
             dtype=torch.bool,
             device=self.device,
@@ -534,6 +555,39 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
     def _requires_dense_decode_swa_indices(self) -> bool:
         return True
+
+    def _requires_decode_swa_lens_tail_clear(self) -> bool:
+        return True
+
+    def _get_token_to_req_indices(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        if self._persist_single_req_token_map and common_attn_metadata.num_reqs == 1:
+            num_tokens = common_attn_metadata.num_actual_tokens
+            token_to_req_indices = self.token_to_req_indices[:num_tokens]
+            # This buffer outlives the batch that filled it: an earlier
+            # multi-request step leaves per-request row numbers behind, and a
+            # single request must map every token to request 0. Refresh the
+            # slice in place so the published pointer is unchanged.
+            token_to_req_indices.zero_()
+            common_attn_metadata._token_to_req_indices_cache = token_to_req_indices
+            return token_to_req_indices
+        return common_attn_metadata.token_to_req_indices(self.token_to_req_indices)
+
+    def _get_is_valid_token(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mapping: torch.Tensor,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
+    ) -> torch.Tensor:
+        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+        # Validity depends only on the current slot mapping, and a single
+        # request does not imply every slot is live: eviction and rejected
+        # suffixes both produce PAD slots. Always refresh from the live mapping
+        # instead of trusting whatever the previous batch left in the buffer.
+        is_valid_token.copy_(slot_mapping >= 0)
+        return is_valid_token
 
     def _build_decode_swa_indices(
         self,
@@ -623,26 +677,31 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         mode = "noncausal" if non_causal else "causal"
 
         # Split into decode and prefill portions using configurable threshold
-        (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.split", slot_mapping
+        ):
+            (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+                split_decodes_and_prefills(
+                    common_attn_metadata, decode_threshold=self.decode_threshold
+                )
             )
-        )
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
         with optional_phase_profile_stage(
             f"target.attn_metadata.swa.{mode}.token_map", slot_mapping
         ):
-            token_to_req_indices = common_attn_metadata.token_to_req_indices(
-                self.token_to_req_indices
-            )
+            token_to_req_indices = self._get_token_to_req_indices(common_attn_metadata)
 
-        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         with optional_phase_profile_stage(
             f"target.attn_metadata.swa.{mode}.validity", slot_mapping
         ):
-            is_valid_token.copy_(slot_mapping >= 0)
+            is_valid_token = self._get_is_valid_token(
+                common_attn_metadata,
+                slot_mapping,
+                num_decode_tokens,
+                num_prefill_tokens,
+            )
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (
@@ -653,7 +712,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             with optional_phase_profile_stage(
                 f"target.attn_metadata.swa.{mode}.decode_indices", slot_mapping
             ):
-                self.decode_swa_lens[num_decode_tokens:] = 0
+                with optional_phase_profile_stage(
+                    f"target.attn_metadata.swa.{mode}.decode_tail_clear",
+                    slot_mapping,
+                ):
+                    if self._requires_decode_swa_lens_tail_clear():
+                        self.decode_swa_lens[num_decode_tokens:] = 0
                 decode_swa_indices = self._build_decode_swa_indices(
                     num_decode_tokens=num_decode_tokens,
                     non_causal=non_causal,
@@ -735,46 +799,51 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         ):
             tile_sched = self.build_tile_scheduler(num_decode_tokens)
 
-        return DeepseekSparseSWAMetadata(
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            block_table=block_table,
-            slot_mapping=slot_mapping,
-            is_valid_token=is_valid_token,
-            token_to_req_indices=token_to_req_indices,
-            decode_swa_indices=decode_swa_indices[:num_decode_tokens],
-            decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
-            decode_swa_width=decode_swa_width,
-            prefill_swa_indices=(
-                self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
-            ),
-            prefill_swa_lens=(
-                self.prefill_swa_lens[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
-            ),
-            prefill_left_visible=prefill_left_visible,
-            prefill_right_visible=prefill_right_visible,
-            block_size=self.block_size,
-            num_decodes=num_decodes,
-            num_prefills=num_prefills,
-            num_decode_tokens=num_decode_tokens,
-            num_prefill_tokens=num_prefill_tokens,
-            # Upper bound on decode-split rows for the kernel's max_q_len
-            # hint. common max_query_len bounds every row (scheduled max under
-            # adaptive verification), clamped to what the split can admit so a
-            # mixed batch's prefill max does not inflate decode scheduling.
-            max_decode_query_len=min(
-                common_attn_metadata.max_query_len, self.decode_threshold
-            ),
-            tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
-            tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
-            tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
-            **deepseek_v4_fields,  # type: ignore[arg-type]
-        )
+        with optional_phase_profile_stage(
+            f"target.attn_metadata.swa.{mode}.result", slot_mapping
+        ):
+            return DeepseekSparseSWAMetadata(
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+                is_valid_token=is_valid_token,
+                token_to_req_indices=token_to_req_indices,
+                decode_swa_indices=decode_swa_indices[:num_decode_tokens],
+                decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+                decode_swa_width=decode_swa_width,
+                prefill_swa_indices=(
+                    self.prefill_swa_indices[:num_prefill_tokens]
+                    if num_prefill_tokens > 0
+                    else None
+                ),
+                prefill_swa_lens=(
+                    self.prefill_swa_lens[:num_prefill_tokens]
+                    if num_prefill_tokens > 0
+                    else None
+                ),
+                prefill_left_visible=prefill_left_visible,
+                prefill_right_visible=prefill_right_visible,
+                block_size=self.block_size,
+                num_decodes=num_decodes,
+                num_prefills=num_prefills,
+                num_decode_tokens=num_decode_tokens,
+                num_prefill_tokens=num_prefill_tokens,
+                # Upper bound on decode-split rows for the kernel's max_q_len
+                # hint. common max_query_len bounds every row (scheduled max under
+                # adaptive verification), clamped to what the split can admit so a
+                # mixed batch's prefill max does not inflate decode scheduling.
+                max_decode_query_len=min(
+                    common_attn_metadata.max_query_len, self.decode_threshold
+                ),
+                tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
+                tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
+                tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
+                tile_sched_c1a=tile_sched[_LAYER_TYPE_C1A],
+                tile_sched_c2a=tile_sched[_LAYER_TYPE_C2A],
+                **deepseek_v4_fields,  # type: ignore[arg-type]
+            )
 
     def _build_image_visibility(
         self,
@@ -856,6 +925,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
         metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
         metadata.tile_sched_c128a = tile_sched[_LAYER_TYPE_C128A]
+        metadata.tile_sched_c1a = tile_sched[_LAYER_TYPE_C1A]
+        metadata.tile_sched_c2a = tile_sched[_LAYER_TYPE_C2A]
         metadata.flashinfer_sparse_index_cache.clear()
 
     def build_tile_scheduler(
@@ -876,6 +947,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_SWAONLY: None,
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
+            _LAYER_TYPE_C1A: None,
+            _LAYER_TYPE_C2A: None,
         }
         if (
             num_decode_tokens == 0

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental DSV4 MXFP4 -> INT8 modular MoE backend for SM80."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Experimental DSV4.1 MXFP4 -> INT8 modular MoE backend for SM80."""
 
 import torch
 
@@ -25,13 +26,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
-_HIDDEN_SIZE = 4096
-_INTERMEDIATE_SIZE = 2048
-_TOPK = 6
+_HIDDEN_SIZE = 5120
+_INTERMEDIATE_SIZE = 2304
+_TARGET_TOPK = 6
+_DRAFT_TOPK = 3
+_DECODE_NUM_EXPERTS = 384
+_DECODE_BLOCK_M = 16
 _TILE_TABLE: tuple[tuple[int, int, int], ...] = (
     (1, 16, 128),
-    (1024, 16, 64),
+    (1024, 16, 128),
     (2048, 64, 128),
     (1 << 30, 128, 128),
 )
@@ -51,8 +56,27 @@ def select_mxfp4_int8_sm80_tile(
     return 16, 128
 
 
+def make_mxfp4_int8_sm80_decode_metadata(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the immutable M=1, top-k 6, block-M 16 route layout."""
+    sorted_ids = torch.full(
+        (_TARGET_TOPK * _DECODE_BLOCK_M,),
+        _TARGET_TOPK,
+        dtype=torch.int32,
+        device=device,
+    )
+    sorted_ids[::_DECODE_BLOCK_M] = torch.arange(
+        _TARGET_TOPK, dtype=torch.int32, device=device
+    )
+    num_post_pad = torch.tensor(
+        [_TARGET_TOPK * _DECODE_BLOCK_M], dtype=torch.int32, device=device
+    )
+    return sorted_ids, num_post_pad
+
+
 class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
-    """SM80 INT8-MMA experts for the fixed DSV4 TP1 expert shape.
+    """SM80 INT8-MMA experts for the fixed DSV4.1 TP1 expert shape.
 
     Pipeline parallelism is outside the MoE tensor layout, so PP3 is supported
     while TP/EP/DP/PCP/SP sharding deliberately fails closed.
@@ -62,7 +86,6 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
-        layer: torch.nn.Module,
         max_num_tokens: int | None = None,
         num_dispatchers: int | None = None,
     ):
@@ -74,22 +97,31 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         if (
             moe_config.hidden_dim != _HIDDEN_SIZE
             or moe_config.intermediate_size_per_partition != _INTERMEDIATE_SIZE
-            or moe_config.experts_per_token != _TOPK
+            or moe_config.experts_per_token not in (_DRAFT_TOPK, _TARGET_TOPK)
         ):
             raise ValueError(
-                "mxfp4_int8_sm80 currently requires DSV4 TP1 shape "
-                f"H={_HIDDEN_SIZE}, I={_INTERMEDIATE_SIZE}, topk={_TOPK}; got "
+                "mxfp4_int8_sm80 currently requires DSV4.1 TP1 shape "
+                f"H={_HIDDEN_SIZE}, I={_INTERMEDIATE_SIZE}, topk=3 or 6; got "
                 f"H={moe_config.hidden_dim}, "
                 f"I={moe_config.intermediate_size_per_partition}, "
                 f"topk={moe_config.experts_per_token}"
             )
-        self.w13_shift2 = layer.w13_mxfp4_int8_shift2
-        self.w2_shift2 = layer.w2_mxfp4_int8_shift2
         super().__init__(
             moe_config=moe_config,
             quant_config=quant_config,
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
+        )
+        self.w13_shift2: torch.Tensor | None = None
+        self.w2_shift2: torch.Tensor | None = None
+        self.decode_sorted_ids: torch.Tensor | None = None
+        self.decode_num_post_pad: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.w13_shift2 = layer.w13_mxfp4_int8_shift2
+        self.w2_shift2 = layer.w2_mxfp4_int8_shift2
+        self.decode_sorted_ids, self.decode_num_post_pad = (
+            make_mxfp4_int8_sm80_decode_metadata(self.w13_shift2.device)
         )
 
     @property
@@ -178,11 +210,12 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         # The modular runner normally aliases its final output with workspace13.
         # Keep routed W2 slots in workspace2 so the in-place reduction never
-        # overwrites slots belonging to later tokens. workspace13 is only the
-        # activation output, whose contents are dead after A2 quantization.
+        # overwrites slots belonging to later tokens. Pack the W13 output and
+        # activation into disjoint flat regions of workspace13 so both views
+        # have the tight row stride required by the CUDA kernels.
         return (
-            (M * topk, _INTERMEDIATE_SIZE),
-            (M * topk, max(2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE)),
+            (M * topk, 3 * _INTERMEDIATE_SIZE),
+            (M * topk, _HIDDEN_SIZE),
             (M, _HIDDEN_SIZE),
         )
 
@@ -214,85 +247,94 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
             raise TypeError("mxfp4_int8_sm80 requires BF16 input and output tensors")
         assert self.w1_scale is not None
         assert self.w2_scale is not None
+        assert self.w13_shift2 is not None
+        assert self.w2_shift2 is not None
 
         m = hidden_states.size(0)
         topk = topk_ids.size(1)
         num_experts = w1.size(0)
         block_m, block_n = select_mxfp4_int8_sm80_tile(m, topk, num_experts)
-        routing_ids = topk_ids.to(torch.int32).contiguous()
-        routing_weights = topk_weights.to(torch.float32).contiguous()
-        sorted_ids, expert_ids, num_post_pad = moe_align_block_size(
-            routing_ids,
-            block_m,
-            global_num_experts,
+        with optional_phase_profile_stage("moe.mxfp4_sm80.routing_cast", hidden_states):
+            routing_ids = topk_ids.to(torch.int32).contiguous()
+            routing_weights = topk_weights.to(torch.float32).contiguous()
+        use_persistent_decode_metadata = (
+            m == 1
+            and topk == _TARGET_TOPK
+            and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
+            and block_m == _DECODE_BLOCK_M
         )
+        if use_persistent_decode_metadata:
+            assert self.decode_sorted_ids is not None
+            assert self.decode_num_post_pad is not None
+            sorted_ids = self.decode_sorted_ids
+            expert_ids = routing_ids.view(-1)
+            num_post_pad = self.decode_num_post_pad
+        else:
+            with optional_phase_profile_stage("moe.mxfp4_sm80.align", hidden_states):
+                sorted_ids, expert_ids, num_post_pad = moe_align_block_size(
+                    routing_ids,
+                    block_m,
+                    global_num_experts,
+                )
 
-        gate_up = workspace2.view(-1, workspace2.size(-1))[
-            : m * topk, : 2 * _INTERMEDIATE_SIZE
-        ]
-        intermediate = workspace13.view(-1, workspace13.size(-1))[
-            : m * topk, :_INTERMEDIATE_SIZE
-        ]
+        num_routed = m * topk
+        scratch = workspace13.flatten()
+        gate_up_numel = num_routed * 2 * _INTERMEDIATE_SIZE
+        gate_up = scratch[:gate_up_numel].view(num_routed, 2 * _INTERMEDIATE_SIZE)
+        intermediate = scratch[
+            gate_up_numel : gate_up_numel + num_routed * _INTERMEDIATE_SIZE
+        ].view(num_routed, _INTERMEDIATE_SIZE)
         # Reuse the W13 output after activation. A2 quantization is enqueued
         # before W2 on the same stream, so overwriting this storage is ordered.
-        routed_out = workspace2.view(-1, workspace2.size(-1))[: m * topk, :_HIDDEN_SIZE]
+        routed_out = workspace2.view(-1, _HIDDEN_SIZE)[:num_routed]
 
-        a13_q, a13_scale = quantize_per_token_int8(hidden_states)
-        torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
-            a13_q,
-            a13_scale,
-            w1,
-            self.w13_shift2,
-            self.w1_scale,
-            gate_up,
-            gate_up,
-            routing_weights,
-            sorted_ids,
-            expert_ids,
-            num_post_pad,
-            m * topk,
-            block_m,
-            block_n,
-            False,
-        )
-        self.activation(
-            activation,
-            intermediate,
-            gate_up,
-            clamp_limit=self.quant_config.gemm1_clamp_limit,
-            alpha=(
-                self.quant_config.gemm1_alpha
-                if self.quant_config.gemm1_alpha is not None
-                else 1.0
-            ),
-            beta=(
-                self.quant_config.gemm1_beta
-                if self.quant_config.gemm1_beta is not None
-                else 0.0
-            ),
-        )
+        with optional_phase_profile_stage("moe.mxfp4_sm80.w13_quant", hidden_states):
+            a13_q, a13_scale = quantize_per_token_int8(hidden_states)
+        with optional_phase_profile_stage("moe.mxfp4_sm80.w13_gemm", hidden_states):
+            torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
+                a13_q,
+                a13_scale,
+                w1,
+                self.w13_shift2,
+                self.w1_scale,
+                gate_up,
+                gate_up,
+                routing_weights,
+                sorted_ids,
+                expert_ids,
+                num_post_pad,
+                m * topk,
+                block_m,
+                block_n,
+                False,
+            )
+        with optional_phase_profile_stage("moe.mxfp4_sm80.activation", gate_up):
+            self.activation(activation, intermediate, gate_up)
 
-        a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
-        torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
-            a2_q,
-            a2_token_scale,
-            w2,
-            self.w2_shift2,
-            self.w2_scale,
-            output,
-            routed_out,
-            routing_weights,
-            sorted_ids,
-            expert_ids,
-            num_post_pad,
-            m * topk,
-            block_m,
-            block_n,
-            True,
-        )
-        torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_reduce(
-            routed_out,
-            routing_weights,
-            output,
-            m * topk,
-        )
+        with optional_phase_profile_stage("moe.mxfp4_sm80.w2_quant", intermediate):
+            a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
+        with optional_phase_profile_stage("moe.mxfp4_sm80.w2_gemm", intermediate):
+            torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
+                a2_q,
+                a2_token_scale,
+                w2,
+                self.w2_shift2,
+                self.w2_scale,
+                output,
+                routed_out,
+                routing_weights,
+                sorted_ids,
+                expert_ids,
+                num_post_pad,
+                m * topk,
+                block_m,
+                block_n,
+                True,
+            )
+        with optional_phase_profile_stage("moe.mxfp4_sm80.reduce", routed_out):
+            torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_reduce(
+                routed_out,
+                routing_weights,
+                output,
+                m * topk,
+            )

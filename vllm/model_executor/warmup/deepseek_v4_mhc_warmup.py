@@ -18,7 +18,7 @@ from vllm.tracing import instrument
 
 logger = init_logger(__name__)
 
-_MHC_MODEL_TYPES = frozenset(("deepseek_v4", "glm5_next"))
+_MHC_MODEL_TYPES = frozenset(("deepseek_v4", "deepseek_v41", "glm5_next"))
 _MHC_LAYER_CLASS_NAMES = frozenset(("DeepseekV4DecoderLayer", "Glm5NextDecoderLayer"))
 _AUTO_WARMUP_MAX_TOKENS = 16_384
 _DEFAULT_TOKEN_SIZE_CANDIDATES = (

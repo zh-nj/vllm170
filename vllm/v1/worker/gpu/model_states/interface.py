@@ -126,6 +126,14 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def prepare_full_cudagraph_inputs(
+        self,
+        model_inputs: dict[str, Any],
+        attn_metadata: Any,
+    ) -> None:
+        """Prepare model-specific inputs outside a FULL CUDA graph."""
+        return None
+
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
         """Cudagraph support of attention groups this ModelState builds outside
         ``init_attn_backend`` (e.g. encoder-only layers).

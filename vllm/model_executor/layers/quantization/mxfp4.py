@@ -717,21 +717,58 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     and w2_bias.shape[1] == hidden_size
                 )
 
-        # Convert weights to kernel format
-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
-            convert_weight_to_mxfp4_moe_kernel_format(
-                mxfp4_backend=self.mxfp4_backend,
-                layer=layer,
-                w13_weight=w13,
-                w2_weight=w2,
-                w13_weight_scale=w13_scale,
-                w2_weight_scale=w2_scale,
-                w13_bias=w13_bias,
-                w2_bias=w2_bias,
-                _cache_permute_indices=self._cache_permute_indices,
-                activation=self.moe.activation,
+        # Convert weights to kernel format.  The SM80 MXFP4-int8 path produces
+        # output buffers comparable in size to the source weights.  Convert
+        # W13 first and replace it immediately so its source storage is freed
+        # before allocating the larger W2 output buffer.
+        if self.mxfp4_backend == Mxfp4MoeBackend.MXFP4_INT8_SM80:
+            if w13_bias is not None or w2_bias is not None:
+                raise ValueError("mxfp4_int8_sm80 does not support expert bias")
+            from vllm.model_executor.layers.quantization.utils.mxfp4_int8_sm80 import (
+                remap_mxfp4_weight_for_int8,
             )
-        )
+
+            w13, w13_shift2, w13_scale = remap_mxfp4_weight_for_int8(
+                w13,
+                w13_scale,
+                headroom_bits=3,
+                reuse_weight_storage=True,
+            )
+            replace_parameter(layer, "w13_weight", w13)
+            replace_parameter(layer, "w13_weight_scale", w13_scale)
+            layer.register_parameter(
+                "w13_mxfp4_int8_shift2",
+                torch.nn.Parameter(w13_shift2, requires_grad=False),
+            )
+
+            w2, w2_shift2, w2_scale = remap_mxfp4_weight_for_int8(
+                w2,
+                w2_scale,
+                headroom_bits=3,
+                reuse_weight_storage=True,
+            )
+            replace_parameter(layer, "w2_weight", w2)
+            replace_parameter(layer, "w2_weight_scale", w2_scale)
+            layer.register_parameter(
+                "w2_mxfp4_int8_shift2",
+                torch.nn.Parameter(w2_shift2, requires_grad=False),
+            )
+            w13_bias = w2_bias = None
+        else:
+            w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+                convert_weight_to_mxfp4_moe_kernel_format(
+                    mxfp4_backend=self.mxfp4_backend,
+                    layer=layer,
+                    w13_weight=w13,
+                    w2_weight=w2,
+                    w13_weight_scale=w13_scale,
+                    w2_weight_scale=w2_scale,
+                    w13_bias=w13_bias,
+                    w2_bias=w2_bias,
+                    _cache_permute_indices=self._cache_permute_indices,
+                    activation=self.moe.activation,
+                )
+            )
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
@@ -759,6 +796,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
+        self._build_kernel_after_loading(layer)
+
+    def _build_kernel_after_loading(self, layer: RoutedExperts) -> None:
         # Build quant config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
@@ -774,15 +814,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            return
+
+        if self.mxfp4_backend in (
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ):
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+                prepare_moe_mxfp4_layer_for_marlin_inplace,
+            )
+
+            prepare_moe_mxfp4_layer_for_marlin_inplace(layer)
+            self._build_kernel_after_loading(layer)
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
         w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
-
-        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
-            return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 

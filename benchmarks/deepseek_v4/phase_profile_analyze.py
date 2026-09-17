@@ -43,29 +43,46 @@ DETAIL_REQUIREMENTS = {
     },
     "decode": {
         "target.model_forward",
-        "target.attn_metadata.prepare_attn",
+        "target.attn_metadata",
         "target.attn_metadata.builders",
+        "target.model_inputs",
+        "target.pp_recv_wait",
+        "target.pp_recv_copy",
+        "target.logits",
+        "target.sample",
+        "target.sampling_total",
         "layer.total",
+        "layer.mhc_attention_pre",
         "layer.attention",
+        "layer.mhc_ffn_pre",
         "layer.ffn",
         "attention.input_gemm_overlap",
         "attention.input_gemm.join",
         "attention.qkv_insert",
-        "attention.qicm_join",
+        "attention.qkv_insert_compress.join",
+        "attention.q_projection",
+        "attention.qnorm_rope_kv_insert",
+        "attention.indexer_prepare_cache.join",
         "attention.q_index_compress_mla",
         "attention.output_projection",
+        "attention.output_projection.inv_rope_wo_a",
+        "attention.output_projection.wo_b",
         "indexer.paged_logits",
-        "indexer.query_cache_join",
         "indexer.topk",
-        "moe.fused_route_experts",
         "moe.routed_experts",
-        "moe.shared_experts.compute",
-        "moe.shared_experts.join",
+        "moe.shared_experts",
+        "moe.shared_experts.wait",
         "moe.shared_experts.w13",
         "moe.shared_experts.activation",
         "moe.shared_experts.w2",
-        "moe.marlin.w13_gemm",
-        "moe.marlin.w2_gemm",
+        "moe.mxfp4_sm80.routing_cast",
+        "moe.mxfp4_sm80.align",
+        "moe.mxfp4_sm80.w13_quant",
+        "moe.mxfp4_sm80.w13_gemm",
+        "moe.mxfp4_sm80.activation",
+        "moe.mxfp4_sm80.w2_quant",
+        "moe.mxfp4_sm80.w2_gemm",
+        "moe.mxfp4_sm80.reduce",
         "sparse_mla.attention",
     },
     "dspark": {
@@ -112,8 +129,14 @@ LAYER_COMPONENTS = (
 MODEL_COMPONENTS = (
     "layer.total",
     "model.embedding",
+    "model.pp_state_import",
+    "model.engram_hash",
+    "model.engram_prepare",
     "model.aux_reconstruct",
     "model.stage_reconstruct",
+    "model.final_reconstruct",
+    "model.pp_state_export",
+    "model.final_collapse",
     "model.hc_head",
     "model.final_norm",
 )
@@ -922,10 +945,12 @@ def render_flow_markdown(flow: str, summary: dict[str, Any]) -> str:
     elif flow in {"dspark", "dflash"}:
         draft_name = "DSpark" if flow == "dspark" else "DFlash"
         rank_note = (
-            "The target q8 verification traverses PP0/PP1/PP2 and remains in the "
+            "The target q8 verification traverses the configured PP ranks and "
+            "remains in the "
             f"decode flow. Target sampling and the {draft_name} proposal then "
             "execute on "
-            "PP2. The cycle section combines only sibling top-level GPU scopes; "
+            "the last PP rank. The cycle section combines only sibling top-level "
+            "GPU scopes; "
             "nested rows must not be added."
         )
     else:
@@ -1218,27 +1243,36 @@ def _render_draft_details(flow: str, summary: dict[str, Any]) -> list[str]:
 
 
 def _render_decode_details(summary: dict[str, Any]) -> list[str]:
+    pp_ranks = sorted(
+        {
+            pp_rank
+            for row in summary["round_summary"]
+            for pp_rank in row["rank_latency_us"]
+        },
+        key=int,
+    )
+    rank_headers = " | ".join(f"PP{pp_rank} mean/p50/p90 ms" for pp_rank in pp_ranks)
+    rank_separator = "|---:|---:" + "|---:" * len(pp_ranks) + "|---:|---:|---|"
     lines = [
         "",
         "## Target verification rounds",
         "",
         (
-            "A production seven-token speculative round carries up to eight tokens. "
-            "Its PP stages form a dependency chain, so the aligned PP model "
+            "A target decode round carries one or more tokens. Its PP stages form a "
+            "dependency chain, so the aligned PP model "
             "ranges are additive; the slowest-stage column remains a balance "
             "diagnostic."
         ),
         "",
         (
-            "| Tokens | Rounds | PP0 mean/p50/p90 ms | PP1 mean/p50/p90 ms | "
-            "PP2 mean/p50/p90 ms | PP serial mean/p50/p90 ms | "
+            f"| Tokens | Rounds | {rank_headers} | PP serial mean/p50/p90 ms | "
             "Slowest mean/p50/p90 ms | Slowest ranks |"
         ),
-        "|---:|---:|---:|---:|---:|---:|---:|---|",
+        rank_separator,
     ]
     for row in summary["round_summary"]:
         rank_text = []
-        for pp_rank in ("0", "1", "2"):
+        for pp_rank in pp_ranks:
             latency = row["rank_latency_us"].get(pp_rank)
             rank_text.append(
                 "-"
@@ -1253,9 +1287,10 @@ def _render_decode_details(summary: dict[str, Any]) -> list[str]:
             f"PP{rank}:{count}" for rank, count in row["critical_rank_counts"].items()
         )
         lines.append(
-            f"| {row['token_count']} | {row['round_count']} | {rank_text[0]} | "
-            f"{rank_text[1]} | {rank_text[2]} | "
-            f"{row['pipeline_mean_us'] / 1000:.3f}/"
+            f"| {row['token_count']} | {row['round_count']} | "
+            + " | ".join(rank_text)
+            + " | "
+            + f"{row['pipeline_mean_us'] / 1000:.3f}/"
             f"{row['pipeline_p50_us'] / 1000:.3f}/"
             f"{row['pipeline_p90_us'] / 1000:.3f} | "
             f"{row['critical_mean_us'] / 1000:.3f}/"
@@ -1266,17 +1301,17 @@ def _render_decode_details(summary: dict[str, Any]) -> list[str]:
     lines.extend(
         [
             "",
-            "## Serial PP3 model-work decomposition",
+            f"## Serial PP{len(pp_ranks)} model-work decomposition",
             "",
             (
                 "The same stage is summed across PP ranks because a single decode "
-                "target pass traverses PP0, PP1, then PP2. Parent and child levels "
+                "target pass traverses the PP ranks serially. Parent and child levels "
                 "still overlap and must not be added to each other."
             ),
             "",
             (
                 "| Stage | Level | PP ranks | Events | Per target round ms | "
-                "PP3 model share |"
+                f"PP{len(pp_ranks)} model share |"
             ),
             "|---|---:|---|---:|---:|---:|",
         ]
@@ -1432,10 +1467,18 @@ def _render_decode_details(summary: dict[str, Any]) -> list[str]:
         "attention.qkv_rmsnorm",
         "attention.q_index_compress_mla",
         "attention.qkv_insert",
+        "attention.q_projection",
+        "attention.qnorm_rope_kv_insert",
         "attention.indexer_branch",
         "attention.mla_compressor_branch",
         "attention.qicm_join",
         "indexer.query_prepare",
+        "indexer.k_projection",
+        "indexer.k_norm_rope_store",
+        "indexer.q_projection",
+        "indexer.q_rope_quant",
+        "attention.indexer",
+        "indexer.candidate_blocks",
         "indexer.compress_cache",
         "indexer.query_cache_join",
         "indexer.select",

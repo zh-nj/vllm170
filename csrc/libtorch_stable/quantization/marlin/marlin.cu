@@ -25,6 +25,8 @@
 
 #include "kernel.h"
 
+#include <cstdlib>
+
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
@@ -425,18 +427,59 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   if (prob_n <= 4096) max_par = 16 * 8;
   int max_shared_mem_new = max_shared_mem;
   int rest_m = prob_m;
-  int max_thread_m_blocks = 4;
+  // VLLM_MARLIN_M_ALIGN pins the M-tile height so that the K accumulation order
+  // no longer depends on how many rows the batch happens to have.
+  //
+  // thread_m_blocks is derived from prob_m below, so a row accumulates over K
+  // in a different order for M<=16, M in 17..112 and M>=128. The GEMM output
+  // therefore changes with the batch shape by around one bf16 ULP. For a model
+  // whose logits sit on near ties that is enough to flip the argmax, so a
+  // batched prefill and a solo prefill can disagree. Pinning the tile to the
+  // M<=16 geometry makes every M accumulate the same way.
+  //
+  // The value is the rows per launch. 1 means the default 16-row chunk; a wider
+  // chunk is also accepted because re-reading the weight matrix once per launch
+  // is the whole cost of this knob, so wider is cheaper. It must stay narrow
+  // enough that prob_m_split never exceeds the 16-row tile height, otherwise
+  // the kernel's `parallel` stride stops matching the solo geometry.
+  //
+  // Rows <= 8 are left alone: they take the m_block_size_8 kernel, which is the
+  // decode path and is already uniform across requests; forcing the wide tile
+  // there would cost decode throughput for nothing.
+  //
+  // Above kAlignMaxM the knob is also left alone, and that is deliberate. The
+  // chunked launch re-reads the weight matrix once per launch, which measured
+  // +177% on this shape at M=2048 (1922 -> 7318 us) -- acceptable for the short
+  // prefills that hit the argmax flip, not for long ones. Aligning a long
+  // prefill was also observed to change its answer rather than stabilise it, so
+  // the cost buys nothing there.
+  static constexpr int kAlignMaxM = 128;
+  static const int marlin_m_align = [] {
+    const char* v = std::getenv("VLLM_MARLIN_M_ALIGN");
+    return v != nullptr ? std::atoi(v) : 0;
+  }();
+  const bool align_m = marlin_m_align > 0 && prob_m > 8 && prob_m <= kAlignMaxM;
+  const int align_chunk = marlin_m_align > 1 ? marlin_m_align : 16;
+  int max_thread_m_blocks = align_m ? 1 : 4;
   while (rest_m) {
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;
     int prob_m_split =
         par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
+    if (align_m) {
+      // One M-tile per launch, so prob_m_split never exceeds the tile height
+      // and the kernel's `parallel` stride stays 0 exactly as it is for a solo
+      // batch of at most 16 rows; without this, a 56-row batch would be
+      // launched as one 48-row tile with parallel=3 and round differently.
+      prob_m_split = min(rest_m, align_chunk);
+    }
 
     int thread_k = thread_k_init;
     int thread_n = thread_n_init;
 
     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
-    int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
+    int m_block_size_8 =
+        !align_m && prob_m_split <= 8 && a_type.size_bits() == 16;
 
     // Set thread config
     exec_config_t exec_cfg;

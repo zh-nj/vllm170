@@ -569,6 +569,8 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
+            if desc.cg_mode == CUDAGraphMode.FULL:
+                model_state.prepare_full_cudagraph_inputs(model_inputs, attn_metadata)
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None

@@ -4,15 +4,20 @@
 from types import SimpleNamespace
 from typing import cast
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
-from vllm.config import SpeculativeConfig
+from vllm.config import KernelConfig, SpeculativeConfig, VllmConfig
+from vllm.config.speculative import verify_distributed_dspark_stage_ranks
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import _needs_pre_hc_hidden_states
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    _get_dspark_kernel_config,
     _is_materialized_embedding,
 )
 
@@ -94,3 +99,138 @@ def test_pre_hc_hidden_states_skip_dspark_only() -> None:
 def test_pp_missing_layer_is_not_a_materialized_embedding() -> None:
     assert _is_materialized_embedding(torch.nn.Embedding(4, 8))
     assert not _is_materialized_embedding(PPMissingLayer())
+
+
+@pytest.mark.cpu_test
+def test_dspark_uses_independent_moe_backend() -> None:
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(moe_backend="marlin"),
+        kernel_config=KernelConfig(moe_backend="mxfp4_int8_sm80"),
+    )
+
+    draft_kernel_config = _get_dspark_kernel_config(cast(VllmConfig, vllm_config))
+
+    assert draft_kernel_config.moe_backend == "marlin"
+    assert vllm_config.kernel_config.moe_backend == "mxfp4_int8_sm80"
+
+
+def test_distributed_dspark_stage_ranks_accept_pp1_through_pp3() -> None:
+    verify_distributed_dspark_stage_ranks([1, 2, 3], 3, 5)
+
+
+@pytest.mark.parametrize(
+    ("computed", "scheduled", "prefill", "expected"),
+    [
+        ([0], [4], [10], True),
+        ([0], [10], [10], False),
+        ([0, 10], [4, 1], [10, 11], False),
+        ([], [], [], False),
+    ],
+)
+def test_distributed_dspark_skips_only_intermediate_prefill(
+    computed: list[int],
+    scheduled: list[int],
+    prefill: list[int],
+    expected: bool,
+) -> None:
+    input_batch = SimpleNamespace(
+        num_reqs=len(computed),
+        num_computed_prefill_tokens_np=np.asarray(computed, dtype=np.int32),
+        num_scheduled_tokens=np.asarray(scheduled, dtype=np.int32),
+        prefill_len_np=np.asarray(prefill, dtype=np.int32),
+    )
+
+    assert GPUModelRunner._is_all_reqs_chunked_prefill(input_batch) is expected
+
+
+@pytest.mark.parametrize(
+    "stage_ranks",
+    ([1, 2], [1, 1, 3], [2, 1, 3], [1, 2, 4], [-1, 1, 2]),
+)
+def test_distributed_dspark_stage_ranks_reject_invalid_layout(stage_ranks) -> None:
+    with pytest.raises(ValueError):
+        verify_distributed_dspark_stage_ranks(stage_ranks, 3, 5)
+
+
+def test_distributed_dspark_accepts_matching_batch_identity() -> None:
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator._distributed_step_id = 17
+    input_batch = SimpleNamespace(req_ids=["req-a", "req-b"], num_reqs=2)
+
+    speculator._validate_distributed_package(
+        {
+            "scheduler_step_id": 17,
+            "dummy_run": False,
+            "req_ids": ("req-a", "req-b"),
+            "num_reqs": 2,
+        },
+        input_batch,
+    )
+
+
+def test_distributed_dspark_ignores_local_dummy_request_ids() -> None:
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator._distributed_step_id = -1
+    input_batch = SimpleNamespace(req_ids=["local-dummy"], num_reqs=1)
+
+    speculator._validate_distributed_package(
+        {
+            "scheduler_step_id": -1,
+            "dummy_run": True,
+            "req_ids": ("remote-dummy",),
+            "num_reqs": 1,
+        },
+        input_batch,
+    )
+
+
+@pytest.mark.parametrize(
+    ("package", "match"),
+    [
+        (
+            {
+                "scheduler_step_id": 18,
+                "dummy_run": False,
+                "req_ids": ("req-a",),
+                "num_reqs": 1,
+            },
+            "scheduler step mismatch",
+        ),
+        (
+            {
+                "scheduler_step_id": 17,
+                "dummy_run": False,
+                "req_ids": ("req-b",),
+                "num_reqs": 1,
+            },
+            "request batch mismatch",
+        ),
+        (
+            {
+                "scheduler_step_id": 17,
+                "dummy_run": False,
+                "req_ids": ("req-a",),
+                "num_reqs": 2,
+            },
+            "request count mismatch",
+        ),
+        (
+            {
+                "scheduler_step_id": 17,
+                "dummy_run": True,
+                "req_ids": ("req-a",),
+                "num_reqs": 1,
+            },
+            "dummy-run marker mismatch",
+        ),
+    ],
+)
+def test_distributed_dspark_rejects_batch_identity_drift(
+    package: dict[str, object], match: str
+) -> None:
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator._distributed_step_id = 17
+    input_batch = SimpleNamespace(req_ids=["req-a"], num_reqs=1)
+
+    with pytest.raises(RuntimeError, match=match):
+        speculator._validate_distributed_package(package, input_batch)

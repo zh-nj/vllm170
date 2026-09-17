@@ -346,8 +346,8 @@ def build_result(
         "repeat_count": args.repeats,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
-        "pp_size": 3,
-        "tp_size": 1,
+        "pp_size": int(os.getenv("DSV4_PP_SIZE", "3")),
+        "tp_size": int(os.getenv("DSV4_TP_SIZE", "1")),
         "dspark_tokens": int(os.getenv("DSV4_DSPARK_TOKENS", "0")),
         "dspark_draft_sample_method": os.getenv(
             "DSV4_DSPARK_DRAFT_SAMPLE_METHOD", "greedy"
@@ -394,11 +394,23 @@ def build_result(
         "sparse_decode_split": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1"))
         ),
+        "sm80_decode_num_splits": int(
+            os.getenv("VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", "0")
+        ),
+        "decode_topk_cache": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE", "0"))
+        ),
         "direct_ragged_swa": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", "1"))
         ),
+        "paged_decode_swa": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_PAGED_DECODE_SWA", "1"))
+        ),
         "direct_ragged_c128": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128", "1"))
+        ),
+        "engram_gpu_dequant": bool(
+            int(os.getenv("VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT", "0"))
         ),
         "dspark_kv_only_insert": bool(
             int(os.getenv("VLLM_DEEPSEEK_V4_DSPARK_KV_ONLY_INSERT", "1"))

@@ -274,6 +274,20 @@ def test_decode_round_summary_accepts_graph_replay_totals() -> None:
     assert replay["pp_ranks"] == [0, 1, 2]
 
 
+def test_decode_markdown_uses_configured_pp_width() -> None:
+    records = []
+    for pp_rank in range(5):
+        row = _row("decode", "target.model_forward", pp_rank, 100 + pp_rank)
+        row.update(step_id=0, token_count=1, level="total")
+        records.append(row)
+
+    summary = phase_profile_analyze.analyze_phase_records(records)["flows"]["decode"]
+    markdown = phase_profile_analyze.render_flow_markdown("decode", summary)
+
+    assert "PP4 mean/p50/p90 ms" in markdown
+    assert "## Serial PP5 model-work decomposition" in markdown
+
+
 def test_dspark_separates_prefill_proposals_and_builds_cycle_floor() -> None:
     records = []
     for pp_rank, model_us in enumerate((10, 20, 30)):

@@ -1818,6 +1818,59 @@ def test_mxfp4_emulation_rounds_up_to_block_size(
     assert rounded_intermediate % OCP_MX_BLOCK_SIZE == 0
 
 
+def test_mxfp4_marlin_inplace_replaces_weights_before_next_repack(monkeypatch):
+    """Keep Marlin conversion from retaining both source MoE matrices."""
+    from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4
+
+    layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
+    layer.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(
+            torch.zeros((2, 8, 4), dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        torch.nn.Parameter(
+            torch.zeros((2, 8, 2), dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    for name in ("w13_weight_scale", "w2_weight_scale"):
+        layer.register_parameter(
+            name,
+            torch.nn.Parameter(
+                torch.zeros((2, 8, 1), dtype=torch.uint8), requires_grad=False
+            ),
+        )
+
+    repacked_ptrs: list[int] = []
+
+    def fake_repack(weight, size_n, size_k, perm, is_a_8bit):
+        del size_n, size_k, perm, is_a_8bit
+        if repacked_ptrs:
+            assert layer.w13_weight.data_ptr() == repacked_ptrs[0]
+        output = weight.clone()
+        repacked_ptrs.append(output.data_ptr())
+        return output
+
+    monkeypatch.setattr(marlin_utils_fp4, "get_marlin_input_dtype", lambda: None)
+    monkeypatch.setattr(marlin_utils_fp4, "_repack_marlin_experts", fake_repack)
+    monkeypatch.setattr(
+        marlin_utils_fp4, "marlin_permute_scales", lambda s, **kwargs: s.contiguous()
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp4,
+        "mxfp4_marlin_process_scales",
+        lambda scales, input_dtype=None: scales,
+    )
+
+    marlin_utils_fp4.prepare_moe_mxfp4_layer_for_marlin_inplace(layer)
+
+    assert layer.w13_weight.data_ptr() == repacked_ptrs[0]
+    assert layer.w2_weight.data_ptr() == repacked_ptrs[1]
+
+
 def test_select_mxfp4_moe_backend_raises_with_unsupported_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ):
