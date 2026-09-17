@@ -4,6 +4,7 @@
 
 import math
 import mmap
+import os
 from contextlib import suppress
 from pathlib import Path
 
@@ -20,11 +21,35 @@ def host_available_bytes():
     return int(info["MemAvailable"].split()[0]) * 1024
 
 
+HOST_HEADROOM_GIB = 64
+"""Free host memory that must remain while resident weights are allocated.
+
+The upstream default assumes a host large enough for two Engram tables plus a
+wide safety margin. A smaller host can lower it through
+``VLLM_DSV41_HOST_HEADROOM_GIB``; the guard still fails closed well before the
+kernel OOM killer would be reached.
+"""
+
+
+def host_headroom_bytes() -> int:
+    raw = os.environ.get("VLLM_DSV41_HOST_HEADROOM_GIB")
+    if raw is None:
+        return HOST_HEADROOM_GIB * GiB
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError("VLLM_DSV41_HOST_HEADROOM_GIB must be numeric") from None
+    if value < 1:
+        raise ValueError("VLLM_DSV41_HOST_HEADROOM_GIB must be at least 1 GiB")
+    return int(value * GiB)
+
+
 def check_host_headroom(additional_bytes=0):
-    if host_available_bytes() < 64 * GiB + additional_bytes:
+    headroom = host_headroom_bytes()
+    if host_available_bytes() < headroom + additional_bytes:
         raise RuntimeError(
             "DeepSeek hybrid host allocation stopped before exhausting RAM: "
-            "64 GiB of available memory must remain"
+            f"{headroom / GiB:.1f} GiB of available memory must remain"
         )
     entry = next(
         (

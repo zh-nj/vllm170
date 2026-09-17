@@ -21,6 +21,9 @@ export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-8,8,8,8,8}
+# This host has ~252 GiB RAM; the branch's default 64 GiB spare-RAM guard
+# would reject the two resident Engram tables (2 x 94.42 GiB) outright.
+export VLLM_DSV41_HOST_HEADROOM_GIB=${VLLM_DSV41_HOST_HEADROOM_GIB:-12}
 
 PORT_PORT=${PORT_PORT:-26663}
 PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
