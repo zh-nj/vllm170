@@ -44,7 +44,7 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -86,25 +86,56 @@ class DSparkDeepseekV4Model(nn.Module):
             or 3
         )
 
+        # Distributed draft placement: with ``dspark_pipeline_stage_ranks`` the
+        # draft blocks live on the listed target PP ranks and the projection,
+        # norm and output heads stay on the final rank. Without it every stage
+        # is a head-and-embedding rank and all blocks are local.
+        stage_ranks = vllm_config.speculative_config.dspark_pipeline_stage_ranks
+        self.distributed = stage_ranks is not None
+        pp_rank = get_pp_group().rank_in_group if self.distributed else -1
+        self.local_stage_indices = (
+            tuple(i for i, rank in enumerate(stage_ranks) if rank == pp_rank)
+            if stage_ranks is not None
+            else tuple(range(self.num_dspark_layers))
+        )
+        self.is_head_rank = not self.distributed or get_pp_group().is_last_rank
+        self.is_embedding_rank = stage_ranks is None or pp_rank == stage_ranks[0]
+
         # Shared with the target (aliased by the speculator's loading utility).
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+            if self.is_embedding_rank
+            else PPMissingLayer()
         )
 
-        self.main_proj = ReplicatedLinear(
-            config.hidden_size * len(self.target_layer_ids),
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "main_proj"),
+        self.main_proj = (
+            ReplicatedLinear(
+                config.hidden_size * len(self.target_layer_ids),
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "main_proj"),
+            )
+            if self.is_head_rank
+            else PPMissingLayer()
         )
-        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.main_norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if self.is_head_rank
+            else PPMissingLayer()
+        )
 
         self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            (
+                vllm_config.scheduler_config.max_num_batched_tokens
+                if self.local_stage_indices
+                else 0
+            ),
             config.index_topk,
             dtype=torch.int32,
         )
@@ -112,10 +143,16 @@ class DSparkDeepseekV4Model(nn.Module):
         current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
             [
-                DeepseekV4DecoderLayer(
-                    current_vllm_config,
-                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
-                    topk_indices_buffer=self.topk_indices_buffer,
+                (
+                    DeepseekV4DecoderLayer(
+                        current_vllm_config,
+                        prefix=maybe_prefix(
+                            prefix, f"layers.{self.num_hidden_layers + i}"
+                        ),
+                        topk_indices_buffer=self.topk_indices_buffer,
+                    )
+                    if i in self.local_stage_indices
+                    else PPMissingLayer()
                 )
                 for i in range(self.num_dspark_layers)
             ]
@@ -126,18 +163,26 @@ class DSparkDeepseekV4Model(nn.Module):
         # checkpoint. v4.1 has no learned hc_head: the hc copies are
         # collapsed with a pre-mix derived from the last layer's hc_ffn
         # projection at the end of forward().
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if self.is_head_rank
+            else PPMissingLayer()
+        )
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
-        self.markov_head = DSparkMarkovHead(
-            config.vocab_size,
-            draft_vocab_size,
-            config.dspark_markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
+        self.markov_head = (
+            DSparkMarkovHead(
+                config.vocab_size,
+                draft_vocab_size,
+                config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+            )
+            if self.is_head_rank
+            else PPMissingLayer()
         )
         self.confidence_head: DSparkConfidenceHead | None = None
-        if getattr(config, "enable_confidence_head", True):
+        if self.is_head_rank and getattr(config, "enable_confidence_head", True):
             self.confidence_head = DSparkConfidenceHead(
                 config.hidden_size + config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
@@ -154,6 +199,56 @@ class DSparkDeepseekV4Model(nn.Module):
         return self.main_norm(self.main_proj(aux_hidden_states))
 
     @torch.inference_mode()
+    def prepare_pipeline_query(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed and expand a query on the first distributed draft stage."""
+        if not self.is_embedding_rank:
+            raise RuntimeError("This DSpark rank does not own the embedding.")
+        inputs_embeds = self.embed_input_ids(input_ids)
+        return inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+
+    def forward_local_stage(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        pre_mix: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the decoder blocks owned by this distributed draft rank."""
+        if not self.distributed or not self.local_stage_indices:
+            raise RuntimeError("This rank does not own a distributed DSpark block.")
+        if self.use_sequence_parallel:
+            raise RuntimeError("Distributed DSpark does not support sequence parallel.")
+        for stage_index in self.local_stage_indices:
+            layer = self.layers[stage_index]
+            assert not isinstance(layer, PPMissingLayer)
+            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+            )
+        return hidden_states, residual, post_mix, res_mix, pre_mix
+
+    def finish_pipeline_query(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        pre_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct and collapse the final distributed draft state."""
+        if not self.is_head_rank:
+            raise RuntimeError("Only the DSpark head rank owns the output heads.")
+        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        return hc_collapse_triton(hidden_states, pre_mix)
+
     def precompute_and_store_context_kv(
         self,
         main_x: torch.Tensor,
@@ -192,6 +287,10 @@ class DSparkDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.distributed:
+            raise RuntimeError(
+                "Distributed DSpark must use the rank-local draft pipeline."
+            )
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         full_num_tokens = positions.shape[0]
@@ -309,7 +408,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
-        self.has_own_embed_tokens = not get_pp_group().is_first_rank
+        self.has_own_embed_tokens = self.model.is_embedding_rank
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
@@ -321,11 +420,18 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        # Shared with the target (aliased by the speculator's load utility).
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
+        self.is_dspark_head_rank = self.model.is_head_rank
+        self.is_dspark_embedding_rank = self.model.is_embedding_rank
+        # PP aliases the target head after draft loading, avoiding a transient
+        # full-vocabulary duplicate on every draft stage.
+        self.lm_head = (
+            ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if get_pp_group().world_size == 1
+            else PPMissingLayer()
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
