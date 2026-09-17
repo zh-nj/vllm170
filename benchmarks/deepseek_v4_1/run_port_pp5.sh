@@ -9,6 +9,11 @@
 # indexer K, top-k indices and candidate blocks inside the ordinary PP
 # message, which is what makes an 8,8,8,8,8 split legal. Distributed DSpark
 # (draft blocks on PP1..PP3, heads on PP4) is kept.
+#
+# Stopping the server: killing only the `vllm serve` parent leaves the five
+# `VLLM::Worker_PP*` processes holding ~62 GiB per card, and the next launch
+# then dies in WorkerProc init. Kill them too, e.g.
+#   pkill -f "[v]llm serve"; pkill -f "VLLM::Worker"
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
