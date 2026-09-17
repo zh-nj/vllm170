@@ -840,3 +840,83 @@ MoE 路由专家从现在的 126 ms 掉到实测带宽地板 72 ms 所能让出�
 
 ⇒ 交付状态可复现：默认配置的服务在 63k 上是 **~7,08x tok/s**。
 （短长度那一点 7% 的差属于上面记的实例间漂移，单次采样，不作结论。）
+
+---
+
+## 19. 第 13 轮：int8 路线（A8W4）相对 bf16 路线（A16W4）的精度验证 + MoE 主循环收口
+
+问题定义：同一份 MXFP4 权重有两条可服务的路线 —— 线上 `mxfp4_int8_sm80` 把 e2m1 码
+**重编码成 int8 操作数**（`±mag << shift`，配一个每通道 fp32 scale）并用 int8 张量核做 A8W4；
+Marlin 的 `use_mxfp4_w4a16` 路线把权重**解量化成 bf16** 做 A16W4。必须验证前者精度。
+工具（本轮新增，都在 `benchmarks/`）：`kernels/deepseek_v41_mxfp4_int8_accuracy.py`（权重 + 整层 MLP
+两档）、`deepseek_v4/compare_moe_numerics.py`（跨后端的线上贪心/prompt-logprob 对照）。
+
+### 19.1 权重侧：int8 重编码在生产配置下**是无损的**
+
+真实 checkpoint（`layers.N.ffn.experts.E.{w1,w3,w2}.{weight,scale}`，e8m0 每 32 元素一个）：
+8 层 × 4 专家 × {w13, w2} = 64 个张量 / 1.13e9 个权重，`headroom_bits=3`（生产值）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 与精确 mxfp4 反量化逐元素相同 | **56/64 个张量误差恰好为 0** |
+| rel-L2（浮点，我独立实现） | mean 8e-5，max 2.1e-3（L39 e383 w2） |
+| 码字 exact_rate（仓库自带 `compute_mxfp4_int8_remap_stats`） | 100% 或 99.991–99.999% |
+| 被置零（`delta > headroom`）的权重占比 | 0.0000%–0.0299%，且只出现在 8 个张量里 |
+| headroom 扫描（mean rel-L2） | h1 5.6e-3 / h2 4.7e-4 / **h3 8e-5（最优，生产即取此值）** |
+
+机理：e2m1 的幅值集合 {0,1,2,3,4,6,8,12}（×2 表）全部可写成 `mag << shift`，`shift ≤ 3` ⇒ 幅值上限
+96 < 127，所以"mxfp4 → int8"只是**换一种写法**；只有当某个 32 元素块的指数比该输出通道的最大指数
+低 4 以上时，那个权重才会被置零（headroom=3 已是 int8 能表达的极限，h4 以上放不下）。
+
+### 19.2 整层数值：代价**全部**来自 int8 激活量化
+
+`moe` 模式：真实第 6 层 16 个专家、256 token、topk 6、fp32 参考矩阵乘，参考是 A16W4e
+（bf16 激活 × 精确 mxfp4 权重，即 Marlin W4A16 的语义）：
+
+| 配置 | rel-L2 | max&#124;Δ&#124; | cosine |
+| --- | ---: | ---: | ---: |
+| A16W4r（bf16 激活 × int8 路线权重） | 0.00161 | 0.0102 | 0.999999 |
+| A8W4e（int8 激活 × 精确权重） | 0.02737 | 0.152 | 0.999626 |
+| **A8W4r（线上路线）** | **0.02733** | 0.151 | **0.999627** |
+
+⇒ 权重重编码只贡献 0.16%，**激活 int8 量化贡献 2.74%**，两者几乎正交相加。
+所以"用 int8 而不是 bf16"的精度代价 = **每 token 对称 int8 激活量化**，约 2.7% 的 MoE 输出相对误差
+（cosine 0.9996），**与权重格式无关**（权重那条路是精确的）。
+
+顺带钉死一条硬件事实：`--moe-backend marlin`（bf16 路线）在本配置下**起不来** —— worker 启动阶段
+`Cuda failure 2 'out of memory'`（63 GiB/rank）。int8 路线不只是更快，它也是这块卡上唯一装得下的路线。
+
+### 19.3 主循环：四个可动项全部测过，零或负
+
+在真实 170HX 上（tile (64,128)，2048 token，CUDA graph，20 次采样）：
+
+| 实验 | 结果 |
+| --- | --- |
+| 基线 | w13 11.60 + w2 6.16 = **17.78 ms/层**（6.79 GB / 17.78 ms = **382 GB/s**） |
+| **解码消融**（把 mxfp4→int8 那 14 条 ALU 换成 1 条搬运，结果故意算错） | 11.70 + 6.21 = 17.91 ms ⇒ **解码被完全掩盖，不是 ALU 瓶颈** |
+| 新增 tile **(64,256)**（8 warp/CTA、CTA 数减半、每 stage 25 KB、占用率 12→16 warp/SM） | 18.65 ms ⇒ **慢 5%**（输出与 (16,128) 逐位相同 ⇒ tile 本身是对的） |
+| kStages 3→4 / grid m-fastest→n-fastest / bm32（§7.2、§12.1） | 1.00× / 1.01× / −17% |
+
+### 19.4 诊断边界（把"没做成的事"写清楚）
+
+- 卡片 roofline 实测：D2D copy 512 MB → **1,303 GB/s**（读+写），fp32 read+write 1,300 GB/s。
+  内核只用 382 GB/s ⇒ 约为 roofline 的 **30%**。
+- mma 管道：每层 4.35e11 MACs ÷ 4096 = 1.06e8 条 mma；70 SM × 0.5 mma/cycle × 1.41 GHz ⇒ 理论
+  **2.15 ms/层**，实测 17.78 ms ⇒ **张量核只有 12% 忙**。
+- ALU（消融）、DRAM（30% roofline）、mma（12%）三项都不是瓶颈 ⇒ 剩下的是**依赖/延迟/占用率**
+  （4 warp/CTA、~50 KB smem/CTA ⇒ 3 CTA/SM、每 K-tile 一次 `__syncthreads()`），要定位必须上硬件计数器。
+- **硬件计数器在这台机器上不可用**：`ncu` 直接拒绝 ——
+  `ERR_NVCMPGPU: Profiling is not supported on the NVIDIA Crypto Mining Processors (CMP) of the target device`。
+  这是 CMP SKU 的固有限制（不是配置问题），`nsys` 只能给时间线、给不了 stall 原因。
+- ⇒ **MoE 主循环在这台机器上已到"盲调"的尽头**：tile 形状、stage 深度、解码 ALU、网格顺序四类全部试完
+  且都是零/负；继续往前要么换成非 CMP 的 GA100 做 SASS 级调优，要么按 §17.3 的算法级改动（更大 chunk
+  摊薄每 step 的权重流）走 —— 但后者要连注意力/索引器一起还账。
+
+### 19.5 本轮的可交付物
+
+- `benchmarks/kernels/deepseek_v41_mxfp4_int8_accuracy.py`：真实权重的重编码精度 + 整层 MLP 的
+  int8/bf16 分解误差（`weights` / `moe` 两种模式，可直接复跑）。
+- `benchmarks/deepseek_v4/compare_moe_numerics.py`：跨后端线上对照（贪心 token 一致率 +
+  每个 prompt token 的 logprob 差），用来在换后端/换内核后做"数值是否变了"的回归。
+- 结论：**int8 路线精度可用**（权重无损、总代价 ~2.7% MoE 输出 rel-L2、cosine 0.9996），
+  **主循环性能已无可调之处**（除非换掉 CMP 卡或有 profiler 的机器）。
