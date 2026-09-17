@@ -620,3 +620,35 @@ forward 内部（第 6 轮 profiled 值，按 −20 ms profiler 开销折算）�
 - phase profiler（250 个 stage × 每步 flush 一次 sync）把每步周期从 ~326 ms 抬到 ~435 ms；
 - 自建分段插桩若每步 `synchronize()` 也会抬到 ~540 ms 并让"每步周期"这个指标本身失真；
 - 只保留"一对 event 量 forward + 端到端墙钟"两个数，二者相减才是可信的往返开销。
+
+---
+
+## 15. 第 10 轮：那 85 ms 往返的内部结构（PP 等待 ~50 ms + 引擎循环 ~38 ms）
+
+沿用"每步一对 event + 三个 host 时间戳（step 入口 / 模型调用前 / 模型调用后）"的轻量插桩
+（每 5 步才 synchronize 一次），得到每 rank 的分段（2048 token/step，prefill 稳态）：
+
+| rank | pre（收到上游中间张量前的时间） | GPU forward | post + 到下一步的间隔 |
+| --- | ---: | ---: | ---: |
+| PP0 | **0.0 ms** | 232 ms | 252–260 ms |
+| PP3 | **49–54 ms** | 233–238 ms | 204–224 ms |
+
+两个新事实：
+
+1. **rank≥1 每步要等 ~50 ms 才拿到上游的 hidden states**（rank0 为 0，符合预期）。
+   这就是"PP 交接"在真实（unprofiled）运行里的量级。
+   ⚠️ 前几轮 profiler 给出的 `target.pp_recv_wait` 只有 2 ms **是错的**：phase profiler 每步
+   flush 会 synchronize 一次，把流水线抽干，等待被"摊平"到 forward 里去了。
+2. 引擎侧 `max_concurrent_batches = pp_size = 5`（`vllm/config/vllm.py:572`），即 batch queue
+   深度已等于 PP 层数 —— 流水线已经是"每 rank 处理不同 batch"的满载状态，没有可再挖的深度。
+
+⇒ 每步 326 ms 现在是完整可解释的：
+
+```
+326 ms = 232 (GPU forward) + 50 (PP 等待/交接) + ~44 (引擎循环 + 采样 + 调度 + 抖动)
+         └ MoE 126 + 注意力 97 + hc 16 + 共享专家 11.6（+metadata 10.8）
+```
+
+**优化含义**：50 ms 的 PP 等待由 84 MB/step 的 `hidden_states (2048×4×5120 bf16)` 交接决定
+（PCIe Gen2 x16，无 NVLink）；要压它只有三条路：更快的链路（硬件）、更小的载荷（改模型契约）、
+或更深的流水（引擎已经 5 层满载）。44 ms 的引擎循环同理属引擎工程。
