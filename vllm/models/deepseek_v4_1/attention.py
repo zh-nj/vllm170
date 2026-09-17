@@ -355,6 +355,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compress_ratio=self.compress_ratio,
         )
         self.indexer_rotary_emb = self.rotary_emb
+        # Exposed so a PP stage can forward the source layer's
+        # compressed latent to consumers placed on a later rank.
+        self._last_compressed_latent: torch.Tensor | None = None
         self.topk_indices_buffer = topk_indices_buffer
         self.candidate_block_buffer = candidate_block_buffer
 
@@ -701,6 +704,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             q = project_query_and_cache_kv()
 
+        self._last_compressed_latent = latent
+
         def prepare_indexer():
             if indexer is None:
                 return None, None, None
@@ -966,6 +971,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return source.kv_cache
 
 
+class DeepseekV4PPCompressedCache(torch.nn.Module, AttentionLayerBase):
+    """Compressed-KV cache replica for a source layer on an earlier PP rank."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        compress_ratio: int,
+        backend_cls: type[AttentionBackend],
+        use_fp8_ds_mla_layout: bool,
+    ) -> None:
+        super().__init__()
+        cache_config = vllm_config.cache_config
+        assert cache_config is not None
+        self.prefix = prefix
+        self.compress_ratio = compress_ratio
+        self.backend_cls = backend_cls
+        self.head_dim = 512
+        self.kv_cache_dtype, self.dtype = _resolve_dsv4_kv_cache_dtype(
+            use_fp8_ds_mla_layout, cache_config.cache_dtype, cache_config
+        )
+        self.kv_cache = torch.tensor([])
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        self.kv_cache = kv_cache.squeeze(1)
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self.backend_cls
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.dtype,
+            tokens_per_state=self.compress_ratio,
+            cache_dtype_str=self.kv_cache_dtype,
+            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+        )
+
+    def forward(self): ...
+
+
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self,
@@ -1124,6 +1180,10 @@ class DeepseekV4Indexer(nn.Module):
             candidate_write=candidate_write,
             num_heads=self.n_head,
         )
+        # Set by the model when a later PP stage consumes this index source's
+        # keys: the store kernel then also returns the normalized rows.
+        self.export_normalized_k = False
+        self._last_normalized_k: torch.Tensor | None = None
 
     def _produce_k(
         self,
@@ -1136,6 +1196,7 @@ class DeepseekV4Indexer(nn.Module):
         ``k_norm(wk(latent))`` at group-boundary tokens, RoPE'd at the group
         position and MXFP4/FP8-quantized into the indexer K cache.
         """
+        self._last_normalized_k = None
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict) or latent is None:
             # Profile run: the indexer K cache is not bound yet and the
@@ -1147,7 +1208,7 @@ class DeepseekV4Indexer(nn.Module):
         # non-boundary tokens hold garbage latent and are skipped by the
         # store kernel.
         k_pre, _ = self.wk(latent)
-        indexer_k_norm_rope_store(
+        self._last_normalized_k = indexer_k_norm_rope_store(
             k_pre,
             positions,
             rotary_emb.cos_sin_cache,
@@ -1157,6 +1218,7 @@ class DeepseekV4Indexer(nn.Module):
             indexer_metadata.slot_mapping,
             self.compress_ratio,
             self.use_fp4_kv,
+            return_normalized=getattr(self, "export_normalized_k", False),
         )
 
     def forward(

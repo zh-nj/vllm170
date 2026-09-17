@@ -31,13 +31,16 @@ def indexer_k_norm_rope_store(
     k_pre: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
-    rms_norm_weight: torch.Tensor,
+    rms_norm_weight: torch.Tensor | None,
     rms_norm_eps: float,
     k_cache: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     compress_ratio: int,
     use_fp4_cache: bool,
-) -> None:
+    *,
+    input_is_normalized: bool = False,
+    return_normalized: bool = False,
+) -> torch.Tensor | None:
     """k_norm → RoPE → quant → paged store for indexer keys.
 
     Args:
@@ -46,12 +49,21 @@ def indexer_k_norm_rope_store(
         positions: [num_tokens] int64 token positions.
         cos_sin_cache: [max_pos, rope_head_dim] GPT-J layout (cos half, then
             sin half), from the layer's compress-RoPE instance.
-        rms_norm_weight: [128] k_norm weight.
+        rms_norm_weight: [128] k_norm weight, or None when
+            ``input_is_normalized`` is True.
         k_cache: uint8 paged indexer cache [num_blocks, block_size, row_bytes].
         kv_slot_mapping: [num_tokens] slots in the indexer cache (-1 = skip).
         compress_ratio: group size; keys are emitted at group boundaries.
         use_fp4_cache: MXFP4 (2 nibbles/byte + ue8m0 per 32) when True, else
             per-token FP8 with a single fp32 scale.
+        input_is_normalized: Treat ``k_pre`` as the BF16 output of k_norm.
+            This is used when a PP rank imports a key produced upstream.
+        return_normalized: Return the BF16 normalized key rows before RoPE.
+            Non-boundary rows are unspecified and ignored by import kernels.
+
+    Returns:
+        The normalized key rows when ``return_normalized`` is True, otherwise
+        None.
     """
     num_tokens = kv_slot_mapping.numel()
     assert k_pre.ndim == 2 and k_pre.shape[1] == 128
@@ -59,7 +71,13 @@ def indexer_k_norm_rope_store(
     assert num_tokens <= k_pre.shape[0] and num_tokens <= positions.numel()
     assert compress_ratio in (1, 2)
     if num_tokens == 0:
-        return
+        return torch.empty_like(k_pre) if return_normalized else None
+    if input_is_normalized:
+        assert rms_norm_weight is None
+    else:
+        assert rms_norm_weight is not None
+
+    normalized_out = torch.empty_like(k_pre) if return_normalized else None
 
     head_dim = k_pre.shape[1]
     if use_fp4_cache:
@@ -101,6 +119,7 @@ def indexer_k_norm_rope_store(
         cos_sin_cache.stride(0),
         k_cache,
         kv_slot_mapping,
+        normalized_out,
         k_cache.shape[1],
         HEAD_SIZE=head_dim,
         ROPE_HEAD_DIM=64,
@@ -110,12 +129,15 @@ def indexer_k_norm_rope_store(
         KV_BLOCK_STRIDE=k_cache.stride(0),
         FP8_MAX=448.0,
         USE_FP4=use_fp4_cache,
+        INPUT_IS_NORMALIZED=input_is_normalized,
+        STORE_NORMALIZED=return_normalized,
         SHUFFLE=shuffle,
         BLOCK_TILE_SIZE=_BLOCK_TILE_SIZE,
         HEAD_TILE_SIZE=_HEAD_TILE_SIZE,
         num_warps=1,
         **launch_kwargs,
     )
+    return normalized_out
 
 
 @triton.jit
@@ -129,6 +151,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
     cos_sin_stride,
     k_cache_ptr,
     kv_slot_mapping_ptr,
+    normalized_out_ptr,
     kv_cache_block_size,
     HEAD_SIZE: tl.constexpr,
     ROPE_HEAD_DIM: tl.constexpr,
@@ -138,6 +161,8 @@ def _indexer_k_norm_rope_quant_store_kernel(
     KV_BLOCK_STRIDE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FP4: tl.constexpr,
+    INPUT_IS_NORMALIZED: tl.constexpr,
+    STORE_NORMALIZED: tl.constexpr,
     SHUFFLE: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
@@ -156,10 +181,16 @@ def _indexer_k_norm_rope_quant_store_kernel(
 
     # ── k_norm (fp32 throughout, bf16 roundtrip like the reference) ────
     k = tl.load(k_pre_ptr + token_idx * k_pre_stride + block).to(tl.float32)
-    rms_w = tl.load(rms_norm_weight_ptr + block).to(tl.float32)
-    variance = tl.sum(k * k, axis=0) / HEAD_SIZE
-    k = (k * tl.rsqrt(variance + rms_norm_eps) * rms_w).to(tl.bfloat16)
-    k = k.to(tl.float32)
+    if not INPUT_IS_NORMALIZED:
+        rms_w = tl.load(rms_norm_weight_ptr + block).to(tl.float32)
+        variance = tl.sum(k * k, axis=0) / HEAD_SIZE
+        k = (k * tl.rsqrt(variance + rms_norm_eps) * rms_w).to(tl.bfloat16)
+        k = k.to(tl.float32)
+    if STORE_NORMALIZED:
+        tl.store(
+            normalized_out_ptr + token_idx * k_pre_stride + block,
+            k.to(tl.bfloat16),
+        )
 
     # ── Register-based GPT-J forward RoPE in fp32 ─────────────────────
     # A latent stands for the first token of its group, so group j takes

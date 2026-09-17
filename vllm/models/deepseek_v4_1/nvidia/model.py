@@ -62,7 +62,17 @@ from vllm.models.deepseek_v4.nvidia.model import (
 from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4_1.attention import (
+    DeepseekV4Attention,
+    DeepseekV4IndexerCache,
+    DeepseekV4PPCompressedCache,
+    _indexer_k_cache_head_dim,
+)
+from vllm.models.deepseek_v4_1.common.ops import indexer_k_norm_rope_store
+from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import (
+    rope_quant_insert,
+)
+from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
 from vllm.models.deepseek_v4_1.ced import CEDPrefill, CEDStep, ced_prefill_enabled
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -82,6 +92,13 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# Tensors carried inside the ordinary PP message so a stage that splits a
+# V4.1 KV-sharing group can rebuild the source layer's caches locally.
+_PP_COMPRESSED_LATENT = "dsv41_compressed_latent"
+_PP_NORMALIZED_INDEX_K = "dsv41_normalized_index_k"
+_PP_TOPK_INDICES = "dsv41_topk_indices"
+_PP_CANDIDATE_BLOCKS = "dsv41_candidate_blocks"
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -495,6 +512,76 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 vllm_config, prefix, start, end, _select_dsv4_attn_cls(vllm_config)
             )
 
+        # ---- cross-rank KV sharing (project mechanism) ----
+        # V4.1 keeps one compressed-KV cache per kv-source layer plus one
+        # indexer cache per index source; consumers read the most recent source
+        # below them. When a PP boundary splits such a group, the stage that
+        # owns the consumers rebuilds the source caches from tensors carried in
+        # the PP message instead of raising.
+        from vllm.distributed.utils import get_pp_indices
+
+        pp_group = get_pp_group()
+        expected_start, expected_end = get_pp_indices(
+            config.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+        )
+        compress_ratios = tuple(int(ratio) for ratio in config.compress_ratios)
+        kv_source_layers = tuple(int(layer) for layer in config.kv_source_layer_ids)
+        index_source_layers = tuple(
+            int(layer) for layer in config.index_source_layer_ids
+        )
+
+        def _kv_source_for(layer_id: int) -> int:
+            return max(source for source in kv_source_layers if source <= layer_id)
+
+        def _index_source_for(layer_id: int) -> int:
+            return max(source for source in index_source_layers if source <= layer_id)
+
+        incoming_source: int | None = None
+        if expected_start > 0 and compress_ratios[expected_start] > 0:
+            source = _kv_source_for(expected_start)
+            if source < expected_start:
+                incoming_source = source
+
+        self._pp_incoming_source = incoming_source
+        self._pp_use_fp4_index = dsa_indexer_uses_fp4(vllm_config)
+        self._pp_incoming_index = incoming_source is not None and any(
+            layer_id in index_source_layers
+            and _kv_source_for(layer_id) < expected_start
+            for layer_id in range(expected_start, expected_end)
+        )
+        self._pp_incoming_topk = (
+            expected_start > 0
+            and compress_ratios[expected_start] > 0
+            and _index_source_for(expected_start) < expected_start
+        )
+        candidate_source = int(getattr(config, "candidate_source_layer_id", -1))
+        self._pp_incoming_candidates = (
+            candidate_source >= 0 and expected_start > candidate_source
+        )
+
+        self.pp_compressed_cache: DeepseekV4PPCompressedCache | None = None
+        self.pp_index_cache: DeepseekV4IndexerCache | None = None
+        if incoming_source is not None:
+            source_prefix = f"{prefix}.layers.{incoming_source}.attn"
+            attention_cls = _select_dsv4_attn_cls(vllm_config)
+            self.pp_compressed_cache = DeepseekV4PPCompressedCache(
+                vllm_config,
+                prefix=source_prefix,
+                compress_ratio=compress_ratios[incoming_source],
+                backend_cls=attention_cls.backend_cls,
+                use_fp8_ds_mla_layout=attention_cls.use_fp8_ds_mla_layout,
+            )
+            if self._pp_incoming_index:
+                self.pp_index_cache = DeepseekV4IndexerCache(
+                    head_dim=_indexer_k_cache_head_dim(
+                        config.index_head_dim, self._pp_use_fp4_index
+                    ),
+                    dtype=torch.uint8,
+                    prefix=f"{source_prefix}.indexer.k_cache",
+                    cache_config=vllm_config.cache_config,
+                    compress_ratio=compress_ratios[incoming_source],
+                )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -507,6 +594,42 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+
+        self._pp_outgoing_source: int | None = None
+        self._pp_outgoing_index = False
+        self._pp_outgoing_topk = False
+        self._pp_outgoing_candidates = False
+        if expected_end < config.num_hidden_layers:
+            next_start, next_end = get_pp_indices(
+                config.num_hidden_layers,
+                pp_group.rank_in_group + 1,
+                pp_group.world_size,
+            )
+            assert next_start == expected_end
+            if compress_ratios[next_start] > 0:
+                source = _kv_source_for(next_start)
+                if source < next_start:
+                    self._pp_outgoing_source = source
+            self._pp_outgoing_index = any(
+                layer_id in index_source_layers
+                and _kv_source_for(layer_id) < next_start
+                for layer_id in range(next_start, next_end)
+            )
+            self._pp_outgoing_topk = (
+                compress_ratios[next_start] > 0
+                and _index_source_for(next_start) < next_start
+            )
+            self._pp_outgoing_candidates = (
+                candidate_source >= 0 and next_start > candidate_source
+            )
+
+        if self._pp_outgoing_index:
+            assert self._pp_outgoing_source is not None
+            if self._pp_outgoing_source >= self.start_layer:
+                source_layer = self.layers[self._pp_outgoing_source]
+                assert isinstance(source_layer, DeepseekV4DecoderLayer)
+                assert source_layer.attn.indexer is not None
+                source_layer.attn.indexer.export_normalized_k = True
 
         self.ced_prefill = None
         if ced_prefill_enabled(vllm_config) and get_pp_group().is_last_rank:
@@ -590,6 +713,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.pp_shared_kv is not None
             else {}
         )
+        if self._pp_incoming_source is not None:
+            shared_kv[_PP_COMPRESSED_LATENT] = torch.empty(
+                (batch_size, 512), dtype=torch.bfloat16, device=device
+            )
+        if self._pp_incoming_index:
+            shared_kv[_PP_NORMALIZED_INDEX_K] = torch.empty(
+                (batch_size, self.config.index_head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if self._pp_incoming_topk:
+            shared_kv[_PP_TOPK_INDICES] = torch.empty(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        if self._pp_incoming_candidates:
+            shared_kv[_PP_CANDIDATE_BLOCKS] = torch.empty(
+                (batch_size, self.config.candidate_topk_blocks),
+                dtype=torch.int32,
+                device=device,
+            )
         return IntermediateTensors(
             {
                 **shared_kv,
@@ -605,6 +750,121 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
             }
         )
+
+    def _import_pp_attention_state(
+        self,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors,
+    ) -> None:
+        """Rebuild the upstream source layer's caches on this rank."""
+        num_tokens = positions.shape[0]
+        if self._pp_incoming_topk:
+            self.topk_indices_buffer[:num_tokens].copy_(
+                intermediate_tensors[_PP_TOPK_INDICES]
+            )
+        if self._pp_incoming_candidates:
+            assert self.candidate_block_buffer is not None
+            self.candidate_block_buffer[:num_tokens].copy_(
+                intermediate_tensors[_PP_CANDIDATE_BLOCKS]
+            )
+        if self._pp_incoming_source is None:
+            return
+
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, list):
+            attn_metadata = attn_metadata[dbo_current_ubatch_id()]
+        if not isinstance(attn_metadata, dict):
+            return
+
+        first_layer = self.layers[self.start_layer]
+        assert isinstance(first_layer, DeepseekV4DecoderLayer)
+        assert self.pp_compressed_cache is not None
+        compressed_metadata = typing.cast(
+            typing.Any, attn_metadata[self.pp_compressed_cache.prefix]
+        )
+        rope_quant_insert(
+            intermediate_tensors[_PP_COMPRESSED_LATENT],
+            positions,
+            first_layer.attn.rotary_emb.cos_sin_cache,
+            self.pp_compressed_cache.kv_cache,
+            compressed_metadata.slot_mapping,
+            self.pp_compressed_cache.compress_ratio,
+        )
+
+        if self._pp_incoming_index:
+            assert self.pp_index_cache is not None
+            index_metadata = typing.cast(
+                typing.Any, attn_metadata[self.pp_index_cache.prefix]
+            )
+            indexer_k_norm_rope_store(
+                intermediate_tensors[_PP_NORMALIZED_INDEX_K],
+                positions,
+                first_layer.attn.rotary_emb.cos_sin_cache,
+                None,
+                0.0,
+                self.pp_index_cache.kv_cache,
+                index_metadata.slot_mapping,
+                self.pp_index_cache.compress_ratio,
+                self._pp_use_fp4_index,
+                input_is_normalized=True,
+            )
+
+    def _append_pp_attention_state(
+        self,
+        tensors: dict[str, torch.Tensor],
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> None:
+        """Attach the source state the next stage needs to the PP message."""
+        source_id = self._pp_outgoing_source
+        if source_id is not None:
+            if source_id >= self.start_layer:
+                source_layer = self.layers[source_id]
+                assert isinstance(source_layer, DeepseekV4DecoderLayer)
+                latent = source_layer.attn._last_compressed_latent
+            else:
+                assert intermediate_tensors is not None
+                latent = intermediate_tensors[_PP_COMPRESSED_LATENT]
+            if latent is None:
+                latent = torch.empty(
+                    (positions.shape[0], 512),
+                    dtype=torch.bfloat16,
+                    device=positions.device,
+                )
+            tensors[_PP_COMPRESSED_LATENT] = (
+                latent if source_id >= self.start_layer else latent.clone()
+            )
+
+        if self._pp_outgoing_index:
+            assert source_id is not None
+            if source_id >= self.start_layer:
+                source_layer = self.layers[source_id]
+                assert isinstance(source_layer, DeepseekV4DecoderLayer)
+                assert source_layer.attn.indexer is not None
+                normalized_k = source_layer.attn.indexer._last_normalized_k
+            else:
+                assert intermediate_tensors is not None
+                normalized_k = intermediate_tensors[_PP_NORMALIZED_INDEX_K]
+            if normalized_k is None:
+                normalized_k = torch.empty(
+                    (positions.shape[0], self.config.index_head_dim),
+                    dtype=torch.bfloat16,
+                    device=positions.device,
+                )
+            tensors[_PP_NORMALIZED_INDEX_K] = (
+                normalized_k
+                if source_id >= self.start_layer
+                else normalized_k.clone()
+            )
+
+        num_tokens = positions.shape[0]
+        if self._pp_outgoing_topk:
+            tensors[_PP_TOPK_INDICES] = self.topk_indices_buffer[:num_tokens].clone()
+        if self._pp_outgoing_candidates:
+            assert self.candidate_block_buffer is not None
+            tensors[_PP_CANDIDATE_BLOCKS] = self.candidate_block_buffer[
+                :num_tokens
+            ].clone()
 
     def forward(
         self,
@@ -627,6 +887,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.pp_shared_kv.import_chunk(
                     intermediate_tensors, self.topk_indices_buffer
                 )
+
+        if intermediate_tensors is not None:
+            self._import_pp_attention_state(positions, intermediate_tensors)
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -747,6 +1010,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         full_num_tokens, self.topk_indices_buffer
                     )
                 )
+            self._append_pp_attention_state(tensors, positions, intermediate_tensors)
             return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
