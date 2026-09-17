@@ -138,3 +138,82 @@ MoE 每 step 每 rank 要读 **8 层 × 6.79 GB = 54 GB** 的 mxfp4 专家权重
   2. attention/hc/norm 的剩余 ~83 ms/step：给 `sparse_mla.attention` 加 stage 后定位。
   3. 每步 63 ms 宿主开销：查 engine→5 worker 的每步 RPC/序列化路径。
   4. engram（rank0 18 ms/step）：宿主表 gather 用后台流与主计算重叠（`lookup(background=True)` 已存在但未启用）。
+
+---
+
+## 7. 第 2 轮：MoE 成本模型、注意力计量、10000 tok/s 的可行性算术
+
+### 7.1 MoE 的成本模型（benchmark 实测，单层 w13+w2）
+
+`benchmarks/kernels/deepseek_v41_mxfp4_int8_sm80.py`，tile 固定 (64,128)，只变 token 数：
+
+| tokens | 合计 ms | 每 token µs |
+| ---: | ---: | ---: |
+| 2048 | 17.79 | 8.68 |
+| 4096 | 25.64 | 6.26 |
+| 8192 | 43.95 | 5.37 |
+
+线性拟合 **T ≈ 9.07 ms（权重流）+ 4.26 µs/token**。固定项 = 6.79 GB 专家权重 / 9.07 ms
+⇒ **749 GB/s**（卡片 copy 峰值的 60%），这部分已经接近该内核的实际带宽上限。
+每 token 项 4.26 µs = 每 step 每 rank 多出 **70 ms**（8 层），是 MoE 里最大的一块可动项。
+
+### 7.2 已试的两个 MoE 改动（都无效，已回滚）
+
+| 改动 | 预期 | 实测 |
+| --- | --- | --- |
+| 把 grouped GEMM 的 grid 从 m-fastest 换成 n-fastest（`mxfp4_moe_cutlass_core.cuh` + entry 的 `dim3`），让 A tile 在 L2 里复用 | 省 ~9.8 GB/层 DRAM | **1.01×（噪声内）** ⇒ A 重读本来就被 L2 吃掉了，DRAM 流量没变 |
+| tile 换档（16×64 / 16×128 / 128×128） | 提高带宽 | 均更慢（310 / 329 / 280 GB/s vs 380） |
+
+⇒ 内核当前的瓶颈是 mma 路径效率（每 slot 35.4M MACs / 0.71 µs ≈ 100 TOPS ≈ int8 峰值的 32%），
+以及权重流带宽 749 GB/s。想再快只能改内核主体（stage 数 / K-tile / mma 指令组合），不是调参。
+
+### 7.3 注意力计量（本轮补的 stage）
+
+`deepseek_v4_1/amd/rocm.py::_forward_prefill` 现在有 `sparse_mla.gather_compressed` /
+`gather_swa` / `combine_indices` / `prefill` 四个 stage（此前散在未插桩的部分里）。
+
+整请求（63k / 31 chunk）每 rank：
+
+| 环节 | rank0 | rank3 | 每 step |
+| --- | ---: | ---: | ---: |
+| `sparse_mla.prefill`（注意力内核本身） | 772 | 890 | 25–29 ms |
+| `sparse_mla.combine_indices` | 70 | 51 | ~2 ms |
+| `sparse_mla.gather_compressed + gather_swa` | 23 | 37 | ~1 ms |
+| `indexer.logits` | 140 | 556 | 4.5–18 ms |
+| `target.attn_metadata` | 399 | 340 | 11–13 ms |
+
+同时确认：生产 prefill 走的是 **已调优的 read-once 路径**（`ampere_sparse` →
+`deepseek_v4_1/amd/rocm.py` 调 `rocm_sparse_attn_prefill` 时**不传** block_h/block_k，
+所以 sm_80 门控生效、用 bh=64）。`triton_mla_sparse_sm80.py` 那个显式传 `block_h=32`
+的调用点属于另一个未被选用的后端，不影响我们。
+
+### 7.4 那 55 ms/step 的"未插桩层内时间"与 63–90 ms 的步间空隙
+
+rank 内子项求和 6,724 ms vs `target.model_forward` 8,424 ms ⇒ **仍有 ~55 ms/step**
+在 hc/norm/rope/PP-KV/量化等未插桩的层内工作里。
+
+步间空隙（step 周期 − forward）**五个 rank 几乎相同**（85 / 82 / 91 / 64 / 74 ms），
+说明它不是逐跳累积的 PP 交接，而是**每步一次全局同步 + 引擎/宿主开销**
+（scheduler、SchedulerOutput 广播、采样、输出处理）。当前 step 周期 ~350 ms，
+其中 forward 260–286 ms。
+
+### 7.5 10000 tok/s 的可行性算术（2048 chunk）
+
+10000 tok/s ⇒ **每 step ≤ 205 ms**（现在 ~377，含插桩；无插桩 2048 tok / 0.377 s = 5,430）。
+
+| 项 | 现在 ms/step | 物理下限 | 说明 |
+| --- | ---: | ---: | --- |
+| MoE 权重流（54 GB/step/rank） | 158 | **~72** | 749 GB/s 实测带宽 × 54 GB |
+| MoE 每 token 项 | （含在上面） | ~0 | 需内核效率提升 |
+| 注意力 | 29 | ~20 | read-once 已在位 |
+| indexer + metadata | 29 | ~15 | |
+| 其余层内（hc/norm/PP-KV） | 55 | ~35 | 待插桩定位 |
+| 步间空隙 | 63 | ~10 | 引擎每步同步 |
+
+即：**即使 MoE 立刻达到它的实测带宽上限（72 ms）且空隙压到 10 ms，也只能到 ~200 ms/step
+≈ 10,200 tok/s** —— 目标是"贴着实测物理上限"的，任何一项掉链子都到不了。
+按现在的内核效率（158 ms）算，实际落在 **5,400–6,500 tok/s**。
+
+⇒ 结论：**10k 的瓶颈在 MoE 内核效率与每步固定开销**，下一步优先级：
+① MoE 内核 mma 路径（100→200 TOPS）；② 每步 63–90 ms 空隙的引擎侧归因；
+③ 55 ms/step 未插桩层内工作（hc/norm）。
