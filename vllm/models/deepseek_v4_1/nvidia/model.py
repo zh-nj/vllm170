@@ -86,6 +86,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import Engram, EngramLayout, NgramHashState
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -248,6 +252,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
 
         self.rms_norm_eps = config.rms_norm_eps
+        self.prefix = prefix
         self.attn = _select_dsv4_attn_cls(vllm_config)(
             vllm_config,
             prefix=f"{prefix}.attn",
@@ -340,7 +345,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
-    def forward(
+    def forward(self, x: torch.Tensor, *args, **kwargs):
+        with phase_profile_layer(self.prefix):
+            with phase_profile_stage("layer.total", x, level="module"):
+                return self._forward(x, *args, **kwargs)
+
+    def _forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
@@ -928,16 +938,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     lookback_token_ids = input_ids.new_full(
                         (num_reqs, self.engram_hash.lookback_depth), -1
                     )
-                engram_hashes = self.engram_hash(
-                    input_ids,
-                    positions,
-                    swa_metadata.query_start_loc,
-                    image_mask,
-                    lookback_token_ids,
-                    image_sentinel_mask(lookback_token_ids),
-                    swa_metadata.slot_mapping,
-                    swa_metadata.block_table,
-                )
+                with phase_profile_stage("engram.hash", positions, flow="prefill"):
+                    engram_hashes = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        image_mask,
+                        lookback_token_ids,
+                        image_sentinel_mask(lookback_token_ids),
+                        swa_metadata.slot_mapping,
+                        swa_metadata.block_table,
+                    )
                 # Gather all Engram rows before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)

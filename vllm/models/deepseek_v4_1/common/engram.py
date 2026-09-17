@@ -58,6 +58,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
@@ -840,25 +841,25 @@ class ParallelEngramEmbedding(nn.Module):
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
-        _engram_lookup_kernel[(grid,)](
-            weight.view(torch.uint8),
-            scales,
-            indices,
-            out,
-            self.vocab_start_idx,
-            self.vocab_end_idx,
-            rows,
-            indices.stride(0),
-            indices.stride(1),
-            HEAD_START=self.head_start,
-            LOCAL_HEADS=self.part_n_hash_cols,
-            TOTAL_HEADS=self.n_hash_cols,
-            DIM=self.dim,
-            QUANT_BLOCK=self.block_size,
-            BLOCK_R=16,
-            GRID=grid,
-        )
-
+        with optional_phase_profile_stage("engram.lookup", out):
+            _engram_lookup_kernel[(grid,)](
+                weight.view(torch.uint8),
+                scales,
+                indices,
+                out,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                rows,
+                indices.stride(0),
+                indices.stride(1),
+                HEAD_START=self.head_start,
+                LOCAL_HEADS=self.part_n_hash_cols,
+                TOTAL_HEADS=self.n_hash_cols,
+                DIM=self.dim,
+                QUANT_BLOCK=self.block_size,
+                BLOCK_R=16,
+                GRID=grid,
+            )
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
         bf16, gathered from all TP shards."""
@@ -1054,7 +1055,8 @@ class Engram(nn.Module):
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""
-        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+        with optional_phase_profile_stage("engram.prepare", self.staged_rows):
+            self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""
@@ -1090,7 +1092,8 @@ class Engram(nn.Module):
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
         the gate so those positions pass through untouched."""
-        kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        with optional_phase_profile_stage("engram.embed", hidden_states):
+            kv = self.wkv(self.embed(hash_ids).flatten(-2))
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
         if self.use_sequence_parallel:
@@ -1113,33 +1116,34 @@ class Engram(nn.Module):
         block_size = triton.next_power_of_2(dim)
         num_warps = 8 if block_size >= 2048 else 4
         mask = token_mask if token_mask is not None else hidden_states
-        _fused_engram_post_wkv_kernel[(num_tokens * hc_mult,)](
-            hidden_states,
-            kv,
-            self.q_weight,
-            self.k_weight,
-            mask,
-            output,
-            num_kv_tokens,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
-            hidden_states.stride(2),
-            kv.stride(0),
-            kv.stride(1),
-            self.q_weight.stride(0),
-            self.q_weight.stride(1),
-            self.k_weight.stride(0),
-            self.k_weight.stride(1),
-            token_mask.stride(0) if token_mask is not None else 0,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            self.eps,
-            self.clamp_value,
-            DIM=dim,
-            HC_MULT=hc_mult,
-            BLOCK_SIZE=block_size,
-            HAS_MASK=token_mask is not None,
-            num_warps=num_warps,
-        )
+        with optional_phase_profile_stage("engram.post_wkv", hidden_states):
+            _fused_engram_post_wkv_kernel[(num_tokens * hc_mult,)](
+                hidden_states,
+                kv,
+                self.q_weight,
+                self.k_weight,
+                mask,
+                output,
+                num_kv_tokens,
+                hidden_states.stride(0),
+                hidden_states.stride(1),
+                hidden_states.stride(2),
+                kv.stride(0),
+                kv.stride(1),
+                self.q_weight.stride(0),
+                self.q_weight.stride(1),
+                self.k_weight.stride(0),
+                self.k_weight.stride(1),
+                token_mask.stride(0) if token_mask is not None else 0,
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                self.eps,
+                self.clamp_value,
+                DIM=dim,
+                HC_MULT=hc_mult,
+                BLOCK_SIZE=block_size,
+                HAS_MASK=token_mask is not None,
+                num_warps=num_warps,
+            )
         return output
