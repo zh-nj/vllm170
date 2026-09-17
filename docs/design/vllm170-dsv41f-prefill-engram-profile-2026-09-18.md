@@ -652,3 +652,51 @@ forward 内部（第 6 轮 profiled 值，按 −20 ms profiler 开销折算）�
 **优化含义**：50 ms 的 PP 等待由 84 MB/step 的 `hidden_states (2048×4×5120 bf16)` 交接决定
 （PCIe Gen2 x16，无 NVLink）；要压它只有三条路：更快的链路（硬件）、更小的载荷（改模型契约）、
 或更深的流水（引擎已经 5 层满载）。44 ms 的引擎循环同理属引擎工程。
+
+## 16. 第 11 轮：加深 batch queue（深度 10）压不动 PP 等待 —— 负结果，配置已回滚
+
+第 15 轮把 50 ms 归给 PP 交接后，唯一还没试的"更深的流水"是把 batch queue 再加深：
+`vllm/config/vllm.py` 里 `max_concurrent_batches` 默认取 `pp_size + 1`（= 6），
+本轮加了环境变量开关 `VLLM_DSV41_BATCH_DEPTH_EXTRA`，把它抬到 10 层，其余全部不动。
+
+### 16.1 结果：更深 = 更差
+
+| 配置 | in-flight KV 需求 | 63k prefill 稳态 |
+| --- | --- | --- |
+| 默认（depth 6，`PORT_KV_BYTES=1300000000`，run80） | 1.3 GB | **5,917–5,959 tok/s** |
+| depth 10（run76/77） | 需抬到 1.5 GB 才能启动 | **5,883–5,902 tok/s** |
+
+两件事同时被这个实验钉死：
+
+1. **深度不是瓶颈**。深度 6 已经足够让 5 个 rank 都有活干（每 rank 同时在手 6 个 batch，
+   forward 232 ms < 一个 batch 走完 5 段的时间），再加 4 层只是把调度开销和 KV 占用一起放大。
+   ⇒ 那 50 ms 不是"等不到 batch"的流水气泡，而是**单次交接本身要花的钱**。
+2. **深度与 KV 是耦合的**：in-flight block 数 ≈ depth × max_num_batched_tokens，
+   depth 10 × 2048 直接把 1.3 GB 的 KV 池吃穿（启动即
+   `To serve at least one request ... KV cache is needed, which is larger than the available`），
+   必须把 `PORT_KV_BYTES` 抬到 1.5 GB。任何"再加深"的想法都自带一份 KV 预算。
+
+配置已回滚（`git status` 干净），默认 depth 6 / KV 1.3 GB 的服务已按 run80 重新拉起并
+`STARTUP_OK` 复核。
+
+### 16.2 由此收敛出的结论
+
+2048 chunk 下的 326 ms/step 现在是**逐项都已定位、且都被实验否定过优化空间**的结构：
+
+```
+326 ms = 232 (GPU forward) + 50 (PP 交接) + ~44 (引擎循环)
+          ├ MoE 126：权重带宽主导（749 GB/s 有效；只有 mainloop 重写这一条路）
+          ├ 注意力 97：稀疏 MLA（topk 512 + swa 128）在 sm_80 fp16 张量核上已接近 roofline
+          └ 其余 ~40：hc 16 + 共享专家 11.6 + metadata 10.8
+```
+
+第 2–11 轮共 12 个实验，只有 1 个是正的（MoE tile 可达性 bug，+10–11%）；
+其余 11 个（MoE grid 顺序、kStages、tile 扫描、bm32、共享专家重叠阈值、indexer streaming
+topk、logits 寄存器数、fp8 线性层三内核、hc TileLang 调参、512/4096/8192 chunk、batch depth 10）
+全部中性或负。**10,000 tok/s 在当前硬件 + 当前内核下不可达**：它要求 205 ms/step，
+而光是 GPU forward 就要 232 ms。要再往前走只剩两条真正的工程路：
+MoE mainloop 重写（目标把 126 ms 压向 HBM 峰值附近的 ~70 ms）与
+PP 载荷/引擎往返（94 ms → ~30 ms）。两条都不是"调参"能拿到的。
+
+**当前稳定战绩**（不得再退化）：63k prefill **5,917–5,959 tok/s**（起步 5,300，累计 +11%）；
+35k ≈ 5,267–5,319；21.7k ≈ 4,416；12k ≈ 3,205。
