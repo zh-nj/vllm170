@@ -883,8 +883,11 @@ Marlin 的 `use_mxfp4_w4a16` 路线把权重**解量化成 bf16** 做 A16W4。�
 所以"用 int8 而不是 bf16"的精度代价 = **每 token 对称 int8 激活量化**，约 2.7% 的 MoE 输出相对误差
 （cosine 0.9996），**与权重格式无关**（权重那条路是精确的）。
 
-顺带钉死一条硬件事实：`--moe-backend marlin`（bf16 路线）在本配置下**起不来** —— worker 启动阶段
-`Cuda failure 2 'out of memory'`（63 GiB/rank）。int8 路线不只是更快，它也是这块卡上唯一装得下的路线。
+顺带记一条运维观察（**单次失败，先不要当结论**）：`--moe-backend marlin`（bf16 激活路线）第一次拉起时在
+worker 启动阶段报了 `Cuda failure 2 'out of memory'`。**这与 §11.3 记的已知启动 flake 是同一个签名**
+（`ncclUnhandledCudaError … Cuda failure 2 'out of memory'`），而 marlin 的权重仍然是 4-bit（W4A16，只把
+激活留在 bf16；`utils/marlin_utils_fp4.py` 只把 e8m0 scale cast 成 param_dtype），所以**没有证据说它装不下**。
+用 `/tmp/start_pp5.sh`（带 3 次重试）复跑的结果见 §20。
 
 ### 19.3 主循环：四个可动项全部测过，零或负
 
