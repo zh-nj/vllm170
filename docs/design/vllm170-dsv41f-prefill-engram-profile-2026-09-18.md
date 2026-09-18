@@ -997,3 +997,62 @@ logprob** 共 5,094 个位置 + 贪心 384 个 token）。A = `mxfp4_int8_sm80`�
 - 目标状态：MoE 主循环（§19.3/§19.4）与精度（§19 + §20）两条线都已闭环；
   距离 10,000 tok/s 的剩余差距仍是 §17.3 里那条"更大 chunk 摊薄每 step 权重流"的算法级路线，
   它要把注意力/索引器随上下文增长的账一起还。
+
+---
+
+## 21. 更正："2048 token 时 64 行 tile 平均只有 ~32 有效行" —— 那是 benchmark 的合成路由，线上没有 padding
+
+### 21.1 那个数字的来源
+
+`benchmarks/kernels/deepseek_v41_mxfp4_int8_sm80.py` 用 `torch.rand(tokens, NUM_EXPERTS).topk(6)`
+造路由（**均匀随机**），于是 2048 token → 12,288 slots / 384 experts = **32 行/专家**，
+`moe_align_block_size` 把它补齐到 block_m=64 ⇒ 每个 (m,n) tile 的 M 维一半是 padding。
+§7.1/§12.1/§19.3 的 "(64,128) 最快、bm16/bm32 更慢" 都是在这个合成分布下测的。
+
+### 21.2 线上实测（真实路由）
+
+方法：在 `experts/mxfp4_int8_sm80.py::forward` 里临时加一个 env 开关（`VLLM_MOE_TILE_STATS`），
+对 `routing_ids`（即 `topk_ids`）做 `bincount`，直接统计命中专家数、每专家行数，
+以及 bm∈{16,32,64,128} 下的 tile 数与 padding。两次运行（63k 与 6k 请求，共 1,830 + 710 次 MoE 调用）：
+
+| 量 | 实测 |
+| --- | --- |
+| m / topk / slots | 2048 / 6 / 12,288 |
+| **命中专家数** | **6**（每个专家**恰好 2048 行**） |
+| tiles（bm16/32/64/128） | 768 / 384 / **192** / 96 |
+| **padding** | **0.0%（四个 bm 全是 0）** |
+| 每个 (层, chunk) 的 6 个专家 | 各不相同（例：`[289,0,161,235,263,36]`、`[1,7,58,65,159,169]`、`[14,56,113,125,190,226]`） |
+
+⇒ **线上一个 padding 行都没有。** block_m 在线上不决定 padding，只决定
+"每个被激活专家的权重块被读几次"：bm16 读 768 次、bm64 只读 192 次（4 倍差）。
+这正是 §12.1 的 bm32 −17% 与 `79270ec6fc` 的 +10–11% 的真正机理（权重重读，而不是 padding）。
+
+### 21.3 连带的两条修正
+
+1. **§17.3 的"MoE 权重流地板 72 ms/step"对线上作废**：线上每层每 chunk 只激活 6 个专家，
+   权重流量 ≈ 6/384 × 6.79 GB ≈ **106 MB/层**，不是 6.79 GB。所以线上 MoE 不是带宽受限，
+   而是"每个 (m,n) tile 一段固定成本"受限（§19.4：mma 只忙 12%、DRAM 只有 roofline 的 30%）。
+   §7.1 的 6.79 GB/层只适用于合成均匀路由的 benchmark。
+2. 于是 10,000 tok/s 的算术要按新口径重述：**没有 72 ms 的权重流地板可以追**，
+   可动的只有 per-tile 成本（即 §19.4 那条"依赖/延迟/占用率"路线）。
+
+### 21.4 未闭环的观察（本轮只记录，不下结论）
+
+同一个 chunk 内 2048 个 token 的**路由行完全相同**（两次运行、每次调用都是 `distinct_rows=1`），
+而技术报告（`DeepSeek_V41_Tech_Report.pdf` §4.2.1）写的是"**每个 token** 激活 6 个专家"。
+已排除：`candidate_source_layer_id` / `topk_indices_buffer` 属**注意力 indexer**，与 MoE 路由无关。
+可量的机理假设：分数是 `sqrt(softplus(logit))`，该变换强烈压缩差异；当 chunk 内 hidden states
+经 RMSNorm 后方向高度相似时，token 间的分数差会被压到小于**逐专家偏置**
+（`e_score_correction_bias`：layer 0/6/20/39 的 mean 9.83/11.28/14.14/57.63，spread 0.29/0.21/0.48/0.48），
+于是 bias 主导排序 ⇒ 整个 chunk 选出同一组专家。离线用**异质**输入（真实 token embedding 过
+layer 0/6/20 的 gate）模拟，512 个 token 也只有 **43 个不同 top-6 组合**（top-1 只有 20–36 种），
+说明该模型排序本来就高度聚集 —— 与"chunk 内收敛到 1 种"方向一致。
+判定"共享决策（stride-0 广播）"还是"真实退化"只差一次重启：打印 `routing_ids.stride()`、
+`topk_weights` 的 distinct rows 与实际权重行；或改用 PP=1 + `--enable-return-routed-experts`
+（PP>1 被显式拒绝）。**插桩已回滚**（它先后踩了 CUDA graph capture 与 m=1 warmup 两个坑），
+交付代码里不留调试脚手架；上面两次实测数据来自回滚前的版本。
+
+### 21.5 收口状态
+
+服务已回到默认配置并复核：**63k prefill 6,868 tok/s**（同一实例族 6,976–7,171 的漂移范围内）。
+本节的更正已写入 §17.3/§21，作为"10k 算术"的新基准。
