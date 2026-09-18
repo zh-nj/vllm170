@@ -8,26 +8,40 @@
 
 ---
 
-## 1. FlashMLA：SM80 上无法集成（有证据）
+## 1. FlashMLA：sm_80 上"没有可集成的注意力 kernel"（≠ FlashMLA 没为 sm_80 做过事）
+
+先纠正本节原标题"无法集成"的措辞（2026-09-18 晚更正）：**FlashMLA 确实已经为 sm_80 做了工程，
+但做的是"让 Ampere 能编译/能存在"，不是"提供了可调用的注意力 kernel"**。两件事都在 2026-09-15 落地：
 
 | 检查 | 结果 |
 | --- | --- |
-| `csrc/kernels/sm80/` | **只有 README**，没有任何 kernel 源码；`flash_mla/cuda.*.so` 是 sm_80-only 构建（`cuobjdump` 只列 `sm_80.cubin`） |
-| `import flash_mla` / `get_mla_metadata` | ✓ 可用（arch-generic helper 能在 Ampere 上跑） |
-| `flash_mla_sparse_fwd`（V4.1 稀疏 prefill 内核） | ✗ `RuntimeError: [FlashMLA] sparse_prefill_fwd is not implemented for sm_80 in this build` |
+| `FLASH_MLA_ENABLE_SM80=1` 构建目标（`setup.py`，未提交） | ✓ 存在：只发 `arch=compute_80,code=sm_80`；产物 `flash_mla/cuda.cpython-312-*.so`（09-15 14:00）里 `cuobjdump --list-elf` **只有两个 cubin**：`combine.sm_80.cubin`、`get_decoding_sched_meta.sm_80.cubin` |
+| 共享 helper 的 Ampere 适配 | ✓ cluster launch bounds 去掉第三参、`griddepcontrol`(PDL) 在 Ampere 退化为普通 launch（`csrc/kernels/smxx/*`） |
+| `csrc/kernels/sm80/` | **只有一个 README**（未跟踪），自述 "currently empty of kernel sources" |
+| `import flash_mla` / `get_mla_metadata` | ✓ 在 170HX 上实测可跑（返回 `FlashMLASchedMeta`） |
+| 四个注意力入口 | ✗ 全是 **stub**：在 170HX 上直接调用实测 `RuntimeError: [FlashMLA] sparse_prefill_fwd is not implemented for sm_80 in this build...`（`sparse_decode_fwd` / `dense_prefill_fwd` / `dense_decode_fwd` 同样） |
 | 上游 V4.1 kernel | SM90/SM100：wgmma、TMA、mbarrier、thread-block cluster，sm_80 上连编译都过不去 |
 
-仓库自带的 `docs/20260915-sm80-dsv41-attention-analysis.md`（同一台机器上测的）结论一致：
-**FlashMLA 在 sm_80 上"没有可移植的东西"**，并给了替代方案——Triton 的 read-once
-prefill tiling（`bh=64/bk=64/st=2/nw=8`，1.51×）。
+**sm_80 上注意力真正拿到的收益不在 FlashMLA，而在本仓库的 Triton 路径**：
+`vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:2821-2834,2869` 记录并实现了
+`block_h=64` 的 read-once tiling —— 原来每个 head-block 重读一遍该 query 的 KV 选择（实测 4.3× 流量放大），
+`block_h=64` 把 64 个 head 放进一个 CTA ⇒ 每个 query token 的 KV 只读一次：
+**3428 µs / 40.1 TFLOPS → 2269 µs / 60.6 TFLOPS（1.51×）**，端到端 TTFT −3.4%，
+且是 sm80 prefill 的默认路径（`block_h = 64 if sm80_prefill else 16`）。
 
-**该替代方案已经在本仓库生效**：`vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`
-里有完整的 sm_80 门控（`head_dim==512` + bf16 KV + `shared_memory_per_block_optin >= 139264`
-+ 未导出 `VLLM_DEEPSEEK_V4_SPARSE_PREFILL_BLOCK_K`），`run_port_pp5.sh` 没有导出该变量
-→ PP5 启动就是 read-once tiling。本轮未改这块（已是最优可得配置）。
+⇒ 准确的结论是：**（a）sm_80 的注意力优化已经做了并且已上线（Triton tiling，1.51×）；
+（b）FlashMLA 侧只到位了构建骨架，写 kernel 的门槛已被量化为"必须快过 2269 µs / 60.6 TFLOPS"；
+（c）这条路的余量有限——prefill 注意力只占 TTFT ~10%、decode ~3.6%/token，且 SM90 那套跨 query
+共享（BLOCK_M tiling）已在本负载上测过不可行（BLOCK_M=8 时 4.94× 理想 FLOPs 只换 1.6× 流量）。**
+三条硬约束留给将来真要写 kernel 的人：smem 163 KB（SM90 sparse-decode 的 accum∪KV union 放不下，
+必须换分解）、**sm_80 没有 fp8 tensor core**（`m16n8k32.e4m3` 是 sm_89+，fp8 KV 必须先 upcast——
+本仓库走 256 项 LUT→bf16）、70 SM 而非 108。
+重新评估的触发条件：走"更大 chunk/更长上下文"使注意力占比上升时（绝对门槛 2269 µs 不变、相对收益变大），
+工具已备好（`FlashMLA/benchmark/bench_dsv41_sm80_attention.py`，**必须用 CUDA graph replay 计时**，
+eager 的 ~260 µs host 开销会把 kernel 时间完全盖掉）。
 
-**结论**：第一步能做的不是"接 FlashMLA kernel"（不存在），而是（a）确认等价优化在位 ✓、
-（b）把注意力/engram 的耗时量出来，喂给第二步。
+**结论**：第一步能做的不是"接不存在的 FlashMLA kernel"，而是（a）确认等价优化在位 ✓、
+（b）把注意力/engram 的耗时量出来，喂给第二步（§7/§14）。
 
 ---
 
