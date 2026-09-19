@@ -232,6 +232,56 @@ The same run corrected an assumption worth recording: the first prefill chunk is
 tokens, not `max_num_batched_tokens` (1024), so the second chunk is `n - 1020`. An
 earlier probe that assumed a 1024-token first chunk silently matched nothing.
 
+### The remaining source: Marlin's M-tuned tiling
+
+Following the localization into the MXFP8 linears (the model's projections are
+`MarlinMxfp8LinearKernel`, not `aten::linear`, so the overrides above do not touch them)
+lands on a heuristic that is explicitly batch-dependent:
+
+```cpp
+// csrc/libtorch_stable/quantization/marlin/marlin.cu
+int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
+...
+exec_cfg = determine_exec_config(..., prob_m_split, prob_n, prob_k,
+                                 thread_m_blocks, ...);
+```
+
+The tile height and the auto-selected `thread_k`/`thread_n` both come from how many rows
+the launch got, and a different tile height changes the kernel's `parallel` reduction
+stride. The file's own comment says so: a 56-row batch "would be launched as one 48-row
+tile with `parallel=3` and round differently".
+
+That is why only part of the effect is reachable from the `aten` layer, and it is also
+why the same tree already carries a knob for it -- `VLLM_MARLIN_M_ALIGN`, added for
+decode-shaped batches, with this comment:
+
+```cpp
+static constexpr int kAlignMaxM = 128;
+const bool align_m = marlin_m_align > 0 && prob_m > 8 && prob_m <= kAlignMaxM;
+```
+
+It pins `prob_m_split` so the `parallel` stride matches the solo geometry, but it is
+capped at `prob_m <= 128` and the comment records why: the chunked launch re-reads the
+weight matrix once per launch, measured at **+177% at M=2048**, and beyond 128 rows
+"aligning a long prefill was also observed to change its answer rather than stabilise
+it". Prefill chunks here are 281-1020 rows, so the existing knob does not cover the case
+this ledger is about.
+
+The obvious alternative -- route the MXFP8 linears to `EmulationMxfp8LinearKernel`
+(`--linear-backend emulation`), which dequantizes to BF16 at load and then runs a plain
+BF16 `aten::linear` that the batch-invariant overrides do cover -- **does not work on
+this checkpoint**: with `--linear-backend emulation --additional-config
+'{"dsv41_strict_bf16_gemm":true}'` the server starts, selects
+`EmulationMxfp8LinearKernel`, and then returns `400 "Out of range float values are not
+JSON compliant: nan"` because the prompt logprobs are NaN. That path needs debugging
+before it can be used as a batch-invariance lever.
+
+So the remaining work is a Marlin tiling whose geometry does not depend on `M` -- either
+an extension of the align path with a measured cost budget, or a different GEMM for the
+prefill row range. Both are kernel changes with a real prefill cost, and the two
+candidate costs are already known from this tree: +177% for the chunked alignment at
+M=2048, and about 5% decode for the `aten` overrides.
+
 ### Partial mitigation, off by default
 
 `VLLM_DSV41_STRICT_BF16_GEMM=1` installs upstream's batch-invariant Triton overrides for
@@ -369,6 +419,10 @@ retention policy could keep.
 # the same effect isolated to cuBLAS on a spare GPU
 python benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py --shapes --map
 
+# the opt-in mitigation (measured: spread 1.79 -> 0.75 nats, decode ~5% slower)
+PORT_EXTRA_ARGS='--additional-config {"dsv41_strict_bf16_gemm":true}' \
+  benchmarks/deepseek_v4_1/run_port_pp5.sh
+
 # the KV cache group layout and per-group hit lengths (Finding 2)
 VLLM_KV_CACHE_DEBUG=1 ... benchmarks/deepseek_v4_1/run_port_pp5.sh
 ```
@@ -403,5 +457,7 @@ Two traps the gate scripts now avoid, both of which produced wrong conclusions f
 - `vllm/envs.py`: `VLLM_KV_CACHE_DEBUG`, and `VLLM_DSV41_STRICT_BF16_GEMM` (default 0).
 - `vllm/model_executor/determinism/batch_invariant.py`: `enable_batch_invariant_math`,
   the narrow subset of the batch-invariance mode that this model can use.
+- `vllm/v1/worker/gpu_worker.py`: the knob is read from `additional_config` first,
+  because an arbitrary `VLLM_*` name set on `vllm serve` does not reach the workers.
 - `vllm/models/deepseek_v4_1/nvidia/model.py`: `_ProbeRowDump`, the layer/stage dump
   that localized the remaining dependence to the attention.

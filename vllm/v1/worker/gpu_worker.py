@@ -1502,6 +1502,19 @@ class Worker(WorkerBase):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
+def _strict_bf16_gemm(vllm_config: VllmConfig) -> bool:
+    """Whether to install batch-invariant bf16/fp16 matmuls in this worker.
+
+    Read from ``additional_config`` first because that travels with the
+    VllmConfig into every worker, while an arbitrary ``VLLM_*`` name set on
+    ``vllm serve`` does not: an env-only knob silently reads its default here.
+    """
+    extra = vllm_config.additional_config
+    if isinstance(extra, dict) and "dsv41_strict_bf16_gemm" in extra:
+        return bool(extra["dsv41_strict_bf16_gemm"])
+    return envs.VLLM_DSV41_STRICT_BF16_GEMM
+
+
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
@@ -1517,7 +1530,7 @@ def init_worker_distributed_environment(
     )
 
     init_batch_invariance()
-    if envs.VLLM_DSV41_STRICT_BF16_GEMM:
+    if _strict_bf16_gemm(vllm_config):
         enable_batch_invariant_math()
     override_envs_for_eplb(
         parallel_config,
