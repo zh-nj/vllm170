@@ -23,11 +23,12 @@ unchanged within the noise of this box.
 
 Two behaviours showed up while verifying it, and both are documented below:
 
-- **Prefill is not batch-invariant** (~0.1-1.4 nats on the same token in the same
-  context, depending only on the shape of the batch it is computed in), so greedy
-  continuations can diverge between a cached and an uncached serving. Proved below with
-  zero reuse involved: it is a property of the model's kernels, not of the cache, and it
-  is not fixable at the prefix-cache layer. Diagnosed, not fixed.
+- **The bf16 GEMMs are not batch-invariant**: cuBLAS picks a different reduction order
+  per `M`, worth exactly one bf16 ULP on a bit-identical row. Accumulated over a prefill
+  chunk that is 0.026 nats at its first row and 1.79 nats by its 277th, which is enough
+  for greedy decoding to diverge between a cached and an uncached serving. Proved below
+  with zero reuse, and isolated to cuBLAS on a spare GPU. Not fixable at the
+  prefix-cache layer; diagnosed, not fixed.
 - **A prompt that ends 1..32 tokens past a 128-block boundary reconciled to zero
   reuse**, even though its blocks were cached. Root-caused to the sparse-retention tail
   in `SlidingWindowManager.reachable_block_mask` and **fixed**; the whole band now
@@ -123,74 +124,101 @@ configuration is 76.4-91.5 ms (about 7%). The two distributions overlap, so ther
 measurable decode cost to the flag, and no measurable gain either -- the benefit is
 entirely in prefill (TTFT).
 
-## Finding 1 (diagnosed, not fixed): prefill is not batch-invariant
+## Finding 1 (diagnosed, not fixed): the GEMMs are not batch-invariant
 
 Cold and warm runs of the same prompt can produce different completions. It is not the
 cache, and it is not fixable at the prefix-cache layer: a row's prefill result depends on
-how many tokens are in the batch it is computed in, so *any* change in chunking changes
-it. A prefix-cache hit is simply the most common way to change chunking.
+how many tokens are in the batch it is computed in. A prefix-cache hit is only the most
+common way to change chunking -- the same divergence appears with caching off when
+`max_num_batched_tokens` changes (1024 -> 1152 already changed 2 of 5 reference prompts
+in an earlier measurement on this box).
 
-Evidence, all of it with **zero reuse** (every request carries a unique `cache_salt`, so
-each is a full cold prefill):
+### It is not the cache, and not non-causal
+
+Every request in this sweep carries a unique `cache_salt`, so each is a full cold prefill
+with zero reuse:
 
 ```
 logprob of token 1300 vs the length of the chunk it is computed in
 (first chunk fixed at 1024, so the second chunk is n - 1024):
 
-  n=[1304,1336]  tail=[280,312]  logprob=-10.063070
-  n=[1344,1392]  tail=[320,368]  logprob=-9.922690
-  n=[1408,1464]  tail=[384,440]  logprob=-10.570042
-  n=[1472,1528]  tail=[448,504]  logprob=-10.791334
-  n=[1536,1568]  tail=[512,544]  logprob=-11.281863
-  n=[1596,1621]  tail=[572,597]  logprob=-10.685512
+  n=[1301,1337]  tail=[277,313]  logprob=-10.063070
+  n=[1341,1393]  tail=[317,369]  logprob=-9.922690
+  n=[1405,1465]  tail=[381,441]  logprob=-10.570042
+  n=[1469,1529]  tail=[445,505]  logprob=-10.791334
+  n=[1533,1565]  tail=[509,541]  logprob=-11.281863
+  n=[1597,1617]  tail=[573,593]  logprob=-10.685512
 ```
 
-Bit-identical over a range, then a discrete jump of up to 1.4 nats. Two controls say
-what kind of effect this is:
+Bit-identical over a range, then a discrete jump; 8 distinct values over 80 lengths,
+spread 1.79 nats. Two controls say what kind of effect this is:
 
 - **Not leakage.** The token at index 900, in the always-1024-token first chunk, is
-  bit-identical (`-0.000127`) across every `n`, so the effect is local to the batch a row
-  is computed in rather than non-causal influence from later tokens.
-- **Not content.** Replacing the tokens after the probe with different tokens *of the
-  same length* leaves the probe bit-identical (`-9.867739`, four different tails), so the
-  later tokens themselves are irrelevant.
+  bit-identical (`-0.000127`) across every `n`.
+- **Not content.** Replacing the tokens after the probe with different tokens *of the same
+  length* leaves the probe bit-identical (`-9.867739`, four different tails).
 
-So the jump is a kernel-configuration change keyed on the batch's token count. The
-plateaus land on 64-token multiples of the recomputed chunk, which is the bucket size of
-`ceil(num_tokens * topk / num_experts)` -- 384 experts and topk 6 give exactly
-`ceil(M / 64)`. What is *not* the cause, checked directly:
+Profiling the spread per probe index over chunk-2 lengths 16..597 shows the shape of it:
+index 1024 (the first row of chunk 2) already moves, by only 0.026 nats; by index 1300 it
+is 1.79. So the primitive effect is a small per-row perturbation, and the large output
+changes are accumulation plus greedy amplification at near-tied tokens.
 
-- MHC pre-norm: both call sites are gated on `is_deep_gemm_supported()`, which is False
-  on SM80, and the TileLang path pins `n_splits=1` for `num_tokens >= 128`.
-- MoE grouped GEMM: its `Params` carry no `split_k_slices`, so it walks the full K per
-  tile and a row's result cannot depend on the grid size.
-- Indexer logits KV grouping: `_select_prefill_kv_group` returns 1 below
-  `_KV_GROUP_MIN_N = 16384`, far above any prefix length here.
+### Root cause: cuBLAS picks a different kernel per M
 
-The remaining suspects are the sparse-MLA prefill attention and the indexer's top-k
-selection (512 of ~651 compressed keys, so the selection boundary is dense and a tiny
-logit change flips which keys are attended). Fixing it means making those kernels
-batch-invariant; upstream's `VLLM_BATCH_INVARIANT` covers none of this model's kernels.
+`benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py` reduces it to a ten-line
+reproduction on a spare GPU: hold row 0 of the activations bit-identical, vary `M`, and
+compare row 0 of the product.
 
-**Impact**, measured on eight realistic 1200-token prompts built from this repo's docs,
-128 greedy tokens each, cold against cached:
+```
+worst |row0 drift| across M in {277,320,384,448,512,597,900,1024}, bf16:
+   5120 x 5120: 1.562e-02  M-DEPENDENT      2304 x 5120: 0.000e+00  invariant
+   5120 x 2304: 1.562e-02  M-DEPENDENT      1536 x 5120: 0.000e+00  invariant
+   5120 x  384: 1.562e-02  M-DEPENDENT       512 x 5120: 0.000e+00  invariant
+   5120 x 1536: 1.562e-02  M-DEPENDENT       128 x 5120: 0.000e+00  invariant
+   5120 x  512: 1.562e-02  M-DEPENDENT      2048 x 5120: 0.000e+00  invariant
+```
+
+Three things follow from the same probe:
+
+- The drift is exactly one bf16 ULP (`|ref| ~ 3.5`, bf16 eps ~ 0.0137), so it is a
+  reduction-order change, not a wrong result.
+- The same `M` run twice is bit-identical, so it is the *selection* that depends on `M`,
+  not run-to-run nondeterminism.
+- `M` thresholds for the `5120x5120` shape sit near 256, 368, 384 and 436, which is the
+  bucket structure the engine-level sweep sees after accumulation.
+
+Only `K == 5120` -- the hidden size, i.e. every GEMM that reads the residual stream -- is
+affected. The `K = 2304` expert down-projections and the rest are stable, and the MoE
+grouped GEMM is CUTLASS with a full-K walk per tile, so it cannot depend on the grid.
+MHC pre-norm is `n_splits = 1` for prefill (its split path is gated on DeepGEMM, which is
+unavailable on SM80), and the indexer's `_select_prefill_kv_group` returns 1 below
+`_KV_GROUP_MIN_N = 16384`.
+
+Neither cheap knob removes it: `preferred_blas_library` is already plain cuBLAS, and
+`CUBLAS_WORKSPACE_CONFIG=:16:8` only stabilises `N in {384, 512}`.
+
+So the fix is a GEMM whose reduction order does not depend on `M` for the `K = 5120`
+call sites during prefill. Upstream's `VLLM_BATCH_INVARIANT` does not cover these call
+sites, and the cost has not been measured yet.
+
+### Impact
+
+Eight realistic 1200-token prompts built from this repo's docs, 128 greedy tokens each,
+cold against cached:
 
 ```
 diverged 8/8    first difference at token 0, 8, 11, 12, 24, 58, 88, 107
 ```
 
 versus 5/5 byte-identical on the five reference prompts and 3/3 on the vision example, so
-the divergence needs a long free-form continuation and a near-tied token to appear. It is
-still the reason a cached and an uncached serving of the same long prompt should be
-expected to differ.
+it needs a long free-form continuation and a near-tied token. It is still the reason a
+cached and an uncached serving of the same long prompt should be expected to differ.
 
 What *is* an invariant, and is asserted by the gate:
 
 - two cold prefills of the same prompt with the same batch shape are bit-identical,
 - two runs that both hit the cache are bit-identical,
 - the hit length is exact.
-
-`prefix_cache_shape_probe.py` re-runs the sweep above.
 
 ## Finding 2 (fixed): a 1..32 token tail block reconciled to zero reuse
 
@@ -288,6 +316,9 @@ retention policy could keep.
 # prefill batch-shape sensitivity (Finding 1), zero reuse
 .venv/bin/python benchmarks/deepseek_v4_1/prefix_cache_shape_probe.py
 
+# the same effect isolated to cuBLAS on a spare GPU
+python benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py --shapes --map
+
 # the KV cache group layout and per-group hit lengths (Finding 2)
 VLLM_KV_CACHE_DEBUG=1 ... benchmarks/deepseek_v4_1/run_port_pp5.sh
 ```
@@ -311,7 +342,10 @@ Two traps the gate scripts now avoid, both of which produced wrong conclusions f
   lengths, TTFT, the `cache_salt` cold/cold control, and the pinned short-tail case.
 - `benchmarks/deepseek_v4_1/vision_reference_example.py`: `--repeat N`, which turns the
   reference example into a multimodal reuse check.
-- `benchmarks/deepseek_v4_1/prefix_cache_shape_probe.py`: new. The Finding 1 sweep.
+- `benchmarks/deepseek_v4_1/prefix_cache_shape_probe.py`: new. The Finding 1 sweep at the
+  engine level.
+- `benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py`: new. The same effect
+  isolated to cuBLAS, plus the M-threshold map and the candidate knobs.
 - `vllm/v1/core/single_type_kv_cache_manager.py`: the retention-tail fix, plus
   `VLLM_KV_CACHE_DEBUG`-gated store/lookup diagnostics that made Finding 2 legible.
 - `vllm/v1/core/kv_cache_coordinator.py`: the same env var dumps the group layout once
