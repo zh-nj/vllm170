@@ -1511,9 +1511,14 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.determinism.batch_invariant import (
+        enable_batch_invariant_math,
+        init_batch_invariance,
+    )
 
     init_batch_invariance()
+    if envs.VLLM_DSV41_STRICT_BF16_GEMM:
+        enable_batch_invariant_math()
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),

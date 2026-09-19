@@ -124,7 +124,7 @@ configuration is 76.4-91.5 ms (about 7%). The two distributions overlap, so ther
 measurable decode cost to the flag, and no measurable gain either -- the benefit is
 entirely in prefill (TTFT).
 
-## Finding 1 (diagnosed, not fixed): the GEMMs are not batch-invariant
+## Finding 1 (diagnosed, not fixed): prefill is not batch-invariant
 
 Cold and warm runs of the same prompt can produce different completions. It is not the
 cache, and it is not fixable at the prefix-cache layer: a row's prefill result depends on
@@ -197,9 +197,59 @@ unavailable on SM80), and the indexer's `_select_prefill_kv_group` returns 1 bel
 Neither cheap knob removes it: `preferred_blas_library` is already plain cuBLAS, and
 `CUBLAS_WORKSPACE_CONFIG=:16:8` only stabilises `N in {384, 512}`.
 
-So the fix is a GEMM whose reduction order does not depend on `M` for the `K = 5120`
-call sites during prefill. Upstream's `VLLM_BATCH_INVARIANT` does not cover these call
-sites, and the cost has not been measured yet.
+So the GEMMs need a reduction order that does not depend on `M`. Upstream already has
+that machinery -- `enable_batch_invariant_mode` installs Triton overrides for exactly
+this on SM80 -- but it is only part of the story: the layer dump below shows the
+*attention* is the dominant remaining source, and `VLLM_BATCH_INVARIANT` cannot be turned
+on for this model until its MoE and attention backends declare batch invariance.
+
+### Where it enters: the attention, at layer 0
+
+The engine-level logits say *that* a row depends on its batch; the layer dump says
+*where*. `_ProbeRowDump` in `vllm/models/deepseek_v4_1/nvidia/model.py` writes one
+token's row after every local stage, keyed by the batch's row count, triggered by the
+existence of `/tmp/dsv41_rowdump_on` (not an env var -- the worker processes do not
+inherit arbitrary `VLLM_*` names from `vllm serve`, so an env-gated diagnostic silently
+never fires) with the target index in `/tmp/dsv41_rowdump_pos`.
+
+Three prompts of 1301, 1405 and 1533 tokens, with the first chunk fixed at 1020 rows:
+
+```
+stage                        vs M385      vs M513
+layers.0.mhc_pre_attn        identical    identical     <- embedding + MHC pre-norm + norm
+layers.0.attn_out            7.812e-03    7.812e-03     <- first divergence: ~1 bf16 ULP
+layers.0.ffn_out             1.562e-02    1.562e-02
+```
+
+So the embedding, the MHC pre-norm and the RMSNorm are batch-invariant, and layer 0's
+**attention output is already different** before the MoE runs. Layer 0 has
+`compress_ratio = 0`, i.e. it is a pure sliding-window layer with no compressed cache,
+no indexer and no top-k, which isolates the batch dependence to the **sliding-window
+attention prefill path**. The MoE only amplifies what the attention hands it, which also
+retires the earlier suspicion of the grouped GEMM.
+
+The same run corrected an assumption worth recording: the first prefill chunk is **1020**
+tokens, not `max_num_batched_tokens` (1024), so the second chunk is `n - 1020`. An
+earlier probe that assumed a 1024-token first chunk silently matched nothing.
+
+### Partial mitigation, off by default
+
+`VLLM_DSV41_STRICT_BF16_GEMM=1` installs upstream's batch-invariant Triton overrides for
+`mm`/`addmm`/`matmul`/`linear` (`enable_batch_invariant_mode`, whose SM80 branch exists
+for exactly this reason) and turns the reduced-precision reductions off. Measured on this
+instance:
+
+```
+engine spread over chunk lengths   1.79 nats -> 0.75 nats   (not 0)
+primitive row-level spread         0.026 -> 0.014 nats
+decode                             73.0 -> 77.0 ms/step    (~5% slower)
+prefill TTFT                       0.95 -> 1.15 s cold     (inside noise)
+```
+
+It roughly halves the perturbation but does not remove it, because the attention is the
+dominant remaining source and the overrides only cover `aten` matmuls. Since it costs
+decode throughput without closing the problem, it stays **off by default** and is
+documented as an opt-in lever for callers who need the smaller spread.
 
 ### Impact
 
@@ -350,4 +400,8 @@ Two traps the gate scripts now avoid, both of which produced wrong conclusions f
   `VLLM_KV_CACHE_DEBUG`-gated store/lookup diagnostics that made Finding 2 legible.
 - `vllm/v1/core/kv_cache_coordinator.py`: the same env var dumps the group layout once
   per engine and the per-group hit lengths per lookup.
-- `vllm/envs.py`: `VLLM_KV_CACHE_DEBUG`.
+- `vllm/envs.py`: `VLLM_KV_CACHE_DEBUG`, and `VLLM_DSV41_STRICT_BF16_GEMM` (default 0).
+- `vllm/model_executor/determinism/batch_invariant.py`: `enable_batch_invariant_math`,
+  the narrow subset of the batch-invariance mode that this model can use.
+- `vllm/models/deepseek_v4_1/nvidia/model.py`: `_ProbeRowDump`, the layer/stage dump
+  that localized the remaining dependence to the attention.

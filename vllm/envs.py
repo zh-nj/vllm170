@@ -114,6 +114,16 @@ if TYPE_CHECKING:
     # during normal serving, which the phase profiler cannot (it synchronizes per
     # record, serializing the PP pipeline and inflating the step).
     VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY: int = 0
+    # Opt-in: make the bf16/fp16 GEMMs batch-invariant (upstream's Triton
+    # persistent overrides plus full-precision reduction). cuBLAS otherwise
+    # picks its kernel from the batch size, so one row produces a different
+    # result in a different batch -- exactly one bf16 ULP -- and greedy decoding
+    # can diverge between a prefix-cache hit and a cold prefill. Measured on the
+    # PP5 instance: the engine-level spread of one prompt token across chunk
+    # lengths drops 1.79 -> 0.75 nats, but does not reach 0, because the
+    # attention is M-dependent too; decode is ~5% slower (73 -> 77 ms/step).
+    # Off by default for that reason.
+    VLLM_DSV41_STRICT_BF16_GEMM: bool = False
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION: bool = True
@@ -1319,6 +1329,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY", "0")
+    ),
+    "VLLM_DSV41_STRICT_BF16_GEMM": lambda: bool(
+        int(os.getenv("VLLM_DSV41_STRICT_BF16_GEMM", "0"))
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH", ""

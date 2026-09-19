@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -419,10 +420,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        if _ROW_DUMP is not None:
+            _ROW_DUMP.capture(f"{self.prefix}.mhc_pre_attn", x, positions)
         with phase_profile_stage("attn.total", x, level="module"):
             x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        if _ROW_DUMP is not None:
+            _ROW_DUMP.capture(f"{self.prefix}.attn_out", x, positions)
 
         with phase_profile_stage("hc.post_attn", x, level="module"):
             residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
@@ -442,7 +447,73 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.ffn_norm.variance_epsilon,
             )
         x = self.ffn(x, input_ids)
+        if _ROW_DUMP is not None:
+            _ROW_DUMP.capture(f"{self.prefix}.ffn_out", x, positions)
         return x, residual, post_mix, res_mix, ffn_pre
+
+
+class _ProbeRowDump:
+    """Dump one token's hidden state after every local layer, per chunk size.
+
+    Two prefill batch shapes produce different logits for the same token (see
+    ``prefix_cache_shapes_probe.py``). Comparing the row layer by layer says
+    which stage introduces the difference: the first layer whose value differs
+    is the one to look at, and everything before it is innocent. Files are keyed
+    by the number of tokens in the batch, so each shape lands in its own file.
+
+    Triggered by the existence of ``_ROW_DUMP_TRIGGER`` rather than an env var:
+    the vLLM worker processes do not inherit arbitrary ``VLLM_*`` names from
+    ``vllm serve``, so an env-gated diagnostic silently never fires. The target
+    token index is read from ``_ROW_DUMP_POS_FILE``, which lets one server
+    answer several questions without a restart.
+    """
+
+    def __init__(self, path: str, rank: int) -> None:
+        self.path = path
+        self.rank = rank
+        self.rows: dict[int, torch.Tensor] = {}
+        self.size: int | None = None
+
+    def capture(
+        self,
+        key: "int | str",
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            # A capture replays the same forward with a padded batch; reading a
+            # value back or saving a tensor there would break the capture.
+            return
+        if positions.numel() < 64:
+            # A prefill chunk, not a decode batch (at most max_num_seqs *
+            # (num_spec + 1) rows). The chunk's start position is not assumed:
+            # the scheduler's split is what this dump is here to look past.
+            return
+        try:
+            with open(_ROW_DUMP_POS_FILE) as fh:
+                target = int(fh.read().strip())
+        except (OSError, ValueError):
+            return
+        matches = (positions == target).nonzero()
+        if matches.numel() == 0:
+            return
+        self.size = int(positions.numel())
+        row = matches[0, 0]
+        self.rows[key] = hidden_states[row].detach().float().cpu().clone()
+
+    def flush(self) -> None:
+        if self.rows and self.size is not None:
+            torch.save(self.rows, f"{self.path}.rank{self.rank}.M{self.size}.pt")
+        self.rows = {}
+        self.size = None
+
+
+_ROW_DUMP_TRIGGER = "/tmp/dsv41_rowdump_on"
+_ROW_DUMP_POS_FILE = "/tmp/dsv41_rowdump_pos"
+_ROW_DUMP_PATH = "/tmp/dsv41row"
+# Set for the duration of one forward by DeepseekV4Model.forward so the decoder
+# layers can capture their own intermediates without threading a handle through.
+_ROW_DUMP: "_ProbeRowDump | None" = None
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -979,6 +1050,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        global _ROW_DUMP
+        _ROW_DUMP = (
+            _ProbeRowDump(_ROW_DUMP_PATH, get_pp_group().rank_in_group)
+            if os.path.exists(_ROW_DUMP_TRIGGER)
+            else None
+        )
+        row_dump = _ROW_DUMP
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -999,6 +1077,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_hashes,
                 engram_mask,
             )
+            if row_dump is not None:
+                row_dump.capture(idx, hidden_states, positions)
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = mhc_post_tilelang(
@@ -1009,6 +1089,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
+        if row_dump is not None:
+            row_dump.flush()
+        _ROW_DUMP = None
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:

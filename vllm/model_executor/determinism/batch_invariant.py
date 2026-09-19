@@ -977,6 +977,32 @@ def enable_batch_invariant_mode():
         torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
+def enable_batch_invariant_math() -> None:
+    """Make the bf16/fp16 GEMMs give the same row for the same batch row.
+
+    ``enable_batch_invariant_mode`` installs persistent Triton overrides for
+    ``mm``/``addmm``/``matmul``/``linear``, which is what SM80 needs: cuBLAS
+    selects its kernel from the problem shape, and on this part that selection
+    moves a bit-identical row by exactly one bf16 ULP as ``M`` crosses the
+    thresholds near 256, 368, 384 and 436. Anything that changes how many tokens
+    share a batch -- a prefix-cache hit, a different ``max_num_batched_tokens``,
+    or plain concurrency -- therefore changes the logits, and greedy decoding
+    can diverge on a near-tied token.
+
+    This is deliberately narrower than :func:`init_batch_invariance`: it does not
+    set ``VLLM_BATCH_INVARIANT``, so no kernel is rejected for failing to declare
+    batch invariance, and it does not call :func:`override_envs_for_invariance`,
+    whose NCCL settings (single channel, ``Simple`` protocol) are unrelated to
+    GEMM numerics and would cost the PP5 broadcast.
+
+    See ``benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py``.
+    """
+    resolve_tuned_matmul_configs()
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    enable_batch_invariant_mode()
+
+
 def override_envs_for_invariance():
     os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
