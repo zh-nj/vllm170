@@ -108,6 +108,13 @@ phase") is what tells a short extend from a real decode; when the runner does no
 supply it the old behavior is kept, and the reorder guarantees the batch order the
 split assumes.
 
+Two further `split_decodes_and_prefills` call sites pass
+`treat_short_extends_as_decodes=not self.use_pcp`
+(`model_executor/layers/attention/sparse_mla_attention.py:276`,
+`mla_attention.py:2446`). They belong to other MLA implementations, not to the
+sparse-SWA path this model runs, and were left alone: closing the tail band with
+only the two sites above is the evidence that they are off this path.
+
 ### Verification
 
 Pairwise, within one boot, positions at and after the second row of the tail, for
