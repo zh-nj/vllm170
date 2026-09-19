@@ -134,7 +134,10 @@ def matmul_kernel_persistent(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -146,8 +149,10 @@ def matmul_persistent(
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    # Allocates output. The kernel accumulates in fp32 whenever the output is
+    # wider than the inputs, so an fp32 output is the accumulator itself, not a
+    # rounded intermediate. The tiling below still comes from the input dtype.
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -589,8 +594,8 @@ def mean_dim(
     return output
 
 
-def mm_batch_invariant(a, b):
-    return matmul_persistent(a, b)
+def mm_batch_invariant(a, b, out_dtype=None):
+    return matmul_persistent(a, b, out_dtype=out_dtype)
 
 
 def matmul_batch_invariant(a, b, *, out=None):
@@ -922,6 +927,12 @@ def enable_batch_invariant_mode():
             # SM80 (Ampere) cannot rely on cuBLASLt-only determinism; install the
             # triton persistent matmul overrides for mm/addmm/matmul/linear.
             _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)
+            # `out_dtype=` is a separate overload, so an fp32 accumulate used to
+            # fall through to cuBLAS and pick its kernel from M. The models that
+            # ask for it -- an lm_head projecting logits, a compressor scoring
+            # its gate -- read the residual stream, which is exactly the K where
+            # cuBLAS reassociates.
+            _batch_invariant_LIB.impl("aten::mm.dtype", mm_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)

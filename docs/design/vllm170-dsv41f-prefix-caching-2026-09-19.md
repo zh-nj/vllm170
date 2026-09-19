@@ -124,7 +124,7 @@ configuration is 76.4-91.5 ms (about 7%). The two distributions overlap, so ther
 measurable decode cost to the flag, and no measurable gain either -- the benefit is
 entirely in prefill (TTFT).
 
-## Finding 1: prefill shape dependence, repair in progress
+## Finding 1: prefill shape dependence, root-caused and repaired
 
 ### Evidence and corrected scope
 
@@ -202,6 +202,180 @@ The older `VLLM_MARLIN_M_ALIGN` covers only M in 9..128. Its source comment is
 historical evidence, not a measured prefill cost bound. In particular the quoted
 1922 -> 7318 microseconds corresponds to +280.75%, not +177%, and its 56-row
 example does not describe the current default launch geometry.
+
+### Root cause: `aten::mm`'s `out_dtype` overload is not covered
+
+With the full-K launch enabled, the divergence is no longer the batch in the way
+the earlier framing assumed. Comparing chunk shapes 281, 385 and 513 rows of the
+same three prompts, where 281 and 385 are the control:
+
+| rank | layers | M281 vs M385 | M281 vs M513 |
+| --- | --- | ---: | ---: |
+| 0 | 0-7 | identical | identical |
+| 1 | 8-15 | identical | identical |
+| 2 | 16-19 | identical | identical |
+| 2 | 20 `attn_out` | identical | 1.562e-02 |
+| 2 | 20-23 `ffn_out` | identical | up to 5.6e-02 |
+| 3, 4 | 24-39 | identical | inherited over the pipeline boundary |
+
+Two prompts differing only in trailing tokens are bit-identical below the
+boundary and differ above it, so the trigger is a discrete threshold, not
+accumulated noise. A length sweep puts it between chunk 2 = 509 and chunk 2 = 513
+rows. Layer 20 is the first layer with `compress_ratio = 1`:
+
+| layers | `compress_ratio` |
+| --- | ---: |
+| 0-1 | 0 (sliding window only, no compressor or indexer) |
+| 2-19 | 2 |
+| 20-39 | 1 |
+| 40-42 | 0 (MTP) |
+
+So the 16 ratio-2 layers below layer 20 see the same 513-row batch and stay
+bit-identical. Whatever moves is specific to the ratio-1 geometry.
+
+`_ProbeRowDump` narrowed it to a single stage inside layer 20. Ordered by the
+attention's causal sequence, for the round-robin dump with `layers.20` selected:
+
+| stage inside layer 20 | M281 vs M385 | M281 vs M513 |
+| --- | ---: | ---: |
+| `mhc_pre_attn` (input) | 0 | 0 |
+| `input_proj.qr_kv` (fused_wqa_wkv, MXFP8 Marlin) | 0 | 0 |
+| `input_proj.kv_score` | 0 | **9.686e-07** |
+| `compressor.latent` | 0 | 1.907e-06 |
+| `indexer.index_q`, `indexer.index_weights` | 0 | 0 |
+| `indexer.topk_indices` | 0 | 0 |
+| `attn_raw` | 0 | 4.883e-04 |
+| `o_proj.out`, `attn_out`, `ffn_out` | 0 | 7.813e-03 |
+
+`kv_score` is the compressor's pooling-score projection, and it is the one input
+GEMM that is not a quantized linear:
+
+```python
+# vllm/models/deepseek_v4_1/attention.py
+def compressor_kv_score() -> torch.Tensor:
+    return torch.mm(
+        hidden_states,
+        compressor.fused_wkv_wgate.weight.T,
+        out_dtype=torch.float32,
+    )
+```
+
+Its width is `512` for `compress_ratio == 1` (no pooling gate) and `1024` for
+`compress_ratio == 2` (kv plus gate), which is precisely what separates layer 20
+from the layers below it. The top-k selection is *identical*, so this is not a
+selection change; the drift spreads to all 128 rows of the dump window uniformly
+(maximum 3.0e-06), which is what a reduction-order change looks like, and it
+reaches the attention through the compressed K cache that `latent` writes.
+
+Isolated on a spare CMP 170HX, `mm([M,5120], [5120,N], out_dtype=float32)` with a
+bit-identical row 0, under `enable_batch_invariant_math()` (what
+`dsv41_strict_bf16_gemm` calls):
+
+| shape | `mm(out_dtype=f32)` rows that move | `mm()` / `matmul` |
+| --- | --- | --- |
+| N = 512 | M = 513, 514, 600, 1020, 1024 | none |
+| N = 1024 | none | none |
+
+The threshold is exactly `M > 512` and only for the fp32-output overload: the
+SM80 branch of `enable_batch_invariant_mode()` registers `aten::mm`,
+`aten::addmm`, `aten::matmul` and `aten::linear` *without* their `out_dtype`
+overloads, so `aten::mm.dtype` keeps dispatching to cuBLAS. That is also why the
+strict flag only ever halved the spread instead of removing it, and why
+`CUBLAS_WORKSPACE_CONFIG=:16:8` does not help either (measured: the fp32 path then
+moves at every M from 281 up, so the limit selects different kernels rather than
+a fixed order). A plausible reading of the default behaviour is that cuBLAS turns
+on split-K once the batch is wide enough to leave the device idle at 512 rows,
+which would put the reassociation exactly at the observed boundary; that part is
+inference from the threshold, not a captured kernel selection.
+
+### Repair
+
+`matmul_persistent` now honors an `out_dtype`, so the fp32 result is the fp32
+accumulator itself rather than a rounded bf16 value, with the tiling still chosen
+from the input dtype. `mm_batch_invariant` passes it through and the SM80 branch
+registers the missing `aten::mm.dtype` overload. The fix is inert unless
+`dsv41_strict_bf16_gemm` is on, so the default configuration is unchanged.
+
+On the same isolated shape, the three production projections and the fp32 path
+are bit-identical across M = 1..1024 including every crossing of 512, and the
+result stays an fp32 accumulate: against an fp64 reference the error is two
+orders of magnitude below the bf16 result the overload exists to avoid
+(`tests/v1/determinism/test_matmul_batch_invariant.py`).
+
+`aten::mm.out` and `aten::mm.dtype_out` remain uncovered; no call site in this
+model uses them. The mode also makes unsupported dtypes raise rather than fall
+back, which is pre-existing: an fp64 `matmul` under the flag fails with
+`KeyError: torch.float64`, so the registration check runs in a child process.
+
+Cost, measured on the shapes this model actually uses, cuBLAS against the
+override (median of 30 CUDA-event timings after warmup):
+
+| GEMM | M | cuBLAS | override |
+| --- | ---: | ---: | ---: |
+| lm_head, N = 129280 | 1 | 0.96 ms | 3.53 ms |
+| lm_head, N = 129280 | 40 | 0.91 ms | 2.57 ms |
+| lm_head, N = 129280 | 1533 | 12.01 ms | 24.73 ms |
+| compressor, N = 512 | 513 | 0.07 ms | 0.52 ms |
+
+The lm_head projection is bandwidth-bound on a 1.3 GB weight, so the override
+mainly loses the small-M efficiency of `BLOCK_SIZE_M = 128`. That is the price of
+exactness on this box; the tuned-config table in
+`vllm/model_executor/determinism/batch_invariant_configs.py` is where it could be
+recovered.
+
+### Verification of the repair
+
+Measured on the PP5 instance with `--additional-config
+'{"marlin_full_k":true,"dsv41_strict_bf16_gemm":true}'`, one request per length,
+each with a fresh UUID salt:
+
+| check | before | after |
+| --- | --- | --- |
+| three lengths 1301/1405/1533, two repeats each | 2 distinct logprobs, spread 0.243736 | **1 value, spread 0.0** |
+| the 35-length sweep across the old boundary | 2 distinct values | **1 value, spread 0.0** |
+| layer 20 `input_proj.kv_score`, M281 vs M513 | 9.686e-07 | 0 |
+| layer 20 `attn_out`, M281 vs M513 | 7.813e-03 | 0 |
+| every stage, every layer, all five ranks | denominator diverged | 0 |
+
+The only keys that still differ between the three shapes are the probe's own
+`context_rows` and `support_indices`, which encode the context width and are
+supposed to (232 = 1533 - 1301). The prefix-cache gate still passes with all five
+cases reusing (mean TTFT 1.097 -> 0.489 s).
+
+The absolute logprob moves (about -10.64 to -10.04 on that prompt) because the
+reduction order changed from cuBLAS's to the persistent kernel's. That is
+expected, and it is the same amplification the ledger already measured: a 1e-6
+drift at layer 20 becomes 0.24 to 0.6 nats at the logits. Invariance across
+shapes, not equality with the previous kernel's value, is the property being
+established.
+
+### What the repair does not cover
+
+Cold against warm is still not token-identical in every gate case, and the
+remaining divergence is a third, independent batch dependence, first visible at
+rank 0's layer 1: layer 0 is bit-identical between a 480-row cold chunk and a
+92-row warm tail, and layer 1's `mhc_pre_attn` differs by exactly one bf16 ULP
+(3.05e-05, at an element of magnitude 0.01) before the attention amplifies it.
+
+The MHC kernels choose a split count from the row count:
+
+```python
+def _tilelang_hc_prenorm_num_splits(input_size: int, num_tokens: int) -> int:
+    if num_tokens >= 128 or input_size % 1024 != 0:
+        return 1
+    ...
+```
+
+and `mhc_post_tilelang` has the same shape at 16 rows (`use_small_fma =
+num_tokens <= 16`, then `tile_n` and `n_splits` follow the row count). Both are
+inert while `is_deep_gemm_supported()` is false, but this one is not: it is the
+tilelang fallback's own heuristic. A prefix-cache hit recomputes a tail of at
+most 128 tokens, so a hit lands on the small-batch side of exactly this
+threshold while the cold prefill lands on the large-batch side -- which is why
+the probe's 281..513-row sweep no longer sees any divergence and cold/warm still
+does. Fixing it means pinning these two choices to their large-batch values when
+exactness is requested, at the cost of the decode-shaped parallelism the
+heuristic was added for.
 
 ### Upstream comparison
 
