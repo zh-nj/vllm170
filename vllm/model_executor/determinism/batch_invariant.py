@@ -910,6 +910,16 @@ _fp32_block_size_n = 128
 _fp32_num_stages = 3
 
 
+def batch_invariant_mode_enabled() -> bool:
+    """Whether the persistent batch-invariant overrides are installed here.
+
+    Kernel heuristics that pick a split count from the number of rows have to
+    know about this: a split count is a K reassociation, and no dispatcher-level
+    override can see a choice made inside a kernel launcher.
+    """
+    return _batch_invariant_MODE
+
+
 def enable_batch_invariant_mode():
     global _batch_invariant_MODE, _batch_invariant_LIB
     global _fp16_block_size_n, _fp32_block_size_n, _fp32_num_stages

@@ -21,18 +21,27 @@ block-aligned hits, ~2x lower TTFT on a repeated 1.5-2.5K prompt, ~11x on a repe
 against the caching-off server, and working multimodal reuse. Decode throughput is
 unchanged within the noise of this box.
 
-Two behaviours showed up while verifying it, and both are documented below:
+Three behaviours showed up while verifying it. All three are root-caused and
+fixed, with the evidence below:
 
-- **The prefill result is sensitive to batch shape**: a historical shape sweep reported
-  discrete logprob changes, consistent with a reduction-order change in cuBLAS. The
-  sweep used a `shape-{n}` salt but did not verify cache-hit counters or record complete
-  mode provenance, so its 1.789114952-nat spread is a historical measurement rather than
-  complete zero-reuse evidence. A separate spare-GPU reproduction isolates an
-  M-dependent bf16 reduction-order effect in cuBLAS. This is diagnosed, not fixed.
+- **The prefill result is sensitive to batch shape.** A historical sweep reported
+  discrete logprob changes. Its `shape-{n}` salt did not verify cache-hit
+  counters and recorded no mode provenance, so its 1.789114952-nat spread is a
+  historical measurement rather than clean zero-reuse evidence -- but the effect
+  is real, and it had three independent causes: Marlin's M-tuned tiling, the
+  `out_dtype` overload of `aten::mm` that the batch-invariant overrides did not
+  cover, and the MHC kernels choosing a split and a tiling from the row count.
+  With all three repaired, a 35-length sweep across the old boundary is a single
+  value (spread 0.0) and cold/warm now match: 0 of 16 pairs diverge over 128
+  greedy tokens, against 8 of 8 realistic prompts before.
 - **A prompt that ends 1..32 tokens past a 128-block boundary reconciled to zero
   reuse**, even though its blocks were cached. Root-caused to the sparse-retention tail
   in `SlidingWindowManager.reachable_block_mask` and **fixed**; the whole band now
   reuses the aligned prefix.
+
+The three repairs are opt-in, as a group, through
+`--additional-config '{"marlin_full_k":true,"dsv41_strict_bf16_gemm":true}'`;
+with the defaults the engine behaves as before.
 
 ## Why it was off
 
@@ -349,33 +358,80 @@ drift at layer 20 becomes 0.24 to 0.6 nats at the logits. Invariance across
 shapes, not equality with the previous kernel's value, is the property being
 established.
 
-### What the repair does not cover
+### Finding 3 (fixed): the MHC kernels tiled themselves by row count
 
-Cold against warm is still not token-identical in every gate case, and the
-remaining divergence is a third, independent batch dependence, first visible at
-rank 0's layer 1: layer 0 is bit-identical between a 480-row cold chunk and a
-92-row warm tail, and layer 1's `mhc_pre_attn` differs by exactly one bf16 ULP
-(3.05e-05, at an element of magnitude 0.01) before the attention amplifies it.
+After the `mm.dtype` repair the probe was flat, but cold and warm still produced
+different tokens in three of the gate's five cases. The row dump says where:
+layer 0 is bit-identical between a 480-row cold chunk and a 92-row warm tail,
+and layer 1's `mhc_pre_attn` is the first thing that differs -- by 3.05e-05, one
+bf16 ULP, at an element of magnitude 0.01 -- before the attention amplifies it.
 
-The MHC kernels choose a split count from the row count:
+Nothing upstream of that value differs, so the pre-norm offers two candidates,
+and both of them read the row count:
 
-```python
-def _tilelang_hc_prenorm_num_splits(input_size: int, num_tokens: int) -> int:
-    if num_tokens >= 128 or input_size % 1024 != 0:
-        return 1
-    ...
-```
+- `_tilelang_hc_prenorm_num_splits` returns 1 above 128 rows and otherwise the
+  largest legal split, which at the V4.1 geometry is 10 for 92 rows and 1 for
+  480.
+- `_tilelang_hc_prenorm_gemm` picks between three tilings of the same reduction:
+  a block-M kernel at `>= 1024` rows, `n_thr=1024, tile_n=4` below 128 rows, and
+  `n_thr=512, tile_n=12` in between.
+- `mhc_post_tilelang` chooses a different fused kernel entirely at
+  `num_tokens <= 16` (`use_small_fma`), with `n_splits` 4 or 8 instead of 1.
 
-and `mhc_post_tilelang` has the same shape at 16 rows (`use_small_fma =
-num_tokens <= 16`, then `tile_n` and `n_splits` follow the row count). Both are
-inert while `is_deep_gemm_supported()` is false, but this one is not: it is the
-tilelang fallback's own heuristic. A prefix-cache hit recomputes a tail of at
-most 128 tokens, so a hit lands on the small-batch side of exactly this
-threshold while the cold prefill lands on the large-batch side -- which is why
-the probe's 281..513-row sweep no longer sees any divergence and cold/warm still
-does. Fixing it means pinning these two choices to their large-batch values when
-exactness is requested, at the cost of the decode-shaped parallelism the
-heuristic was added for.
+A prefix-cache hit recomputes at most 128 tokens of tail -- and a speculative
+decode step far fewer -- so a warm request lands on the small side of every one
+of those thresholds while the cold prefill it replaces lands on the large side.
+That is also why the probe's 281..513-row sweep could not see it: that sweep
+never goes below 128 rows.
+
+The repair pins all three to the large-batch choice when
+`batch_invariant_mode_enabled()` is set -- `n_splits = 1`, both special tilings
+off, which is the path every in-range prefill chunk already takes. Without the
+flag the heuristics are untouched. `tests/kernels/test_mhc_kernels.py` asserts
+the split rule directly, through an `invariant=` argument, so it does not have
+to install the process-global overrides.
+
+Verified by dumping the same prompt served cold and warm, at the position that
+predicts the first generated token:
+
+| check | before | after |
+| --- | --- | --- |
+| every stage, every layer, rank 0 | layer 1 `mhc_pre_attn`, 3.05e-05 | 0 |
+| every stage, every layer, all 5 ranks | 21/24/49/24/24 keys | 0 |
+
+One key still differs, and has to: `layers.20.attn.prefill.support_indices`. Its
+first 512 entries (the compressed top-k) are identical and its last 128 (the
+sliding window) differ by exactly 388 = 480 - 92, because that part is addressed
+relative to the query's own gathered row. Both point at the same KV rows, and
+the only consumer of the indices, `rocm_sparse_attn_prefill`, returns a
+bit-identical result.
+
+End-to-end, on the same instance:
+
+| check | before | after |
+| --- | --- | --- |
+| gate cases with any cold/warm token difference | 3 of 5 | **0 of 5** |
+| gate mean TTFT cold -> warm | 1.097 -> 0.489 s | 1.096 -> 0.477 s |
+| 16 cold/warm pairs, 128 greedy tokens each, tails 4..128 | 8 of 8 realistic prompts diverged | **0 of 16** |
+| decode, 32000-token prompt | 89.6 ms/token | 80.9 ms/token |
+
+The decode difference is across two restarts rather than within one window, and
+this box spreads about 7% run to run, so read it as "not slower": the pinned
+tiling is the one prefill already used, and the small-batch branch it replaces
+was not the faster one here. Vision is unchanged (both images named, 3/3 repeats
+identical, 640 cached tokens) and DSpark acceptance is 94.55% at 5.727 accepted
+tokens, against 95.45% at 5.773 before the repairs -- the arithmetic path moved,
+so a small move in acceptance is expected, not a defect.
+
+### What remains open
+
+`aten::mm.out` and `aten::mm.dtype_out` are still uncovered by the overrides,
+though no call site in this model uses them, and the mode makes unsupported
+dtypes raise instead of falling back (an fp64 `matmul` under the flag fails with
+`KeyError: torch.float64`). The exactness above is measured for this model's
+layers, not proven for every operator: each new batch-shaped heuristic in a
+kernel launcher is a new instance of the same class of bug, and the row probe is
+what finds them.
 
 ### Upstream comparison
 

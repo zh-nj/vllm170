@@ -29,6 +29,9 @@ def _tilelang_hc_prenorm_gemm(
     n_thr: int = 512,
     n_splits: int = 1,
 ) -> None:
+    from vllm.model_executor.determinism.batch_invariant import (
+        batch_invariant_mode_enabled,
+    )
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         hc_prenorm_gemm_block_m_tilelang,
         hc_prenorm_gemm_tilelang,
@@ -40,7 +43,14 @@ def _tilelang_hc_prenorm_gemm(
     assert x.shape[1] % n_splits == 0
     assert (x.shape[1] // n_splits) % n_thr == 0
     use_default_config = tile_n == 12 and n_thr == 512
-    if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
+    # The row count picks between three tilings of the same K reduction, so it
+    # may not pick one when batch-invariant numerics were requested: a
+    # prefix-cache hit recomputes at most 128 tokens of tail -- and a decode
+    # step far fewer -- while the cold prefill it replaces runs a longer chunk.
+    # Pin both special cases off, which leaves the tiling every in-range prefill
+    # chunk already uses.
+    invariant = batch_invariant_mode_enabled()
+    if not invariant and n_splits == 1 and use_default_config and x.shape[0] >= 1024:
         hc_prenorm_gemm_block_m_tilelang(
             x,
             fn,
@@ -55,7 +65,8 @@ def _tilelang_hc_prenorm_gemm(
         )
         return
     if (
-        use_default_config
+        not invariant
+        and use_default_config
         and x.shape[0] < 128
         and x.shape[1] % 1024 == 0
         and (x.shape[1] // n_splits) % 1024 == 0
@@ -94,7 +105,9 @@ def _tilelang_hc_prenorm_gemm(
 _TILELANG_SPLIT_TARGET = 10
 
 
-def _tilelang_hc_prenorm_num_splits(input_size: int, num_tokens: int) -> int:
+def _tilelang_hc_prenorm_num_splits(
+    input_size: int, num_tokens: int, *, invariant: bool | None = None
+) -> int:
     """Split-K factor for the non-DeepGEMM prenorm GEMM.
 
     Without DeepGEMM the tilelang path ran with ``n_splits=1``. The prenorm
@@ -108,8 +121,27 @@ def _tilelang_hc_prenorm_num_splits(input_size: int, num_tokens: int) -> int:
     branch pins ``n_thr=1024``, so a split is only legal when
     ``(input_size // n_splits) % 1024 == 0``; take the largest legal split up to
     the measured target.
+
+    A split count is a K reassociation, so it may not follow the batch when
+    batch-invariant numerics were requested: a prefix-cache hit recomputes a
+    tail of at most 128 tokens and would otherwise land on the split side of
+    this threshold while the cold prefill it replaces lands on the other.
+
+    Args:
+        input_size: Width of the prenorm reduction.
+        num_tokens: Rows in this batch.
+        invariant: Pin the answer to the large-batch value. Defaults to whether
+            the batch-invariant overrides are installed, and exists so the rule
+            can be tested without installing them process-wide.
     """
-    if num_tokens >= 128 or input_size % 1024 != 0:
+    if invariant is None:
+        from vllm.model_executor.determinism.batch_invariant import (
+            batch_invariant_mode_enabled,
+        )
+
+        invariant = batch_invariant_mode_enabled()
+
+    if num_tokens >= 128 or input_size % 1024 != 0 or invariant:
         return 1
     k_blocks = input_size // 1024
     best = 1
@@ -220,7 +252,9 @@ def mhc_pre_delayed_tilelang(
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
     else:
-        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, input_size, 1, n_splits=n_splits)
+        _tilelang_hc_prenorm_gemm(
+            x, fn, mixes, sqrsum, input_size, 1, n_splits=n_splits
+        )
     if norm_weight is not None:
         assert norm_weight.shape == (hidden_size,)
         assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
@@ -751,6 +785,9 @@ def mhc_fused_post_pre_tilelang(
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
+    from vllm.model_executor.determinism.batch_invariant import (
+        batch_invariant_mode_enabled,
+    )
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
@@ -769,6 +806,10 @@ def mhc_fused_post_pre_tilelang(
             )
         else:
             n_splits = 1
+    if batch_invariant_mode_enabled():
+        # Same reason as _tilelang_hc_prenorm_num_splits: a K reassociation may
+        # not depend on how many rows the batch happens to have.
+        n_splits = 1
 
     gemm_out_mul = torch.empty(
         n_splits,

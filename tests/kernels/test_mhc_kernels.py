@@ -11,6 +11,7 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.layers.mhc as mhc_layers
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
+    _tilelang_hc_prenorm_num_splits,
     _torch_hc_prenorm_gemm,
     mhc_pre_broadcast_tilelang,
 )
@@ -31,6 +32,22 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+
+
+def test_hc_prenorm_split_can_be_pinned_across_batch_sizes():
+    """A split count is a K reassociation, so it may not follow the batch.
+
+    The tilelang fallback picks it from the row count: at the V4.1 geometry
+    (input_size 20480) 92 rows ask for 10 splits and 480 rows for 1. A
+    prefix-cache hit recomputes a tail of at most 128 tokens, so a warm serving
+    and the cold prefill it replaces land on opposite sides of that threshold
+    and reassociate K differently. Batch-invariant mode pins it.
+    """
+    sizes = (1, 8, 16, 92, 127, 128, 480, 2048)
+
+    pinned = {_tilelang_hc_prenorm_num_splits(20480, n, invariant=True) for n in sizes}
+
+    assert pinned == {1}
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:

@@ -930,16 +930,17 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 # the context width the gather buffer was sized for. Those are
                 # the two quantities every sparse-MLA launch sizes itself from.
                 chunk_positions = positions[query_start:query_end]
-                row_probe.capture(
-                    f"{self.prefix}.prefill.support_indices",
-                    combined_indices,
-                    chunk_positions,
-                )
-                row_probe.capture(
-                    f"{self.prefix}.prefill.support_lens",
-                    combined_lens,
-                    chunk_positions,
-                )
+                if combined_indices.shape[0] == chunk_positions.numel():
+                    row_probe.capture(
+                        f"{self.prefix}.prefill.support_indices",
+                        combined_indices,
+                        chunk_positions,
+                    )
+                    row_probe.capture(
+                        f"{self.prefix}.prefill.support_lens",
+                        combined_lens,
+                        chunk_positions,
+                    )
                 row_probe.capture(
                     f"{self.prefix}.prefill.context_rows",
                     torch.full(
