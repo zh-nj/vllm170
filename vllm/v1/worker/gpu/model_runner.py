@@ -305,6 +305,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.step_timing = StepTimingCollector()
+        if envs.VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY > 0:
+            # Serving-time split of target forward vs draft per step. The phase
+            # profiler synchronizes per record, which serializes the PP pipeline
+            # and inflates the step, so it can attribute but not time; this mode
+            # resolves one event pair per step every N steps instead.
+            self.step_timing.set_stream_interval(
+                envs.VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY
+            )
 
         # General request states.
         self.req_states = RequestState(
@@ -1793,9 +1801,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         profile_flow = classify_target_flow(input_batch.is_prefilling_np)
         profile_extra = {"token_count": input_batch.num_tokens}
+        # Opens the streaming step-timing pair that closes at forward_start, so
+        # the metadata build and input prep are timed separately from the graph
+        # replay. No-op unless the streaming mode is enabled.
+        self.step_timing.prepare_start()
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
+            self.step_timing.attn_meta_start()
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
@@ -1828,6 +1841,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # indices from the previous real batch.
                     for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
                 )
+            self.step_timing.attn_meta_end()
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1877,6 +1891,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 input_ids = None
 
+        self.step_timing.inputs_start()
         with phase_profile_stage(
             "target.model_inputs",
             input_batch.input_ids,
@@ -1921,6 +1936,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         new_tensors[key] = dst
                 model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
                 del intermediate_tensors
+        self.step_timing.inputs_end()
 
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
@@ -2052,7 +2068,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_step_id = self.execute_model_state.scheduler_step_id
         self.execute_model_state = None
 
+        # Closes the target event pair opened by forward_start() in the execute
+        # path. Only meaningful in the streaming step-timing mode.
+        self.step_timing.forward_end()
+
         if not self.is_last_pp_rank:
+            # No draft work on this rank: close the step's event pair with a
+            # zero-length draft so the target slice is still reported.
+            self.step_timing.drafter_start()
+            self.step_timing.drafter_end()
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
@@ -2061,6 +2085,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator is not None
                 and self.speculator.distributed
                 and not self._is_all_reqs_chunked_prefill(input_batch)
+                and getattr(self.speculator, "has_draft_role", True)
             ):
                 self.speculator.set_distributed_step_id(scheduler_step_id)
                 self.speculator.participate_distributed(input_batch)
@@ -2167,6 +2192,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 if pre_hc_hidden_states is not None:
                     spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+            self.step_timing.drafter_start()
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2183,6 +2209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                 )
+            self.step_timing.drafter_end()
             self._update_draft_tokens(input_batch, draft_tokens)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(

@@ -10,9 +10,35 @@ import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
+
+
+def warm_collective_group(
+    group: torch.distributed.ProcessGroup,
+    src: int,
+    device: torch.device,
+    label: str,
+) -> None:
+    """Force NCCL to allocate this group's device buffers now.
+
+    NCCL allocates a communicator's device buffers on first use, not when the
+    communicator is created. Here that first use is the sampled-token broadcast
+    inside the memory-heavy warmup, where the largest rank holds ~57.5 GiB of
+    weights plus the KV cache and has only a few hundred MiB left, so the
+    allocation dies with ``ncclUnhandledCudaError ... Cuda failure 2 'out of
+    memory'``. One one-element collective at construction time allocates the
+    same buffers while the card is still nearly empty, which is why this runs
+    before the KV cache is reserved instead of during warmup.
+    """
+    buffer = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.broadcast(buffer, src=src, group=group)
+    torch.cuda.synchronize(device)
+    logger.info_once("Warmed %s NCCL group buffers before the KV cache.", label)
 
 
 class PPRecvBufferState(Enum):
@@ -247,6 +273,17 @@ class PPHandler:
         # Dedicated subgroup for the sampled-token broadcast.
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
+        )
+        # Allocate its NCCL buffers here (weights are loaded, the KV cache is
+        # not) instead of on the first broadcast inside the warmup, where the
+        # largest rank has no room left. Same for the PP stage send/recv group.
+        warm_collective_group(
+            self.broadcast_group, src=self.last_rank, device=device,
+            label="PP broadcast",
+        )
+        warm_collective_group(
+            get_pp_group().device_group, src=self.last_rank, device=device,
+            label="PP stage",
         )
 
     def on_req_idx_freed(self, req_idx: int) -> None:

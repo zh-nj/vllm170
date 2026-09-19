@@ -43,15 +43,20 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
 
     def get_warmup_keys(self, *, max_tokens: int, **fields) -> list[CompileKey]:
         # The split heuristic changes only at 64-token boundaries.
-        splits = (
-            sorted(
-                {
-                    compute_mhc_pre_num_splits(fields["rms_numel"], num_tokens)
-                    for num_tokens in range(1, max_tokens + 1, 64)
-                }
-            )
+        from vllm.model_executor.kernels.mhc.tilelang import (
+            _tilelang_hc_prenorm_num_splits,
+        )
+
+        fold = (
+            compute_mhc_pre_num_splits
             if is_deep_gemm_supported()
-            else [1]
+            else _tilelang_hc_prenorm_num_splits
+        )
+        splits = sorted(
+            {
+                fold(fields["rms_numel"], num_tokens)
+                for num_tokens in range(1, max_tokens + 1, 64)
+            }
         )
         return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)
 

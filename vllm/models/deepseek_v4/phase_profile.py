@@ -218,10 +218,29 @@ def phase_profile_step(
     context.token_count = token_count
     context.execution = execution
     context.step_kind = step_kind
+    step_started_ns = time.perf_counter_ns()
     try:
         yield
     finally:
+        step_host_us = (time.perf_counter_ns() - step_started_ns) / 1000.0
         flush_phase_profile()
+        _write_record(
+            {
+                "flow": flow,
+                "stage": "step.host_total",
+                "phase": f"dsv4.{flow}.step.host_total",
+                "level": "total",
+                "step_id": context.step_id,
+                "token_count": token_count,
+                "execution": execution,
+                "step_kind": step_kind,
+                "layer": None,
+                "compress_ratio": None,
+                "cpu_elapsed_us": step_host_us,
+                "cpu_start_ns": step_started_ns,
+                "elapsed_us": 0.0,
+            }
+        )
         (
             context.flow,
             context.step_id,
@@ -323,6 +342,7 @@ def phase_profile_stage(
                 "layer": context.layer,
                 "compress_ratio": context.compress_ratio,
                 "cpu_elapsed_us": (time.perf_counter_ns() - cpu_started_ns) / 1000.0,
+                "cpu_start_ns": cpu_started_ns,
             }
             if extra:
                 row["extra"] = extra
@@ -366,6 +386,11 @@ def profile_parallel_draft_step(function: _F) -> _F:
         speculator_name = getattr(self, "_speculator_name", None)
         flow = classify_speculator_flow(speculator_name)
         if flow is None:
+            return function(self, input_batch, *args, **kwargs)
+        if getattr(self, "has_draft_role", True) is False:
+            # Ranks that own no piece of the draft step, e.g. PP0 in a [1,2,3]
+            # DSpark layout, return immediately; wrapping them only puts an empty
+            # row in the draft ledger and costs an event pair per step.
             return function(self, input_batch, *args, **kwargs)
         graph_mode = self.vllm_config.compilation_config.cudagraph_mode.decode_mode()
         execution = (

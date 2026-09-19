@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -45,6 +46,13 @@ _TILE_TABLE: tuple[tuple[int, int, int], ...] = (
 # Block-M candidates the kernel is instantiated for, ascending.
 _BLOCK_M_CANDIDATES: tuple[int, ...] = (16, 64, 128)
 _BLOCK_N = 128
+# The single-token, top-k 6 decode step reads one 4-bit expert slab per slot, so
+# its grouped GEMM is DRAM-latency bound rather than bandwidth bound: halving
+# block-N doubles the CTA count and buys about 12% on the W13+W2 pair in
+# isolation. Only the decode tile is overridable -- larger batches pick
+# block-M 64/128, whose supported block-N set is different.
+_DECODE_BLOCK_N = envs.VLLM_DEEPSEEK_V4_SM80_MOE_DECODE_BLOCK_N
+_SUPPORTED_DECODE_BLOCK_N: tuple[int, ...] = (64, 128)
 
 
 def select_mxfp4_int8_sm80_tile(
@@ -63,10 +71,19 @@ def select_mxfp4_int8_sm80_tile(
     at 2048 tokens on a CMP 170HX, and worse at 4096).
     """
     average = max(1, (num_tokens * topk + num_experts - 1) // num_experts)
-    for block_m in _BLOCK_M_CANDIDATES:
-        if block_m >= average:
-            return block_m, _BLOCK_N
-    return _BLOCK_M_CANDIDATES[-1], _BLOCK_N
+    block_m = _BLOCK_M_CANDIDATES[-1]
+    for candidate in _BLOCK_M_CANDIDATES:
+        if candidate >= average:
+            block_m = candidate
+            break
+    if block_m != _DECODE_BLOCK_M:
+        return block_m, _BLOCK_N
+    if _DECODE_BLOCK_N not in _SUPPORTED_DECODE_BLOCK_N:
+        raise ValueError(
+            f"unsupported MXFP4-int8 SM80 decode block-N {_DECODE_BLOCK_N}; "
+            f"supported values are {_SUPPORTED_DECODE_BLOCK_N}"
+        )
+    return block_m, _DECODE_BLOCK_N
 
 
 def make_mxfp4_int8_sm80_decode_metadata(

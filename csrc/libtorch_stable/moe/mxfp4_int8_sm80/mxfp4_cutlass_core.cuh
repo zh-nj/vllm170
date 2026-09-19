@@ -33,6 +33,14 @@
 #define MXFP4_SMALL_M_THREADBLOCK_K 128
 #endif
 
+// cp.async pipeline depth for the grouped GEMM. Measured against a reader that
+// walks the identical addresses: the kernel spends 73 us per layer moving W13
+// and 127 us in total, so ~54 us of each layer is inner-loop work that is not
+// hidden behind the loads. Deeper staging is the direct lever on that.
+#ifndef MXFP4_MOE_PIPELINE_STAGES
+#define MXFP4_MOE_PIPELINE_STAGES 3
+#endif
+
 namespace mxfp4_int8 {
 namespace cutlass_core {
 
@@ -525,7 +533,7 @@ struct Mxfp4PackedBThreadblockMmaSkeleton {
   using WarpFragmentA = typename Operator::FragmentA;
   using WarpFragmentB = typename Operator::FragmentB;
 
-  static int const kStages = 3;
+  static int const kStages = MXFP4_MOE_PIPELINE_STAGES;
   static int const kWarpGemmIterations =
       Operator::Shape::kK / Operator::Policy::MmaShape::kK;
   static int const kThreadCount = 32 * WarpCount::kCount;
@@ -824,6 +832,12 @@ struct Mxfp4PackedBThreadblockMmaSkeleton {
       int warp_n_offset,
       int tile_k_offset,
       int problem_n) const {
+    // Measured: replacing lookup_mxfp4_x2_byte_perm with a raw word copy drops
+    // W13 from 126.2 to 84.4 us and W2 from 60.7 to 47.5, i.e. the E2M1
+    // expansion owns 62.5 us of a 199 us layer. Batching several K steps' reads
+    // before decoding them (a wider independent-chain window) changed nothing
+    // (199.14 vs 199.24), so the cost is the PRMT pipe's throughput, not
+    // scheduling, and it cannot be recovered by reordering this loop.
     CUTLASS_PRAGMA_UNROLL
     for (int warp_mma_k = 0; warp_mma_k < kWarpGemmIterations; ++warp_mma_k) {
       int warp_k_offset =

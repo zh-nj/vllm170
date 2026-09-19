@@ -648,6 +648,12 @@ struct Mxfp4PackedBGroupedGemmKernel {
   }
 };
 
+// ThreadblockK = 128 is fixed: it sets kWarpGemmIterations, i.e. how many MMAs
+// are available to hide each batch of shared-memory loads and nibble decodes,
+// so raising it to 256/512 is the obvious way to buy overlap. That does not
+// compile -- CUTLASS's int8 crosswise shared-memory layout asserts
+// kCrosswise <= one cache line (tensor_op_multiplicand_sm75.h:92). The overlap
+// has to come from restructuring the main loop, not from a deeper K tile.
 #define MXFP4_DEFINE_GROUPED_SCALED_BF16_KERNEL(TM, WM, TN, WN)       \
   using Mxfp4GroupedMma_##TM##x##TN##x128 =                          \
       Mxfp4PackedBThreadblockMmaSkeleton<                             \
@@ -666,6 +672,37 @@ struct Mxfp4PackedBGroupedGemmKernel {
           true>;                                                      \
   using Mxfp4PackedBGroupedScaledBf16CutlassKernel_##TM##x##TN##x128 = \
       Mxfp4PackedBGroupedScaledBf16CutlassKernel_##TM##x##TN##x128##_W13
+
+// ``cutlass::Kernel`` carries no __launch_bounds__, so the grouped GEMM's
+// occupancy is whatever the register allocator happens to leave: at
+// kThreadCount=128 the 16x128 tile lands on 136 registers, i.e. 3 CTAs/SM. One
+// decode token emits topk * (N/blockN) = 216 tiles, so the grid sits just above
+// that capacity (216 tiles against 210 slots) and pays an almost empty second
+// wave. ``Mxfp4PackedBGroupedKernel`` makes the resident block count explicit;
+// at 4 the tile drops to 124 registers with STACK 0.
+//
+// Measured and rejected: 4 CTAs/SM is 3.8% faster on the isolated W13+W2 pair
+// (199.3 -> 191.7 us) but only 0.85% on the no-instrumentation 32K/64 gate
+// (16 repeats, 24.173 ms/token against a 24.379 baseline), under the project's
+// 2% bar, so the default stays 0 and the launch is identical to the unbounded
+// one. The knob is kept because occupancy is the first thing a rewritten inner
+// loop will retune. Each kernel symbol carries its own dynamic-smem attribute,
+// so a nonzero value must also be opted in set_max_dynamic_smem_if_needed.
+#ifndef MXFP4_MOE_MIN_BLOCKS_PER_SM
+#define MXFP4_MOE_MIN_BLOCKS_PER_SM 0
+#endif
+
+template <typename Operator, int MinBlocksPerMultiprocessor>
+__global__ void __launch_bounds__(
+    Operator::kThreadCount,
+    MinBlocksPerMultiprocessor)
+Mxfp4PackedBGroupedKernel(typename Operator::Params params) {
+  extern __shared__ int shared_storage_base[];
+  auto* shared_storage =
+      reinterpret_cast<typename Operator::SharedStorage*>(shared_storage_base);
+  Operator op;
+  op(params, *shared_storage);
+}
 
 MXFP4_DEFINE_GROUPED_SCALED_BF16_KERNEL(16, 16, 32, 16);
 MXFP4_DEFINE_GROUPED_SCALED_BF16_KERNEL(16, 16, 64, 16);

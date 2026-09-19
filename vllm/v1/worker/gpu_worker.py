@@ -873,6 +873,12 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+            # Release cached-but-unused blocks to the driver first: the warmup
+            # issues the first PP collectives, and NCCL allocates those buffers
+            # with raw cudaMalloc, which cannot see the torch cache. On the
+            # largest rank only a few hundred MiB are left at that point.
+            gc.collect()
+            torch.accelerator.empty_cache()
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other

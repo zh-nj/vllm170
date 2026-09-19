@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -23,6 +24,8 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,12 @@ def _timing_event() -> torch.cuda.Event:
 
 @dataclass
 class StepTimingEvents:
+    prepare_start: torch.cuda.Event = field(default_factory=_timing_event)
+    prepare_end: torch.cuda.Event = field(default_factory=_timing_event)
+    attn_meta_start: torch.cuda.Event | None = None
+    attn_meta_end: torch.cuda.Event | None = None
+    inputs_start: torch.cuda.Event | None = None
+    inputs_end: torch.cuda.Event | None = None
     forward_start: torch.cuda.Event = field(default_factory=_timing_event)
     forward_end: torch.cuda.Event = field(default_factory=_timing_event)
     drafter_start: torch.cuda.Event = field(default_factory=_timing_event)
@@ -58,6 +67,70 @@ class StepTimingCollector:
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        # Streaming mode: resolve the events every N steps while serving and log
+        # the split, instead of resolving one profiled block on the way out.
+        self._stream_every = 0
+        self._stream: list[tuple[float, float, float, float]] = []
+        self._last_forward_start: torch.cuda.Event | None = None
+
+    def set_stream_interval(self, every: int) -> None:
+        """Log target/draft step timings every ``every`` steps. 0 disables."""
+        self._stream_every = max(0, every)
+        if self._stream_every:
+            self._collecting = True
+
+    def _resolve_stream(self) -> None:
+        timed, self._timed = self._timed, []
+        timed[-1][0].drafter_end.synchronize()
+
+        def span(start: torch.cuda.Event | None, end: torch.cuda.Event | None) -> float:
+            if start is None or end is None:
+                return 0.0
+            return start.elapsed_time(end)
+
+        for events, _ in timed:
+            # Step period: one step's forward_start to the next one's, which is
+            # the only in-process measure of the whole engine period.
+            if self._last_forward_start is None:
+                period = 0.0
+            else:
+                period = self._last_forward_start.elapsed_time(events.forward_start)
+            self._last_forward_start = events.forward_start
+            self._stream.append(
+                (
+                    events.forward_start.elapsed_time(events.forward_end),
+                    events.drafter_start.elapsed_time(events.drafter_end),
+                    period,
+                    events.prepare_start.elapsed_time(events.prepare_end),
+                    span(events.attn_meta_start, events.attn_meta_end),
+                    span(events.inputs_start, events.inputs_end),
+                )
+            )
+        if len(self._stream) < self._stream_every:
+            return
+        samples, self._stream = self._stream, []
+        forward = sorted(s[0] for s in samples)
+        draft = sorted(s[1] for s in samples)
+        period = sorted(s[2] for s in samples)
+        prep = sorted(s[3] for s in samples)
+        attn = sorted(s[4] for s in samples)
+        inputs = sorted(s[5] for s in samples)
+        mid = len(samples) // 2
+        logger.info(
+            "step timing over %d steps: target p50 %.2f ms (min %.2f), "
+            "draft p50 %.2f ms (min %.2f), prep p50 %.2f ms "
+            "(attn_meta %.2f, inputs %.2f), period p50 %.2f ms (other %.2f ms)",
+            len(samples),
+            forward[mid],
+            forward[0],
+            draft[mid],
+            draft[0],
+            prep[mid],
+            attn[mid],
+            inputs[mid],
+            period[mid],
+            period[mid] - forward[mid] - draft[mid] - prep[mid],
+        )
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -95,7 +168,46 @@ class StepTimingCollector:
     def forward_start(self) -> None:
         if self._collecting:
             self._step = StepTimingEvents()
+            pending = getattr(self, "_pending", None) or {}
+            self._pending = None
+            prepare_start = pending.get("prepare_start")
+            if prepare_start is not None:
+                self._step.prepare_start = prepare_start
+            else:
+                # No prepare_start this step: keep the pair valid and zero.
+                self._step.prepare_start.record()
+            for name in ("attn_meta", "inputs"):
+                start = pending.get(f"{name}_start")
+                end = pending.get(f"{name}_end")
+                if start is not None and end is not None:
+                    setattr(self._step, f"{name}_start", start)
+                    setattr(self._step, f"{name}_end", end)
+            self._step.prepare_end.record()
             self._step.forward_start.record()
+
+    def _mark(self, name: str) -> None:
+        if self._collecting:
+            if getattr(self, "_pending", None) is None:
+                self._pending = {}
+            event = _timing_event()
+            event.record()
+            self._pending[name] = event
+
+    def prepare_start(self) -> None:
+        """Opens the step before the target forward: metadata build and inputs."""
+        self._mark("prepare_start")
+
+    def attn_meta_start(self) -> None:
+        self._mark("attn_meta_start")
+
+    def attn_meta_end(self) -> None:
+        self._mark("attn_meta_end")
+
+    def inputs_start(self) -> None:
+        self._mark("inputs_start")
+
+    def inputs_end(self) -> None:
+        self._mark("inputs_end")
 
     def forward_end(self) -> None:
         if self._step is not None:
@@ -111,6 +223,8 @@ class StepTimingCollector:
             self._step.drafter_end.record()
             self._timed.append((self._step, self._batch))
             self._step = None
+            if self._stream_every and len(self._timed) >= self._stream_every:
+                self._resolve_stream()
 
 
 class AsyncOutput(AsyncModelRunnerOutput):

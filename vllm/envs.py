@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_PAGED_DECODE_SWA: bool = True
     VLLM_DEEPSEEK_V4_DIRECT_RAGGED_C128: bool = True
     VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT: bool = False
+    VLLM_DEEPSEEK_V4_SM80_MOE_DECODE_BLOCK_N: int = 128
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
@@ -108,6 +109,11 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_MHC_PRE_BROADCAST: bool = True
     VLLM_DEEPSEEK_V4_BMM_ONLY_WO_A: bool = True
     VLLM_DEEPSEEK_V4_PHASE_PROFILE: bool = False
+    # Resolve the per-step target/draft CUDA-event pairs every N serving steps and
+    # log their percentiles. 0 disables. One sync per N steps, so it can run
+    # during normal serving, which the phase profiler cannot (it synchronizes per
+    # record, serializing the PP pipeline and inflating the step).
+    VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY: int = 0
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH: str = ""
     VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION: bool = True
@@ -1191,6 +1197,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT", "0"))
     ),
+    "VLLM_DEEPSEEK_V4_SM80_MOE_DECODE_BLOCK_N": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_SM80_MOE_DECODE_BLOCK_N", "128")
+    ),
     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
         os.getenv("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
     ),
@@ -1304,6 +1313,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_PHASE_PROFILE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY", "0")
     ),
     "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH": lambda: os.getenv(
         "VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH", ""

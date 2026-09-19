@@ -86,6 +86,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
         max_model_len: int,
         causal: bool | Mapping[int, bool],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        skip_attn: bool = False,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -106,7 +107,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 max_model_len,
-                skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+                skip_attn=(skip_attn or desc.cg_mode == CUDAGraphMode.PIECEWISE),
                 causal=causal,
             )
             attn_metadata, slot_mappings = attn_state

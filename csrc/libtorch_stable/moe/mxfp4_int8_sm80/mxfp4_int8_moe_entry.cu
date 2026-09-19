@@ -71,9 +71,18 @@ template <typename Kernel>
 void set_max_dynamic_smem_if_needed() {
   constexpr int smem_size = int(sizeof(typename Kernel::SharedStorage));
   if constexpr (smem_size > (48 << 10)) {
-    cudaError_t status = cudaFuncSetAttribute(
-        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_size);
+    // Each kernel symbol carries its own dynamic-smem attribute, so the
+    // bounded launcher has to be opted in separately from cutlass::Kernel.
+    cudaError_t status = cudaSuccess;
+    if constexpr (MXFP4_MOE_MIN_BLOCKS_PER_SM > 0) {
+      status = cudaFuncSetAttribute(
+          Mxfp4PackedBGroupedKernel<Kernel, MXFP4_MOE_MIN_BLOCKS_PER_SM>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    } else {
+      status = cudaFuncSetAttribute(
+          cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem_size);
+    }
     STD_TORCH_CHECK(status == cudaSuccess,
                     "failed to set MXFP4-int8 MoE CUTLASS dynamic shared "
                     "memory attribute: ",
@@ -331,7 +340,12 @@ struct Mxfp4Int8MoeGemm {
     dim3 block(Kernel::kThreadCount, 1, 1);
     constexpr int smem_size = int(sizeof(typename Kernel::SharedStorage));
     set_max_dynamic_smem_if_needed<Kernel>();
-    cutlass::Kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
+    if constexpr (MXFP4_MOE_MIN_BLOCKS_PER_SM > 0) {
+      Mxfp4PackedBGroupedKernel<Kernel, MXFP4_MOE_MIN_BLOCKS_PER_SM>
+          <<<grid, block, smem_size, stream>>>(params);
+    } else {
+      cutlass::Kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
+    }
     check_cuda(cudaGetLastError(), "MXFP4-int8 MoE GEMM launch failed");
   }
 

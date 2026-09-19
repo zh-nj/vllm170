@@ -50,6 +50,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -196,15 +200,19 @@ class DSparkDeepseekV4Model(nn.Module):
 
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
-        return self.main_norm(self.main_proj(aux_hidden_states))
+        with phase_profile_stage("draft.hidden_combine.main_proj", aux_hidden_states):
+            main_x = self.main_proj(aux_hidden_states)
+        with phase_profile_stage("draft.hidden_combine.main_norm", main_x):
+            return self.main_norm(main_x)
 
     @torch.inference_mode()
     def prepare_pipeline_query(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed and expand a query on the first distributed draft stage."""
         if not self.is_embedding_rank:
             raise RuntimeError("This DSpark rank does not own the embedding.")
-        inputs_embeds = self.embed_input_ids(input_ids)
-        return inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        with phase_profile_stage("draft.stage.embedding", input_ids, level="stage"):
+            inputs_embeds = self.embed_input_ids(input_ids)
+            return inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
     def forward_local_stage(
         self,
@@ -221,18 +229,22 @@ class DSparkDeepseekV4Model(nn.Module):
             raise RuntimeError("This rank does not own a distributed DSpark block.")
         if self.use_sequence_parallel:
             raise RuntimeError("Distributed DSpark does not support sequence parallel.")
-        for stage_index in self.local_stage_indices:
-            layer = self.layers[stage_index]
-            assert not isinstance(layer, PPMissingLayer)
-            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-            )
+        with phase_profile_stage(
+            "draft.stage.forward", hidden_states, level="stage"
+        ):
+            for stage_index in self.local_stage_indices:
+                layer = self.layers[stage_index]
+                assert not isinstance(layer, PPMissingLayer)
+                with phase_profile_layer(layer.prefix):
+                    hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                        hidden_states,
+                        positions,
+                        input_ids,
+                        pre_mix,
+                        post_mix,
+                        res_mix,
+                        residual,
+                    )
         return hidden_states, residual, post_mix, res_mix, pre_mix
 
     def finish_pipeline_query(
@@ -246,8 +258,9 @@ class DSparkDeepseekV4Model(nn.Module):
         """Reconstruct and collapse the final distributed draft state."""
         if not self.is_head_rank:
             raise RuntimeError("Only the DSpark head rank owns the output heads.")
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
-        return hc_collapse_triton(hidden_states, pre_mix)
+        with phase_profile_stage("draft.head.reconstruct", hidden_states, level="stage"):
+            hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+            return hc_collapse_triton(hidden_states, pre_mix)
 
     def precompute_and_store_context_kv(
         self,
@@ -282,12 +295,16 @@ class DSparkDeepseekV4Model(nn.Module):
             attn = layer.attn
             # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
             # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
-            kv = attn.kv_norm(kv)
-            if slot_mapping is None:
-                continue
-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            with phase_profile_layer(layer.prefix):
+                with phase_profile_stage("draft.context_kv.input_gemm", main_x):
+                    qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                    kv = qr_kv[..., attn.q_lora_rank :]
+                with phase_profile_stage("draft.context_kv.norm", kv):
+                    kv = attn.kv_norm(kv)
+                if slot_mapping is None:
+                    continue
+                with phase_profile_stage("draft.context_kv.insert", kv):
+                    _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(
         self,
@@ -518,7 +535,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
-        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+        with phase_profile_stage("draft.logits.norm", hidden_states):
+            hidden_states = self.model.norm(hidden_states)
+        with phase_profile_stage("draft.logits.lm_head", hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
@@ -542,10 +562,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return draft_ids  # full-vocab: draft ids are target ids
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        with phase_profile_stage("draft.markov.embed", token_ids):
+            return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed, self.logits_processor)
+        with phase_profile_stage("draft.markov.projection", markov_embed):
+            return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor

@@ -55,10 +55,10 @@ def _tilelang_hc_prenorm_gemm(
         )
         return
     if (
-        n_splits == 1
-        and use_default_config
+        use_default_config
         and x.shape[0] < 128
         and x.shape[1] % 1024 == 0
+        and (x.shape[1] // n_splits) % 1024 == 0
     ):
         hc_prenorm_gemm_tilelang(
             x,
@@ -85,6 +85,38 @@ def _tilelang_hc_prenorm_gemm(
         tile_n,
         n_splits,
     )
+
+
+# Split factors measured on a CMP 170HX for the decode shape (one token,
+# mix=24, K=20480): the bare GEMM costs 7.7 us at 1 split, 4.4 at 4, 4.0 at 10
+# and 4.5 at 20, so past ~10 more splits only add reduction work. The epilogue
+# is a separate single-threadblock kernel and is unaffected by this.
+_TILELANG_SPLIT_TARGET = 10
+
+
+def _tilelang_hc_prenorm_num_splits(input_size: int, num_tokens: int) -> int:
+    """Split-K factor for the non-DeepGEMM prenorm GEMM.
+
+    Without DeepGEMM the tilelang path ran with ``n_splits=1``. The prenorm
+    projection is ``[tokens, hc_mult*hidden] x [mix, hc_mult*hidden]^T`` with
+    only ``mix = hc_mult*(hc_mult+2) = 24`` outputs, so a decode step left the
+    entire 24 x 20480 reduction to ``24 / tile_n = 6`` threadblocks: 1.97 MB of
+    fp32 weights moved in 17.6 us, about 120 GB/s, with 64 of the 70 SMs idle.
+
+    The kernel takes a split-K factor and the fused epilogue already reduces
+    over it (see ``mhc_pre_big_fuse_with_norm_tilelang``). The small-batch
+    branch pins ``n_thr=1024``, so a split is only legal when
+    ``(input_size // n_splits) % 1024 == 0``; take the largest legal split up to
+    the measured target.
+    """
+    if num_tokens >= 128 or input_size % 1024 != 0:
+        return 1
+    k_blocks = input_size // 1024
+    best = 1
+    for split in range(1, min(k_blocks, _TILELANG_SPLIT_TARGET) + 1):
+        if k_blocks % split == 0:
+            best = split
+    return best
 
 
 def mhc_pre_delayed_tilelang(
@@ -175,7 +207,9 @@ def mhc_pre_delayed_tilelang(
 
     use_deep_gemm = is_deep_gemm_supported()
     n_splits = (
-        compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
+        compute_mhc_pre_num_splits(input_size, num_tokens)
+        if use_deep_gemm
+        else _tilelang_hc_prenorm_num_splits(input_size, num_tokens)
     )
     mixes = torch.empty(
         n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
@@ -186,7 +220,7 @@ def mhc_pre_delayed_tilelang(
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
     else:
-        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, input_size, 1)
+        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, input_size, 1, n_splits=n_splits)
     if norm_weight is not None:
         assert norm_weight.shape == (hidden_size,)
         assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
