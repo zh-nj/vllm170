@@ -335,7 +335,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k_init,
                int thread_n_init, int num_threads_init, int sms,
-               bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
+               bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+               bool use_full_k) {
   bool is_a_8bit = a_type.size_bits() == 8;
   STD_TORCH_CHECK(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [",
                   prob_m, ", ", prob_n, ", ", prob_k, "]");
@@ -523,6 +524,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
+    if (use_full_k) {
+      // One CTA per output tile makes every slice walk the complete K range.
+      // Changing M only changes the number of independent output tiles.
+      const int tile_m = m_block_size_8 ? 8 : thread_m_blocks * 16;
+      blocks = div_ceil(prob_m_split, tile_m) * (prob_n / thread_n);
+    }
     if (exec_cfg.blocks_per_sm > 1)
       max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
@@ -564,8 +571,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          max_shared_mem_new);
 
-    bool part_use_atomic_add =
-        use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
+    bool part_use_atomic_add = !use_full_k && use_atomic_add &&
+                               div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
@@ -599,7 +606,8 @@ torch::stable::Tensor marlin_gemm(
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
     bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
-    int64_t thread_k, int64_t thread_n, int64_t num_threads, int64_t sms) {
+    int64_t thread_k, int64_t thread_n, int64_t num_threads, int64_t sms,
+    bool use_full_k) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_scalar_type = a.scalar_type();
@@ -735,6 +743,8 @@ torch::stable::Tensor marlin_gemm(
   if (sms == -1) sms = device_sms;
   STD_TORCH_CHECK(sms > 0 && sms <= device_sms, "sms = ", sms,
                   " must be in [1, ", device_sms, "]");
+  STD_TORCH_CHECK(!use_full_k || (thread_k > 0 && thread_n > 0),
+                  "use_full_k requires an explicit thread configuration");
 
   // Alloc buffers
   torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -936,7 +946,7 @@ torch::stable::Tensor marlin_gemm(
       workspace.mutable_data_ptr(), a_type, b_type, c_type, s_type, has_bias,
       has_act_order, is_k_full, has_zp, num_groups, group_size, device_index,
       get_current_cuda_stream(device_index), thread_k, thread_n, num_threads,
-      sms, use_atomic_add, use_fp32_reduce, is_zp_float);
+      sms, use_atomic_add, use_fp32_reduce, is_zp_float, use_full_k);
 
   return c;
 }

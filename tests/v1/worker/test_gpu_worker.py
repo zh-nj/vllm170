@@ -14,6 +14,21 @@ from vllm.v1.worker.startup_plan import (
     maybe_save_startup_plan,
 )
 
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_strict_math_rejects_non_boolean_config(value):
+    config = SimpleNamespace(additional_config={"dsv41_strict_bf16_gemm": value})
+    with pytest.raises(ValueError, match="JSON boolean"):
+        gpu_worker._strict_bf16_gemm(config)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_strict_math_config_overrides_environment(value, monkeypatch):
+    config = SimpleNamespace(additional_config={"dsv41_strict_bf16_gemm": value})
+    monkeypatch.setenv("VLLM_DSV41_STRICT_BF16_GEMM", str(int(not value)))
+    assert gpu_worker._strict_bf16_gemm(config) is value
+
+
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
 

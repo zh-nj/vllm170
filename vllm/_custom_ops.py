@@ -1246,6 +1246,7 @@ def marlin_gemm(
     thread_n: int = -1,
     num_threads: int = -1,
     sms: int = -1,
+    use_full_k: bool = False,
 ) -> torch.Tensor:
     return torch.ops._C.marlin_gemm(
         a,
@@ -1271,6 +1272,7 @@ def marlin_gemm(
         thread_n,
         num_threads,
         sms,
+        use_full_k,
     )
 
 
@@ -1301,6 +1303,7 @@ if hasattr(torch.ops._C, "marlin_gemm"):
         thread_n: int = -1,
         num_threads: int = -1,
         sms: int = -1,
+        use_full_k: bool = False,
     ) -> torch.Tensor:
         dtype = a.dtype
         if dtype not in [torch.half, torch.bfloat16]:

@@ -89,7 +89,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
       "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float, "
-      "int thread_k=-1, int thread_n=-1, int num_threads=-1, int sms=-1) "
+      "int thread_k=-1, int thread_n=-1, int num_threads=-1, int sms=-1, "
+      "bool use_full_k=False) "
       "-> Tensor");
   // conditionally compiled so impl registrations are in source file
 

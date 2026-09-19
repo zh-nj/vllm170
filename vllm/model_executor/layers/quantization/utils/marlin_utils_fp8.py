@@ -475,6 +475,7 @@ def apply_mxfp8_marlin_linear(
     size_k: int,
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    use_full_k: bool = False,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
@@ -508,6 +509,10 @@ def apply_mxfp8_marlin_linear(
         size_k=padded_k,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
+        thread_k=128 if use_full_k else -1,
+        thread_n=64 if use_full_k else -1,
+        num_threads=128 if use_full_k else -1,
+        use_full_k=use_full_k,
     )
 
     output = marlin_unpad_output(output, size_n, padded_n)

@@ -9,6 +9,8 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A16 GEMM via Marlin (SM80+)."""
 
+    use_full_k: bool = False
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -26,10 +28,19 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.config import get_current_vllm_config_or_none
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
             prepare_mxfp8_layer_for_marlin,
         )
 
+        config = get_current_vllm_config_or_none()
+        extra = config.additional_config if config is not None else None
+        requested = (
+            extra.get("marlin_full_k", False) if isinstance(extra, dict) else False
+        )
+        if not isinstance(requested, bool):
+            raise ValueError("additional_config.marlin_full_k must be a boolean")
+        self.use_full_k = requested
         prepare_mxfp8_layer_for_marlin(layer)
 
     def apply_weights(
@@ -50,4 +61,5 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
+            use_full_k=self.use_full_k,
         )

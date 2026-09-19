@@ -1511,7 +1511,10 @@ def _strict_bf16_gemm(vllm_config: VllmConfig) -> bool:
     """
     extra = vllm_config.additional_config
     if isinstance(extra, dict) and "dsv41_strict_bf16_gemm" in extra:
-        return bool(extra["dsv41_strict_bf16_gemm"])
+        value = extra["dsv41_strict_bf16_gemm"]
+        if not isinstance(value, bool):
+            raise ValueError("dsv41_strict_bf16_gemm must be a JSON boolean")
+        return value
     return envs.VLLM_DSV41_STRICT_BF16_GEMM
 
 
@@ -1530,7 +1533,9 @@ def init_worker_distributed_environment(
     )
 
     init_batch_invariance()
-    if _strict_bf16_gemm(vllm_config):
+    strict_math = _strict_bf16_gemm(vllm_config)
+    logger.info("Batch-invariant math overrides: %s (rank %d)", strict_math, rank)
+    if strict_math:
         enable_batch_invariant_math()
     override_envs_for_eplb(
         parallel_config,

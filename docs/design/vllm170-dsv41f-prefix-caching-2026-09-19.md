@@ -23,12 +23,12 @@ unchanged within the noise of this box.
 
 Two behaviours showed up while verifying it, and both are documented below:
 
-- **The bf16 GEMMs are not batch-invariant**: cuBLAS picks a different reduction order
-  per `M`, worth exactly one bf16 ULP on a bit-identical row. Accumulated over a prefill
-  chunk that is 0.026 nats at its first row and 1.79 nats by its 277th, which is enough
-  for greedy decoding to diverge between a cached and an uncached serving. Proved below
-  with zero reuse, and isolated to cuBLAS on a spare GPU. Not fixable at the
-  prefix-cache layer; diagnosed, not fixed.
+- **The prefill result is sensitive to batch shape**: a historical shape sweep reported
+  discrete logprob changes, consistent with a reduction-order change in cuBLAS. The
+  sweep used a `shape-{n}` salt but did not verify cache-hit counters or record complete
+  mode provenance, so its 1.789114952-nat spread is a historical measurement rather than
+  complete zero-reuse evidence. A separate spare-GPU reproduction isolates an
+  M-dependent bf16 reduction-order effect in cuBLAS. This is diagnosed, not fixed.
 - **A prompt that ends 1..32 tokens past a 128-block boundary reconciled to zero
   reuse**, even though its blocks were cached. Root-caused to the sparse-retention tail
   in `SlidingWindowManager.reachable_block_mask` and **fixed**; the whole band now
@@ -124,208 +124,140 @@ configuration is 76.4-91.5 ms (about 7%). The two distributions overlap, so ther
 measurable decode cost to the flag, and no measurable gain either -- the benefit is
 entirely in prefill (TTFT).
 
-## Finding 1 (diagnosed, not fixed): prefill is not batch-invariant
+## Finding 1: prefill shape dependence, repair in progress
 
-Cold and warm runs of the same prompt can produce different completions. It is not the
-cache, and it is not fixable at the prefix-cache layer: a row's prefill result depends on
-how many tokens are in the batch it is computed in. A prefix-cache hit is only the most
-common way to change chunking -- the same divergence appears with caching off when
-`max_num_batched_tokens` changes (1024 -> 1152 already changed 2 of 5 reference prompts
-in an earlier measurement on this box).
+### Evidence and corrected scope
 
-### It is not the cache, and not non-causal
+The historical 80-length sweep in `/tmp/final_shape.json` has a spread of
+1.7891149520874023 nats. That artifact does not contain cache-hit counters or
+server configuration. Its original script reused `shape-{n}` salts across runs;
+zero reuse cannot be established from that file alone.
 
-Every request in this sweep carries a unique `cache_salt`, so each is a full cold prefill
-with zero reuse:
+The corrected probe generates a UUID for each run, gives each request a distinct
+salt, checks prefix-cache query/hit counter deltas, and checks per-request cached
+usage when available. It retains unrounded values and repeats each length.
+`/tmp/dsv41_corrected_baseline.json` records six requests on the restored default
+service: two each at lengths 1301, 1405, 1533. All measured hit deltas were zero,
+repetitions were exactly equal, and the three logprobs were -10.063070297241211,
+-10.57004165649414 and -11.28186321258545. The three-length spread is 1.218792915,
+which must not be compared as the same denominator as the older 80-length sweep.
 
-```
-logprob of token 1300 vs the length of the chunk it is computed in
-(first chunk fixed at 1024, so the second chunk is n - 1024):
+Two indexing corrections matter:
 
-  n=[1301,1337]  tail=[277,313]  logprob=-10.063070
-  n=[1341,1393]  tail=[317,369]  logprob=-9.922690
-  n=[1405,1465]  tail=[381,441]  logprob=-10.570042
-  n=[1469,1529]  tail=[445,505]  logprob=-10.791334
-  n=[1533,1565]  tail=[509,541]  logprob=-11.281863
-  n=[1597,1617]  tail=[573,593]  logprob=-10.685512
-```
+- `/tmp/dsv41_rowdump_log` records a 1020-token first chunk, not 1024, for these
+  requests. The old table's `n-1024` tail labels were four rows too short; the
+  corresponding second chunks were 281, 385 and 513 rows. The corrected probe
+  does not guess scheduler M. `--chunk1` only annotates an explicit assumption.
+- `prompt_logprobs[1300]` is the probability of token 1300, predicted by hidden
+  state at position 1299. The old dump selected position 1300. Consequently its
+  boundary evidence is for an adjacent row, not that exact API logprob. The old
+  claim that index 1024 was the first row of chunk 2 is also withdrawn.
 
-Bit-identical over a range, then a discrete jump; 8 distinct values over 80 lengths,
-spread 1.79 nats. Two controls say what kind of effect this is:
+CPU reinspection of `/tmp/dsv41row.rank0.M{281,385,513}.pt` confirmed:
 
-- **Not leakage.** The token at index 900, in the always-1024-token first chunk, is
-  bit-identical (`-0.000127`) across every `n`.
-- **Not content.** Replacing the tokens after the probe with different tokens *of the same
-  length* leaves the probe bit-identical (`-9.867739`, four different tails).
+| layer 0 stage | M281 vs M385 | M281 vs M513 |
+| --- | ---: | ---: |
+| mhc_pre_attn | 0 | 0 |
+| attn_out | 0.0078125 | 0.0078125 |
+| ffn_out | 0.015625 | 0.015625 |
 
-Profiling the spread per probe index over chunk-2 lengths 16..597 shows the shape of it:
-index 1024 (the first row of chunk 2) already moves, by only 0.026 nats; by index 1300 it
-is 1.79. So the primitive effect is a small per-row perturbation, and the large output
-changes are accumulation plus greedy amplification at near-tied tokens.
+These are single-row comparisons. `self.attn` includes input projections, Q/KV
+normalization, RoPE/cache insertion, sparse SWA attention, `wo_a`, and `wo_b`.
+The dump did not establish equality of all visible K/V inputs. Layer 0 has
+`compress_ratio=0`, so its own compressor/indexer/top-k cannot cause this first
+boundary; this does not rule out additional independent sources in later layers
+or the MoE. The earlier cuBLAS random-matrix reproduction establishes shape
+sensitivity of that primitive, not a causal explanation of every engine plateau.
 
-### Root cause: cuBLAS picks a different kernel per M
+### Marlin isolation and candidate repair
 
-`benchmarks/kernels/deepseek_v41_gemm_batch_invariance.py` reduces it to a ten-line
-reproduction on a spare GPU: hold row 0 of the activations bit-identical, vary `M`, and
-compare row 0 of the product.
+On the otherwise idle CMP 170HX at PCI 02:00.0, the real checkpoint's layer 0
+weights were loaded with the same E8M0 byte interpretation and 32-row scale
+expansion as the model loader. The first projection concatenates wq_a then wkv.
+Holding the inputs fixed and comparing all common rows, not just row 0, gives:
 
-```
-worst |row0 drift| across M in {277,320,384,448,512,597,900,1024}, bf16:
-   5120 x 5120: 1.562e-02  M-DEPENDENT      2304 x 5120: 0.000e+00  invariant
-   5120 x 2304: 1.562e-02  M-DEPENDENT      1536 x 5120: 0.000e+00  invariant
-   5120 x  384: 1.562e-02  M-DEPENDENT       512 x 5120: 0.000e+00  invariant
-   5120 x 1536: 1.562e-02  M-DEPENDENT       128 x 5120: 0.000e+00  invariant
-   5120 x  512: 1.562e-02  M-DEPENDENT      2048 x 5120: 0.000e+00  invariant
-```
+| projection | N,K | default maximum cross-M difference |
+| --- | --- | ---: |
+| fused_wqa_wkv | 1792,5120 | 0.03125 |
+| wq_b | 32768,1280 | 0.015625 |
+| wo_b | 5120,8192 | 0.03125 |
 
-Three things follow from the same probe:
+All same-M repetitions were identical. Pinning thread K/N alone still left
+cross-M differences. Marlin derives `parallel`, `global_mn_tiles`, the stream-K
+tail, and `iters` from M, so fixed tile height alone is insufficient.
 
-- The drift is exactly one bf16 ULP (`|ref| ~ 3.5`, bf16 eps ~ 0.0137), so it is a
-  reduction-order change, not a wrong result.
-- The same `M` run twice is bit-identical, so it is the *selection* that depends on `M`,
-  not run-to-run nondeterminism.
-- `M` thresholds for the `5120x5120` shape sit near 256, 368, 384 and 436, which is the
-  bucket structure the engine-level sweep sees after accumulation.
+The candidate `marlin_full_k` path fixes the thread K/N configuration and launches
+one CTA for each output tile. Every CTA traverses all K, removing cross-CTA
+partial-sum reassociation. It does not divide prefill into repeated 16-row GEMM
+launches. On the three shapes above, the tested common rows were bit-identical
+for M=1..1024, including 281/385/513 and tile boundaries. The existing pytest suite
+also verifies a row permutation and compares to a double-precision reference.
+Full engine invariance remains a separate acceptance condition.
 
-Only `K == 5120` -- the hidden size, i.e. every GEMM that reads the residual stream -- is
-affected. The `K = 2304` expert down-projections and the rest are stable, and the MoE
-grouped GEMM is CUTLASS with a full-K walk per tile, so it cannot depend on the grid.
-MHC pre-norm is `n_splits = 1` for prefill (its split path is gated on DeepGEMM, which is
-unavailable on SM80), and the indexer's `_select_prefill_kv_group` returns 1 below
-`_KV_GROUP_MIN_N = 16384`.
+Use `--additional-config '{"marlin_full_k":true,"dsv41_strict_bf16_gemm":true}'`
+for the current engine trial. Both options default to false. This is a candidate,
+not a declaration that all DeepSeek V4.1 operators are batch-invariant.
 
-Neither cheap knob removes it: `preferred_blas_library` is already plain cuBLAS, and
-`CUBLAS_WORKSPACE_CONFIG=:16:8` only stabilises `N in {384, 512}`.
+The older `VLLM_MARLIN_M_ALIGN` covers only M in 9..128. Its source comment is
+historical evidence, not a measured prefill cost bound. In particular the quoted
+1922 -> 7318 microseconds corresponds to +280.75%, not +177%, and its 56-row
+example does not describe the current default launch geometry.
 
-So the GEMMs need a reduction order that does not depend on `M`. Upstream already has
-that machinery -- `enable_batch_invariant_mode` installs Triton overrides for exactly
-this on SM80 -- but it is only part of the story: the layer dump below shows the
-*attention* is the dominant remaining source, and `VLLM_BATCH_INVARIANT` cannot be turned
-on for this model until its MoE and attention backends declare batch invariance.
+### Upstream comparison
 
-### Where it enters: the attention, at layer 0
+The user-provided `/mnt/data/apps/vllm` contains current fetched refs. Its working
+checkout is detached at `0b3ba88f165976e77ca5e6a7a3f5bba4562b80af`; the relevant
+comparison is fetched `origin/main` at
+`c3b4844634` (2026-09-19), read using `git show`, without changing that worktree.
+The current upstream Marlin still computes M-dependent stream-K slices and has
+no corresponding full-K/batch-invariant MXFP8 mode. Upstream's SM80 ATen overrides
+are already represented locally and do not intercept custom Marlin GEMMs.
 
-The engine-level logits say *that* a row depends on its batch; the layer dump says
-*where*. `_ProbeRowDump` in `vllm/models/deepseek_v4_1/nvidia/model.py` writes one
-token's row after every local stage, keyed by the batch's row count, triggered by the
-existence of `/tmp/dsv41_rowdump_on` (not an env var -- the worker processes do not
-inherit arbitrary `VLLM_*` names from `vllm serve`, so an env-gated diagnostic silently
-never fires) with the target index in `/tmp/dsv41_rowdump_pos`.
+Upstream commit `ef5f7cd119` caches dequantized weights for the ROCm native MXFP8
+backend; it is not a repair for the CUDA Marlin path. The fetched upstream MXFP8
+emulation implementation matches this tree's implementation.
 
-Three prompts of 1301, 1405 and 1533 tokens, with the first chunk fixed at 1020 rows:
+### Strict math and emulation: separate evidence
 
-```
-stage                        vs M385      vs M513
-layers.0.mhc_pre_attn        identical    identical     <- embedding + MHC pre-norm + norm
-layers.0.attn_out            7.812e-03    7.812e-03     <- first divergence: ~1 bf16 ULP
-layers.0.ffn_out             1.562e-02    1.562e-02
-```
+`dsv41_strict_bf16_gemm` invokes the full ATen batch-invariant registration helper:
+mm/addmm/matmul/linear, bmm, softmax/log_softmax, mean, reduced-precision flags,
+and preferred BLAS selection. It does not enable the global backend capability
+checks or change the NCCL environment. Therefore its measured effect cannot be
+attributed to BF16 GEMM alone. Explicit JSON booleans are required; worker logs
+record the effective value per rank.
 
-So the embedding, the MHC pre-norm and the RMSNorm are batch-invariant, and layer 0's
-**attention output is already different** before the MoE runs. Layer 0 has
-`compress_ratio = 0`, i.e. it is a pure sliding-window layer with no compressed cache,
-no indexer and no top-k, which isolates the batch dependence to the **sliding-window
-attention prefill path**. The MoE only amplifies what the attention hands it, which also
-retires the earlier suspicion of the grouped GEMM.
+The older `/tmp/bimath_shape.json` has spread 0.749158859; `/tmp/strict_shape.json`
+has spread 0.981816292. Neither stores sufficient mode/configuration provenance.
+The reported decode 73 -> 77 ms/step and cold TTFT 0.95 -> 1.15 s are historical
+observations, not a controlled estimate of this candidate's performance or proof
+that the TTFT change is within noise.
 
-The same run corrected an assumption worth recording: the first prefill chunk is **1020**
-tokens, not `max_num_batched_tokens` (1024), so the second chunk is `n - 1020`. An
-earlier probe that assumed a 1024-token first chunk silently matched nothing.
+The combined emulation-plus-strict trial returned a NaN serialization error.
+That establishes a failed configuration, not the location or cause of its first
+non-finite value. The real layer 0 scale bytes contain no 255 entries. Their
+range is 114..117; a scale=255 hypothesis is unsupported for those projections.
+No `nan_to_num` or output masking is an acceptable repair.
 
-### The remaining source: Marlin's M-tuned tiling
+### Acceptance boundary
 
-Following the localization into the MXFP8 linears (the model's projections are
-`MarlinMxfp8LinearKernel`, not `aten::linear`, so the overrides above do not touch them)
-lands on a heuristic that is explicitly batch-dependent:
+The prefix-cache gate checks cold A, cold B and warm A, including reuse and the
+short-tail regression. It does not execute a second warm request and does not
+require cold/warm token equality. Its PASS is a cache-reuse result, not a pass
+for this issue. Some historical gate artifacts explicitly contain cold/warm
+output differences despite PASS.
 
-```cpp
-// csrc/libtorch_stable/quantization/marlin/marlin.cu
-int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
-...
-exec_cfg = determine_exec_config(..., prob_m_split, prob_n, prob_k,
-                                 thread_m_blocks, ...);
-```
-
-The tile height and the auto-selected `thread_k`/`thread_n` both come from how many rows
-the launch got, and a different tile height changes the kernel's `parallel` reduction
-stride. The file's own comment says so: a 56-row batch "would be launched as one 48-row
-tile with `parallel=3` and round differently".
-
-That is why only part of the effect is reachable from the `aten` layer, and it is also
-why the same tree already carries a knob for it -- `VLLM_MARLIN_M_ALIGN`, added for
-decode-shaped batches, with this comment:
-
-```cpp
-static constexpr int kAlignMaxM = 128;
-const bool align_m = marlin_m_align > 0 && prob_m > 8 && prob_m <= kAlignMaxM;
-```
-
-It pins `prob_m_split` so the `parallel` stride matches the solo geometry, but it is
-capped at `prob_m <= 128` and the comment records why: the chunked launch re-reads the
-weight matrix once per launch, measured at **+177% at M=2048**, and beyond 128 rows
-"aligning a long prefill was also observed to change its answer rather than stabilise
-it". Prefill chunks here are 281-1020 rows, so the existing knob does not cover the case
-this ledger is about.
-
-The obvious alternative -- route the MXFP8 linears to `EmulationMxfp8LinearKernel`
-(`--linear-backend emulation`), which dequantizes to BF16 at load and then runs a plain
-BF16 `aten::linear` that the batch-invariant overrides do cover -- **does not work on
-this checkpoint**: with `--linear-backend emulation --additional-config
-'{"dsv41_strict_bf16_gemm":true}'` the server starts, selects
-`EmulationMxfp8LinearKernel`, and then returns `400 "Out of range float values are not
-JSON compliant: nan"` because the prompt logprobs are NaN. That path needs debugging
-before it can be used as a batch-invariance lever.
-
-So the remaining work is a Marlin tiling whose geometry does not depend on `M` -- either
-an extension of the align path with a measured cost budget, or a different GEMM for the
-prefill row range. Both are kernel changes with a real prefill cost, and the two
-candidate costs are already known from this tree: +177% for the chunked alignment at
-M=2048, and about 5% decode for the `aten` overrides.
-
-### Partial mitigation, off by default
-
-`VLLM_DSV41_STRICT_BF16_GEMM=1` installs upstream's batch-invariant Triton overrides for
-`mm`/`addmm`/`matmul`/`linear` (`enable_batch_invariant_mode`, whose SM80 branch exists
-for exactly this reason) and turns the reduced-precision reductions off. Measured on this
-instance:
-
-```
-engine spread over chunk lengths   1.79 nats -> 0.75 nats   (not 0)
-primitive row-level spread         0.026 -> 0.014 nats
-decode                             73.0 -> 77.0 ms/step    (~5% slower)
-prefill TTFT                       0.95 -> 1.15 s cold     (inside noise)
-```
-
-It roughly halves the perturbation but does not remove it, because the attention is the
-dominant remaining source and the overrides only cover `aten` matmuls. Since it costs
-decode throughput without closing the problem, it stays **off by default** and is
-documented as an opt-in lever for callers who need the smaller spread.
-
-### Impact
-
-Eight realistic 1200-token prompts built from this repo's docs, 128 greedy tokens each,
-cold against cached:
-
-```
-diverged 8/8    first difference at token 0, 8, 11, 12, 24, 58, 88, 107
-```
-
-versus 5/5 byte-identical on the five reference prompts and 3/3 on the vision example, so
-it needs a long free-form continuation and a near-tied token. It is still the reason a
-cached and an uncached serving of the same long prompt should be expected to differ.
-
-What *is* an invariant, and is asserted by the gate:
-
-- two cold prefills of the same prompt with the same batch shape are bit-identical,
-- two runs that both hit the cache are bit-identical,
-- the hit length is exact.
+For this issue, require corrected cold counter evidence, same-position intermediate
+comparisons, and exact cross-M equality of the repaired primitive; then separately
+check engine logprobs and cold/warm greedy outputs on the same prompt set. Model
+quality and latency also require engine measurements. Stabilizing one GEMM, a
+smaller logprob spread, or five successful reuse cases does not close the issue.
 
 ## Finding 2 (fixed): a 1..32 token tail block reconciled to zero reuse
 
 With genuinely unique prompts (`cold_hits == 0` proving the cold run was cold), reuse
 depended on where the prompt ends inside its last 128-block:
 
-```
+```text
 before the fix            after the fix
   tail   0 : 1280           tail   0 : 1280
   tail 1-32: 0              tail 1-32: 1280      <- full band restored
@@ -350,9 +282,10 @@ Two facts meet, and the first one is easy to miss:
    *starts* on an `alignment_tokens` boundary and stays below
    `min(end, (num_prompt - 1) // block_size)`.
 
-The store computes `end = aligned // 32 + shift` with `aligned = (num_prompt - 1) // 128
-* 128` and `shift = 1` under EAGLE, so the retained tail is `[end - 5, end)`. When the
-prompt ends fewer than 33 tokens past the aligned boundary, block `end - 1` is not a full
+The store computes `end = aligned // 32 + shift`, where `aligned` is
+`(num_prompt - 1) // 128 * 128` and `shift = 1` under EAGLE, so the retained tail is
+`[end - 5, end)`. When the
+prompt ends fewer than 33 tokens past the aligned boundary, block`end - 1` is not a full
 block of that request -- `num_prompt // 32` is one short -- so the store skips it, only 4
 of the 5 blocks exist, and the finder can never reach `need`. Every lookup of that prompt
 reconciles to 0 and the whole prompt is re-prefilled.
@@ -360,7 +293,7 @@ reconciles to 0 and the whole prompt is re-prefilled.
 `VLLM_KV_CACHE_DEBUG=1` shows it directly; `mask=5` is what the mask asked for, and only
 four blocks exist:
 
-```
+```text
 cache_blocks: group=0 SlidingWindowManager block_size=32 cached_before=29
               num_full_blocks=45 hashes=45 mask=5
 prefix lookup: max=1423 hit=0 longest=1408 ... groups=[('MLAAttentionSpec',128,False,0),
@@ -385,7 +318,7 @@ covers it and the branch is skipped, so the retained set is byte-identical to be
 
 The band sweep after the fix (same probe, fresh content per length):
 
-```
+```text
 tail   0: 1280   tail   1: 1280   tail   2: 1280   tail   4: 1280
 tail   8: 1280   tail  16: 1280   tail  24: 1280   tail  31: 1280
 tail  32: 1280   tail  33: 1408   tail  40: 1408   tail  64: 1408

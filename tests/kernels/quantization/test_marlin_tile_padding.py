@@ -532,6 +532,49 @@ def test_mxfp8_marlin_padded_round_trip(shape):
 
 
 @pytest.mark.skipif(
+    _gpu_marlin_unsupported() or not is_fp8_marlin_supported(),
+    reason="FP8 Marlin is not supported on this GPU type.",
+)
+@pytest.mark.parametrize("shape", [(1792, 5120), (32768, 1280), (5120, 8192)])
+def test_mxfp8_full_k_preserves_rows_across_batch_shapes(shape):
+    """Changing batch size or a row's tile position must not reassociate K."""
+    size_n, size_k = shape
+    torch.manual_seed(18)
+    layer = torch.nn.Module()
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    weight = torch.randn(size_n, size_k, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.full((size_n, size_k // 32), 120, dtype=torch.uint8, device="cuda")
+    reference_weight = weight.float() / 128
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    with torch.device("cuda"):
+        prepare_mxfp8_layer_for_marlin(layer)
+    x = torch.randn(1024, size_k, device="cuda", dtype=torch.bfloat16)
+
+    def run(inputs):
+        return apply_mxfp8_marlin_linear(
+            inputs,
+            layer.weight,
+            layer.weight_scale,
+            layer.workspace,
+            size_n,
+            size_k,
+            use_full_k=True,
+        )
+
+    reference = run(x)
+    expected = (x[:2].double() @ reference_weight.double().T).to(torch.bfloat16)
+    torch.testing.assert_close(reference[:2], expected, rtol=8e-3, atol=1e-3)
+    for m in (1, 8, 9, 16, 17, 56, 64, 65, 128, 129, 281, 385, 513, 1020):
+        actual = run(x[:m])
+        assert torch.equal(actual, reference[:m]), f"batch-dependent output at M={m}"
+        assert torch.equal(actual, run(x[:m])), f"unstable repetition at M={m}"
+    reordered = x.roll(63, 0)
+    assert torch.equal(run(reordered), reference.roll(63, 0))
+
+
+@pytest.mark.skipif(
     _gpu_marlin_unsupported(),
     reason="Marlin is not supported on this GPU type.",
 )
