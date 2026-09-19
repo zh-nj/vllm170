@@ -23,6 +23,15 @@ shift
 HOST_FREE_TARGET_GIB=${HOST_FREE_TARGET_GIB:-150}
 ATTEMPTS=${ATTEMPTS:-3}
 
+# See start_pp5_patient.sh: two launchers kill each other's workers. Share the
+# same lock so only one PP5 launcher of either kind can run.
+LAUNCHER_LOCK=${LAUNCHER_LOCK:-/tmp/dsv41_pp5_launcher.lock}
+exec 9>"${LAUNCHER_LOCK}"
+if ! flock -n 9; then
+    echo "another PP5 launcher holds ${LAUNCHER_LOCK}; refusing to start" >&2
+    exit 3
+fi
+
 for attempt in $(seq 1 "${ATTEMPTS}"); do
     for p in $(pgrep -f "VLLM::" || true); do kill -9 "$p" 2>/dev/null || true; done
     for _ in $(seq 1 30); do
@@ -32,7 +41,13 @@ for attempt in $(seq 1 "${ATTEMPTS}"); do
     done
     echo "attempt=${attempt} host_free=${free_gib:-?}GiB" >&2
 
-    rm -f "${LOG}"
+    # Keep the failed attempt's log: the failure is only diagnosable from the
+    # worker traceback, and deleting it per attempt throws that evidence away.
+    if [[ -s "${LOG}" ]]; then
+        mv "${LOG}" "${LOG}.attempt${attempt}"
+    else
+        rm -f "${LOG}"
+    fi
     setsid nohup env "$@" bash "${SCRIPT_DIR}/run_port_pp5.sh" >"${LOG}" 2>&1 </dev/null &
 
     for _ in $(seq 1 60); do
