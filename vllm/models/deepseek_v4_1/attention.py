@@ -4,8 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
-from abc import ABC, abstractmethod
 import importlib
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -27,12 +27,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
-from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.models.deepseek_v4_1.common.ops import (
     MXFP4_BLOCK_SIZE,
     fused_indexer_q_rope_quant,
     indexer_k_norm_rope_store,
 )
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -51,6 +51,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.models.deepseek_v4_1 import row_probe
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
@@ -586,6 +587,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             if register is not None:
                 register(**kwargs)
 
+    def _probe_stage(self, stage: str, tensor: object, positions: torch.Tensor) -> None:
+        """Report one intermediate tensor to an armed row probe."""
+        if row_probe.active() and isinstance(tensor, torch.Tensor):
+            row_probe.capture(f"{self.prefix}.{stage}", tensor, positions)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -607,8 +613,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
                 hidden_states
             )
+        self._probe_stage("input_proj.qr_kv", qr_kv, positions)
+        self._probe_stage("input_proj.kv_score", kv_score, positions)
+        self._probe_stage("input_proj.indexer_weights", indexer_weights, positions)
         with optional_phase_profile_stage("attn.split_norm", hidden_states):
             qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        self._probe_stage("split_norm.qr", qr, positions)
+        self._probe_stage("split_norm.kv", kv, positions)
 
         with optional_phase_profile_stage("attn.prepare", hidden_states):
             self._prepare_and_attn_fn(
@@ -622,10 +633,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 o_padded,
             )
         o = o_padded[:, : self.n_local_heads, :]
+        self._probe_stage("attn_raw", o, positions)
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         with optional_phase_profile_stage("attn.o_proj", o):
-            return self._o_proj(o, positions)
+            projected = self._o_proj(o, positions)
+        self._probe_stage("o_proj.out", projected, positions)
+        return projected
 
     @cached_property
     def _can_fuse_query_quant(self) -> bool:
@@ -745,8 +759,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             q = project_query_and_cache_kv()
+        self._probe_stage("prepare.q_after_rope", q, positions)
 
         self._last_compressed_latent = latent
+        self._probe_stage("compressor.latent", latent, positions)
 
         def prepare_indexer():
             if indexer is None:
@@ -771,6 +787,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             indexer_result = prepare_indexer()
         index_q, index_q_scale, index_weights_out = indexer_result
+        self._probe_stage("indexer.index_q", index_q, positions)
+        self._probe_stage("indexer.index_weights", index_weights_out, positions)
 
         self._sparse_indexer_and_attn(
             hidden_states,
@@ -873,6 +891,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 None,
                 index_weights,
             )
+            if row_probe.active():
+                # The selected compressed positions, in batch-row order.
+                self._probe_stage(
+                    "indexer.topk_indices",
+                    getattr(self.indexer.indexer_op, "topk_indices_buffer", None),
+                    positions,
+                )
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).

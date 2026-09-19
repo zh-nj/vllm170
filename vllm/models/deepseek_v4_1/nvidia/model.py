@@ -63,18 +63,22 @@ from vllm.models.deepseek_v4.nvidia.model import (
 from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
+from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_layer,
+    phase_profile_stage,
+)
+from vllm.models.deepseek_v4_1 import row_probe
 from vllm.models.deepseek_v4_1.attention import (
     DeepseekV4Attention,
     DeepseekV4IndexerCache,
     DeepseekV4PPCompressedCache,
     _indexer_k_cache_head_dim,
 )
+from vllm.models.deepseek_v4_1.ced import CEDPrefill, CEDStep, ced_prefill_enabled
 from vllm.models.deepseek_v4_1.common.ops import indexer_k_norm_rope_store
 from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import (
     rope_quant_insert,
 )
-from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
-from vllm.models.deepseek_v4_1.ced import CEDPrefill, CEDStep, ced_prefill_enabled
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -83,14 +87,11 @@ from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttentio
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import Engram, EngramLayout, NgramHashState
-from vllm.models.deepseek_v4.phase_profile import (
-    phase_profile_layer,
-    phase_profile_stage,
-)
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -347,9 +348,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
-        with phase_profile_layer(self.prefix):
-            with phase_profile_stage("layer.total", x, level="module"):
-                return self._forward(x, *args, **kwargs)
+        with (
+            phase_profile_layer(self.prefix),
+            phase_profile_stage("layer.total", x, level="module"),
+        ):
+            return self._forward(x, *args, **kwargs)
 
     def _forward(
         self,
@@ -422,8 +425,34 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _ROW_DUMP is not None:
             _ROW_DUMP.capture(f"{self.prefix}.mhc_pre_attn", x, positions)
-        with phase_profile_stage("attn.total", x, level="module"):
-            x = self.attn(positions, x, None)
+        handles = []
+        if (
+            _ROW_DUMP is not None
+            and extract_layer_index(self.prefix) == _ROW_DUMP.target_layer
+        ):
+            for path in _ROW_DUMP_MODULES:
+                module = _resolve_submodule(self.attn, path)
+                if module is None:
+                    continue
+
+                def record(module, inputs, output, path=path):
+                    value = output[0] if isinstance(output, tuple) else output
+                    if isinstance(inputs[0], torch.Tensor):
+                        _ROW_DUMP.capture(
+                            f"{self.prefix}.{path}.input", inputs[0], positions
+                        )
+                    if isinstance(value, torch.Tensor):
+                        _ROW_DUMP.capture(
+                            f"{self.prefix}.{path}.output", value, positions
+                        )
+
+                handles.append(module.register_forward_hook(record))
+        try:
+            with phase_profile_stage("attn.total", x, level="module"):
+                x = self.attn(positions, x, None)
+        finally:
+            for handle in handles:
+                handle.remove()
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
         if _ROW_DUMP is not None:
@@ -461,18 +490,26 @@ class _ProbeRowDump:
     is the one to look at, and everything before it is innocent. Files are keyed
     by the number of tokens in the batch, so each shape lands in its own file.
 
+    The coarse per-layer stages (``mhc_pre_attn``, ``attn_out``, ``ffn_out``) are
+    recorded for every layer so the sweep can locate the first divergent layer.
+    The fine stages reported by the attention itself (see
+    ``vllm.models.deepseek_v4_1.row_probe``) are recorded only for
+    ``target_layer``, which keeps an armed forward cheap.
+
     Triggered by the existence of ``_ROW_DUMP_TRIGGER`` rather than an env var:
     the vLLM worker processes do not inherit arbitrary ``VLLM_*`` names from
     ``vllm serve``, so an env-gated diagnostic silently never fires. The target
-    token index is read from ``_ROW_DUMP_POS_FILE``, which lets one server
-    answer several questions without a restart.
+    token index is read from ``_ROW_DUMP_POS_FILE`` and the layer to instrument
+    from ``_ROW_DUMP_LAYER_FILE``, which lets one server answer several
+    questions without a restart.
     """
 
     def __init__(self, path: str, rank: int) -> None:
         self.path = path
         self.rank = rank
-        self.rows: dict[int, torch.Tensor] = {}
+        self.rows: dict[int | str, torch.Tensor] = {}
         self.size: int | None = None
+        self.target_layer = _row_dump_layer()
 
     def capture(
         self,
@@ -494,12 +531,23 @@ class _ProbeRowDump:
                 target = int(fh.read().strip())
         except (OSError, ValueError):
             return
+        layer: int | None = None
+        if isinstance(key, str):
+            match = _ROW_DUMP_LAYER.search(key)
+            if match is not None:
+                layer = int(match.group(1))
+                if layer != self.target_layer and not key.endswith(_ROW_DUMP_COARSE):
+                    return
         matches = (positions == target).nonzero()
-        if matches.numel() == 0:
+        if matches.numel() != 1:
             return
         self.size = int(positions.numel())
         row = matches[0, 0]
         self.rows[key] = hidden_states[row].detach().float().cpu().clone()
+        if layer == self.target_layer and hidden_states.shape[0] == positions.numel():
+            window = (positions >= target - 127) & (positions <= target)
+            self.rows[f"{key}.window"] = hidden_states[window].detach().cpu().clone()
+            self.rows.setdefault("positions", positions.detach().cpu().clone())
 
     def flush(self) -> None:
         if self.rows and self.size is not None:
@@ -508,9 +556,45 @@ class _ProbeRowDump:
         self.size = None
 
 
+def _row_dump_layer() -> int:
+    """Layer whose fine-grained attention stages the probe should record."""
+    try:
+        with open(_ROW_DUMP_LAYER_FILE) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _resolve_submodule(root: nn.Module, path: str) -> nn.Module | None:
+    """Follow a dotted attribute path, or None when the layer has no such part."""
+    module: object = root
+    for part in path.split("."):
+        module = getattr(module, part, None)
+        if module is None:
+            return None
+    return module if isinstance(module, nn.Module) else None
+
+
 _ROW_DUMP_TRIGGER = "/tmp/dsv41_rowdump_on"
 _ROW_DUMP_POS_FILE = "/tmp/dsv41_rowdump_pos"
+_ROW_DUMP_LAYER_FILE = "/tmp/dsv41_rowdump_layer"
 _ROW_DUMP_PATH = "/tmp/dsv41row"
+# Stages recorded for every layer: the coarse sweep that locates the first
+# divergent layer. Everything else the probe records is limited to the target.
+_ROW_DUMP_COARSE = ("mhc_pre_attn", "attn_out", "ffn_out")
+_ROW_DUMP_LAYER = re.compile(r"layers\.(\d+)\.")
+# Attention submodules worth a hook on the target layer. They sit at different
+# depths and the ratio-0 layers have no compressor or indexer at all.
+_ROW_DUMP_MODULES = (
+    "fused_wqa_wkv",
+    "wq_b",
+    "wo_a",
+    "wo_b",
+    "compressor.fused_wkv_wgate",
+    "indexer.wk",
+    "indexer.weights_proj",
+    "indexer.wq_b",
+)
 # Set for the duration of one forward by DeepseekV4Model.forward so the decoder
 # layers can capture their own intermediates without threading a handle through.
 _ROW_DUMP: "_ProbeRowDump | None" = None
@@ -938,9 +1022,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     device=positions.device,
                 )
             tensors[_PP_NORMALIZED_INDEX_K] = (
-                normalized_k
-                if source_id >= self.start_layer
-                else normalized_k.clone()
+                normalized_k if source_id >= self.start_layer else normalized_k.clone()
             )
 
         num_tokens = positions.shape[0]
@@ -1056,6 +1138,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if os.path.exists(_ROW_DUMP_TRIGGER)
             else None
         )
+        row_probe.bind(None if _ROW_DUMP is None else _ROW_DUMP.capture)
         row_dump = _ROW_DUMP
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1092,6 +1175,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if row_dump is not None:
             row_dump.flush()
         _ROW_DUMP = None
+        row_probe.bind(None)
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:

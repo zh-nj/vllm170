@@ -14,6 +14,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4_1 import row_probe
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4_1.sparse_mla import (
@@ -23,8 +24,8 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms import current_platform
-from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.platforms.rocm import _ON_GFX950
+from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
@@ -878,9 +879,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 assert compressed_k_cache is not None
                 block_table = attn_metadata.block_table[num_decodes:]
                 # compressed_k_cache is OCP on every platform (Triton encoder).
-                with optional_phase_profile_stage(
-                    "sparse_mla.gather_compressed", q
-                ):
+                with optional_phase_profile_stage("sparse_mla.gather_compressed", q):
                     dequantize_and_gather_k_cache(
                         kv[:chunk_size],
                         compressed_k_cache,
@@ -913,7 +912,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             )
 
             with optional_phase_profile_stage("sparse_mla.combine_indices", q):
-                    combined_indices, combined_lens = self._combine_prefill_indices(
+                combined_indices, combined_lens = self._combine_prefill_indices(
                     topk_indices[query_start:query_end],
                     query_start_loc[
                         num_decodes + chunk_start : num_decodes + chunk_end + 1
@@ -925,6 +924,31 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     top_k,
                     M,
                     N,
+                )
+            if row_probe.active():
+                # The support domain this chunk attends to, per query row, plus
+                # the context width the gather buffer was sized for. Those are
+                # the two quantities every sparse-MLA launch sizes itself from.
+                chunk_positions = positions[query_start:query_end]
+                row_probe.capture(
+                    f"{self.prefix}.prefill.support_indices",
+                    combined_indices,
+                    chunk_positions,
+                )
+                row_probe.capture(
+                    f"{self.prefix}.prefill.support_lens",
+                    combined_lens,
+                    chunk_positions,
+                )
+                row_probe.capture(
+                    f"{self.prefix}.prefill.context_rows",
+                    torch.full(
+                        (chunk_positions.numel(), 1),
+                        float(N),
+                        dtype=torch.float32,
+                        device=q.device,
+                    ),
+                    chunk_positions,
                 )
             with optional_phase_profile_stage("sparse_mla.prefill", q):
                 rocm_sparse_attn_prefill(
