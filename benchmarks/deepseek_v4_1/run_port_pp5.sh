@@ -141,28 +141,42 @@ fi
 # spans cannot be chunked), which makes the engine require
 #     max_tokens_per_mm_item <= max_num_batched_tokens,
 # and for this checkpoint that item bound is vision_max_n_token + COMPRESS_PAD_TO
-# - 1 = 1024 + 2 - 1 = 1025. Raising max_num_batched_tokens to cover 1025 is not
-# free: measured on this box, 1024 -> 1152 changed the greedy token ids on 2 of 5
-# reference prompts and dropped DSpark acceptance from 5.69 to 5.06 tokens/step,
-# identically with and without vision -- the budget itself, not the images.
+# - 1 = vision_max_n_token + 1. So the cap has to follow the budget, and
+# PORT_VISION_MAX_N_TOKEN defaults to exactly that: at the default 1024 it is the
+# 1023 this launcher shipped (images up to 1022 tokens), at 2048 it is 2047
+# (images up to 2046 tokens). Raise it explicitly to cap images lower than the
+# budget allows. Note that the checkpoint declares 1024 image tokens
+# (vision_config.max_image_tokens), so a larger cap only widens the resolution
+# grid the processor may pick, on the vision side.
 #
-# Capping the per-image token budget at 1023 puts the bound exactly at the
-# default 1024 token budget, so the text path keeps byte-identical output
-# (verified 5/5 on the reference prompts) and images still get 1022 tokens plus
-# the compressor-alignment pad. The override must be flat (``vision_max_n_token``)
-# rather than nested (``vision_config.max_image_tokens``): nested dict overrides
-# are applied after the config derives that attribute from vision_config, so the
-# nested form is silently a no-op.
+# The budget no longer has to be held down for the text path. It used to be:
+# measured here, 1024 -> 1152 changed the greedy token ids on 2 of 5 reference
+# prompts and dropped DSpark acceptance from 5.69 to 5.06 tokens/step. That was
+# the unpinned shape-selected kernels (see
+# docs/design/vllm170-dsv41f-prefix-caching-2026-09-19.md) plus a chunked-prefill
+# tail being scored by the decode kernels (see
+# docs/design/vllm170-dsv41f-budget-2026-09-19.md). With marlin_full_k,
+# dsv41_strict_bf16_gemm and dsv41_strict_prefill_tail on, 1024 -> 4096 leaves all
+# five reference prompts byte-identical and the acceptance counters unchanged.
+#
+# The override must be flat (``vision_max_n_token``) rather than nested
+# (``vision_config.max_image_tokens``): nested dict overrides are applied after
+# the config derives that attribute from vision_config, so the nested form is
+# silently a no-op.
+PORT_VISION_MAX_N_TOKEN=${PORT_VISION_MAX_N_TOKEN:-$((PORT_MAX_BATCHED - 1))}
 mm_args=()
 if [[ "${PORT_MM_IMAGES}" != "0" ]]; then
-    mm_args=(--hf-overrides '{"vision_max_n_token":1023}')
-    if [[ "${PORT_MAX_BATCHED}" -lt 1024 ]]; then
-        echo "PORT_MAX_BATCHED=${PORT_MAX_BATCHED} is below the 1024 an image" \
-            "item needs; raise it or the engine will refuse to start." >&2
+    mm_args=(--hf-overrides "{\"vision_max_n_token\":${PORT_VISION_MAX_N_TOKEN}}")
+    if [[ "${PORT_VISION_MAX_N_TOKEN}" -lt 2 ]]; then
+        echo "PORT_VISION_MAX_N_TOKEN=${PORT_VISION_MAX_N_TOKEN} leaves no room" \
+            "for an image; raise PORT_MAX_BATCHED." >&2
         exit 2
     fi
 fi
 
+# PORT_EXTRA_ARGS carries a flag list (the documented way to pass
+# --additional-config here), so it has to word-split.
+# shellcheck disable=SC2086
 exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --served-model-name dsv41f-port \
     --host 0.0.0.0 \

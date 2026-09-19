@@ -521,10 +521,12 @@ class _ProbeRowDump:
             # A capture replays the same forward with a padded batch; reading a
             # value back or saving a tensor there would break the capture.
             return
-        if positions.numel() < 64:
-            # A prefill chunk, not a decode batch (at most max_num_seqs *
-            # (num_spec + 1) rows). The chunk's start position is not assumed:
-            # the scheduler's split is what this dump is here to look past.
+        if positions.numel() < 2:
+            # Nothing to select from. Everything else is recorded, including the
+            # one-row and short batches: whether those take the decode or the
+            # prefill kernel is one of the questions this dump exists to answer
+            # (``max_num_batched_tokens`` decides it through the chunk width),
+            # and skipping them hid exactly that case.
             return
         try:
             with open(_ROW_DUMP_POS_FILE) as fh:
