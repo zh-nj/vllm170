@@ -202,7 +202,7 @@ because the previous request is still decoding):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1024 | 1020 | 7.389 s | 4435 | 2.463 s | 1.653 s | 4989 tok/s | 61120 MiB | 3.9 GiB |
 | 1152 | 1148 | 7.041 s | 4654 | 2.385 s | 1.615 s | 5278 tok/s | -- | -- |
-| **2048** | **2044** | **6.75-6.81 s** | **4810-4857** | 2.616 s | 1.949 s | 5857 tok/s | 63222 MiB | 1.76 GiB |
+| **2048** | **2044** | **6.67-6.81 s** | **4810-4916** | 2.616 s | 1.949 s | 5857 tok/s | 61998-63222 MiB | 2.4-3.0 GiB |
 | 4096 | 4092 | 7.30-7.32 s | 4479-4490 | 3.409 s | 2.721 s | 6292 tok/s | 64214 MiB | 0.79 GiB |
 
 TTFT is `a + len / rate` with the fitted `a` growing with the budget (0.82 s at
@@ -224,20 +224,36 @@ Quality, measured at every one of those budgets, changed nowhere:
   accepted per draft position, i.e. 94.55% / 98.18% / 90.00% and accepted length
   5.727 / 5.909 / 5.500.
 
-So **2048**: the fastest measured point, images up to 2046 tokens instead of
-1022, and 1.76 GiB still free on the busiest rank (PP2, which carries a DSpark
-draft stage). 4096 was expected to be the better answer for prefill throughput
-and is not -- it is slower end to end and leaves 0.79 GiB. 1025 is the smallest
-budget that restores the checkpoint's own 1023-token image budget. 1152 is the
-value the launcher's comment named; it is dominated by 2048 on both speed and
-image room.
+So **2048**: the fastest measured point (32K TTFT 6.67-6.81 s across three
+boots, 4810-4916 tok/s), images up to 2042 tokens instead of 1018, and 2.4-3.0
+GiB still free on the busiest rank (PP2, which carries a DSpark draft stage).
+4096 was expected to be the better answer for prefill throughput and is not -- it
+is slower end to end and leaves 0.79 GiB. 1025 is the smallest budget that
+restores the checkpoint's own 1023-token image budget. 1152 is the value the
+launcher's comment named; it is dominated by 2048 on both speed and image room.
 
-The port launcher now derives the image cap from the budget
-(`PORT_VISION_MAX_N_TOKEN=${PORT_MAX_BATCHED - 1}`), so the default 1024 still
-gets the 1023 it shipped with and 2048 gets 2047. That cap itself is inert for
-the text path: at a fixed budget of 2048, raising it from 1023 to 2047 leaves
-every per-position logit of all sixteen prompts **bit-identical**, and the vision
-gate still passes with the wider grid.
+End to end, with the derived cap: a 4096x4096 image now yields 2019 prompt
+tokens (about 2008 of them image tokens) where the port could previously reach
+1018-plus-pad, an 8000x8000 image is clamped to the same grid, and both the
+vision gate and the reference five prompts still pass.
+
+One ceiling to keep in mind before raising the budget further: the indexer's
+per-row top-k switches from insertion to radix selection at `numRows > 12288`
+(`csr/.../sampler.cu` `top_k_per_row_prefill`), so a chunk wider than that would
+change the selection algorithm mid-batch. 2048 and 4096 are far below it; a
+megatoken budget would not be.
+
+The port launcher now derives the image cap from the budget *and* from the
+drafting reservation: `PORT_VISION_MAX_N_TOKEN` defaults to
+`PORT_MAX_BATCHED - 1 - (PORT_DSPARK_TOKENS - 1)`, because an image span is
+scheduled atomically and the chunk a request gets is the budget minus the slots
+DSpark reserves -- 1019 at the default 1024, 2043 at 2048. The flat 1023 this
+launcher shipped left a four-token window (1021..1024) in which an image item
+would not fit any chunk, and `scheduler.py:1749-1762` rolls such an item back and
+defers it on every step, which stalls the request rather than failing it. The cap
+itself is inert for the text path: at a fixed budget of 2048, raising it from
+1023 to 2047 left every per-position logit of all sixteen prompts
+**bit-identical**, and the vision gate passes with the wider grid.
 
 The constraint that forces the budget up at all is multimodal:
 `encoder_cache_manager.py:324` requires `max_tokens_per_mm_item <=
@@ -300,6 +316,6 @@ Tests:
   tokens/s, with a per-run salt nonce, an idle before each repeat and the
   prefix-cache hit counter read around every request.
 * `benchmarks/deepseek_v4_1/run_port_pp5.sh` -- the image cap follows the budget
-  instead of pinning the budget to 1024.
+  and the drafting reservation instead of pinning the budget to 1024.
 * `tests/v1/attention/test_attention_splitting.py` -- short-extend split policy
   and the knob's parsing.

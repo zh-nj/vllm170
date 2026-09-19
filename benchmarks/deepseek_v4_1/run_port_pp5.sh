@@ -141,13 +141,18 @@ fi
 # spans cannot be chunked), which makes the engine require
 #     max_tokens_per_mm_item <= max_num_batched_tokens,
 # and for this checkpoint that item bound is vision_max_n_token + COMPRESS_PAD_TO
-# - 1 = vision_max_n_token + 1. So the cap has to follow the budget, and
-# PORT_VISION_MAX_N_TOKEN defaults to exactly that: at the default 1024 it is the
-# 1023 this launcher shipped (images up to 1022 tokens), at 2048 it is 2047
-# (images up to 2046 tokens). Raise it explicitly to cap images lower than the
-# budget allows. Note that the checkpoint declares 1024 image tokens
-# (vision_config.max_image_tokens), so a larger cap only widens the resolution
-# grid the processor may pick, on the vision side.
+# - 1 = vision_max_n_token + 1. The bound has to stay under the *chunk* a
+# request gets, not under the budget: the scheduler admits
+# max_num_batched_tokens - max_num_new_slots_for_drafting tokens per request, so
+# the cap is PORT_MAX_BATCHED - 1 - PORT_DSPARK_SLOTS. An item that does not fit
+# is rolled back and deferred on every step, which stalls the request, and the
+# engine's startup check only compares it against the full budget -- so the
+# shipped flat cap of 1023 at a budget of 1024 left a four-token window where an
+# image could wedge the request. At 2048 the derived cap is 2043 (images up to
+# 2042 tokens) and at 1024 it is 1019 (images up to 1018). Raise
+# PORT_VISION_MAX_N_TOKEN explicitly to cap images lower. The checkpoint
+# declares 1024 image tokens (vision_config.max_image_tokens), so a larger cap
+# only widens the resolution grid the processor may pick, on the vision side.
 #
 # The budget no longer has to be held down for the text path. It used to be:
 # measured here, 1024 -> 1152 changed the greedy token ids on 2 of 5 reference
@@ -163,7 +168,11 @@ fi
 # (``vision_config.max_image_tokens``): nested dict overrides are applied after
 # the config derives that attribute from vision_config, so the nested form is
 # silently a no-op.
-PORT_VISION_MAX_N_TOKEN=${PORT_VISION_MAX_N_TOKEN:-$((PORT_MAX_BATCHED - 1))}
+PORT_DSPARK_SLOTS=0
+if [[ -n "${PORT_DSPARK_TOKENS}" && "${PORT_DSPARK_TOKENS}" != "0" ]]; then
+    PORT_DSPARK_SLOTS=$((PORT_DSPARK_TOKENS - 1))
+fi
+PORT_VISION_MAX_N_TOKEN=${PORT_VISION_MAX_N_TOKEN:-$((PORT_MAX_BATCHED - 1 - PORT_DSPARK_SLOTS))}
 mm_args=()
 if [[ "${PORT_MM_IMAGES}" != "0" ]]; then
     mm_args=(--hf-overrides "{\"vision_max_n_token\":${PORT_VISION_MAX_N_TOKEN}}")
