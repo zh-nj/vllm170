@@ -27,7 +27,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills,
+    strict_prefill_tail,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -414,6 +417,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     """
 
     reorder_batch_threshold: int | None = None
+    # A chunked-prefill tail no longer than ``decode_threshold`` rows is a
+    # "short extend": a prefill chunk that happens to be no wider than a
+    # speculative decode query. Counting it as a decode routes it to the decode
+    # kernel, which does not round like the prefill kernel, so the values such a
+    # chunk computes move with how many rows it holds -- and that count is what
+    # ``max_num_batched_tokens`` sets. Subclasses whose output must not move with
+    # the budget set this to False.
+    treat_short_extends_as_decodes: bool = True
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
 
@@ -444,6 +455,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
         self.reorder_batch_threshold = None
+        self.treat_short_extends_as_decodes = not strict_prefill_tail(
+            self.vllm_config.additional_config
+        )
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -682,7 +696,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         ):
             (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
                 split_decodes_and_prefills(
-                    common_attn_metadata, decode_threshold=self.decode_threshold
+                    common_attn_metadata,
+                    decode_threshold=self.decode_threshold,
+                    # The split assumes the batch is ordered decode ->
+                    # short_extend -> long_extend -> prefill, which is what the
+                    # runner's reorder produces from the same threshold. Without
+                    # the per-request flag a short extend cannot be told from a
+                    # decode, so keep the decode side of the split.
+                    treat_short_extends_as_decodes=(
+                        self.treat_short_extends_as_decodes
+                        or common_attn_metadata.is_prefilling is None
+                    ),
                 )
             )
 

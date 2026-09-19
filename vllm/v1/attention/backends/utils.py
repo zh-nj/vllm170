@@ -839,6 +839,28 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
+def strict_prefill_tail(extra: object) -> bool:
+    """Whether a chunked-prefill tail must stay on the prefill side.
+
+    The scheduler caps a prefill chunk at ``max_num_batched_tokens -
+    max_num_new_slots_for_drafting`` rows, so the tail of a prompt that does not
+    fit in one chunk is ``prompt_len`` modulo that cap: which prompts *have* a
+    short tail, and how short, follows ``--max-num-batched-tokens``. A tail no
+    wider than ``decode_threshold`` is then classified as a decode and scored by
+    the decode kernels, which do not round like the prefill kernels, so the same
+    position moves with the budget, and a backend that splits at a different
+    width than the indexer disagrees with it about the same rows. Off by default;
+    a caller opts in through ``additional_config``, because a worker does not
+    inherit arbitrary ``VLLM_*`` names from ``vllm serve``.
+    """
+    if isinstance(extra, dict) and "dsv41_strict_prefill_tail" in extra:
+        value = extra["dsv41_strict_prefill_tail"]
+        if not isinstance(value, bool):
+            raise ValueError("dsv41_strict_prefill_tail must be a JSON boolean")
+        return value
+    return False
+
+
 def split_prefill_chunks(
     seq_lens_cpu: torch.Tensor, workspace_size: int, request_offset: int = 0
 ) -> list[tuple[int, int]]:

@@ -8,6 +8,7 @@ from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
+    strict_prefill_tail,
 )
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
@@ -239,6 +240,41 @@ def test_split_decodes_and_prefills_uniform_all_ones():
     assert num_prefills == 0
     assert num_decode_tokens == 3
     assert num_prefill_tokens == 0
+
+
+def test_strict_prefill_tail_defaults_off_and_validates():
+    """The decode/prefill split policy is opt-in and typed."""
+    assert strict_prefill_tail({}) is False
+    assert strict_prefill_tail(None) is False
+    assert strict_prefill_tail({"dsv41_strict_prefill_tail": True}) is True
+    assert strict_prefill_tail({"dsv41_strict_prefill_tail": False}) is False
+    for value in ("false", "true", 0, 1, None):
+        with pytest.raises(ValueError, match="JSON boolean"):
+            strict_prefill_tail({"dsv41_strict_prefill_tail": value})
+
+
+def test_split_decodes_and_prefills_short_extend_keeps_prefill_path():
+    """A prefilling short chunk must be able to stay on the prefill side.
+
+    The decode and prefill kernels do not round alike, so classifying a
+    chunked-prefill tail as a decode makes the values that tail computes depend
+    on how many rows it holds -- and a tail's width is
+    ``prompt_len % (max_num_batched_tokens - draft_slots)``. The DSV4.1 port's
+    ``dsv41_strict_prefill_tail`` turns this on; the batch is ordered decode ->
+    short_extend, which is what the runner's reorder produces.
+    """
+    query_lens = [6, 3]
+    assert apply_split_decodes_and_prefills(
+        query_lens, decode_threshold=11, require_uniform=False
+    ) == (2, 0, 9, 0)
+
+    assert apply_split_decodes_and_prefills(
+        query_lens,
+        decode_threshold=11,
+        require_uniform=False,
+        is_prefilling=[False, True],
+        treat_short_extends_as_decodes=False,
+    ) == (1, 1, 6, 3)
 
 
 def test_split_decodes_and_prefills_uniform_short_extend():

@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
+    strict_prefill_tail,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -721,6 +722,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
+        # ``use_pcp`` already forces short extends onto the prefill side; the
+        # port's knob does the same where PCP is off, so this split and the
+        # attention's agree on which rows are a chunked-prefill tail.
+        self.treat_short_extends_as_decodes = not self.use_pcp and not (
+            strict_prefill_tail(self.vllm_config.additional_config)
+        )
         self.reorder_batch_threshold = None
         self.use_flattening = _use_flattening(self.vllm_config)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
@@ -1025,7 +1032,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 require_uniform=not (self.use_flattening or self.supports_varlen),
-                treat_short_extends_as_decodes=not self.use_pcp,
+                treat_short_extends_as_decodes=self.treat_short_extends_as_decodes,
             )
         )
 
