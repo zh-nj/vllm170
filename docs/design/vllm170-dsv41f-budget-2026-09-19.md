@@ -156,8 +156,19 @@ several thresholds at exactly 1024. All are either pinned or measured inert:
   GEMM fixes ThreadblockK at 128, so only the output tiling and the padding
   change, and padded rows carry weight 0.
 
-Marlin's stream-K decomposition and cuBLAS's kernel choice are continuous in `M`,
-not thresholded, and are pinned by `marlin_full_k` and `dsv41_strict_bf16_gemm`.
+Marlin's dependence is continuous in `M` through its split points rather than
+thresholded, and the split points are what moves: `prob_m_split` is 960 at
+`M = 1020` and 1088 at `M = 1148` (`csrc/.../marlin/marlin.cu:465-469`), which
+makes the kernel's own `parallel = prob_m / m_block_size` 15 against 17 and the
+stream-K decomposition `iters` 40 against 56 at `prob_n = 1792` -- a different
+K-stripe boundary per row. Nothing else in the launch discriminates these two
+sizes: `thread_m_blocks` is 4 on every launch of both, so the thread-config table
+and the `red_off` cross-warp reduce are identical, and `prob_m` is never read by
+`get_scales_cache_size` / `get_kernel_cache_size`, so the auto exec-config choice
+is `M`-independent. `marlin_full_k` is therefore the sufficient pin and the only
+one needed: it makes `global_mn_tiles` equal `gridDim.x`, so `iters = k_tiles`
+and `parallel` stops mattering. cuBLAS's kernel choice is likewise continuous in
+`M`, with no 1024-row boundary, and is pinned by `dsv41_strict_bf16_gemm`.
 
 The most sensitive of those call sites is the MoE router gate:
 `vllm/model_executor/layers/fused_moe/router/gate_linear.py:424` calls
