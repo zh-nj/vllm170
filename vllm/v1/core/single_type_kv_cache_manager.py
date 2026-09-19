@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -470,6 +471,18 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
         )
+        if envs.VLLM_KV_CACHE_DEBUG:
+            logger.info(
+                "cache_blocks: group=%d %s block_size=%d cached_before=%d "
+                "num_full_blocks=%d hashes=%d mask=%s",
+                self.kv_cache_group_id,
+                type(self).__name__,
+                self.block_size,
+                num_cached_blocks,
+                num_full_blocks,
+                len(request.block_hashes),
+                "all" if block_mask is None else sum(block_mask),
+            )
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -954,6 +967,18 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for _ in range(len(kv_cache_group_ids))
         )
         block_size = kv_cache_spec.block_size
+        debug = envs.VLLM_KV_CACHE_DEBUG
+        if debug:
+            logger.info(
+                "swa lookup: groups=%s max_length=%d max_blocks=%d need=%d "
+                "drop_eagle=%s alignment=%d",
+                kv_cache_group_ids,
+                max_length,
+                max_num_blocks,
+                sliding_window_contiguous_blocks,
+                drop_eagle_block,
+                alignment_tokens,
+            )
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
@@ -1005,6 +1030,13 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 for computed in computed_blocks:
                     computed.pop()
         hit_length = len(computed_blocks[0]) * block_size
+        if debug:
+            logger.info(
+                "swa result: blocks=%d hit=%d matched=%s",
+                len(computed_blocks[0]),
+                hit_length,
+                match_found,
+            )
         return computed_blocks, hit_length
 
     @classmethod
@@ -1060,11 +1092,33 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # capped by ``get_computed_blocks``) and any shared-prefix junction. Both
         # land before segments would cover them under sparse retention, so keep
         # the ``need``-block tail ending on each boundary explicitly.
+        #
+        # A tail that runs past what a lookup can examine is worth nothing: the
+        # finder only matches a run of ``need`` blocks that starts on an
+        # ``alignment_tokens`` boundary and stays below ``min(end, num_prompt - 1
+        # over block_size)``. When the prompt ends fewer than ``need`` blocks
+        # after the aligned boundary, the tail's last block is not a full block
+        # of this request, so only ``need - 1`` of them exist and every later
+        # lookup of the same prompt reconciles to zero -- a full re-prefill
+        # despite the cache. Retain the previous aligned run in that case, so
+        # the tail is always a run the finder can match.
         if retention_interval is not None:
+            alignment_blocks = alignment_tokens // block_size
             for boundary_tokens in reachable_boundaries:
                 aligned = boundary_tokens // alignment_tokens * alignment_tokens
                 end = aligned // block_size + shift
-                for j in range(max(start_block, end - need), min(end_block, end)):
+                tail_start = end - need
+                reach = min(end, end_block, boundary_tokens // block_size)
+                for j in range(max(start_block, tail_start), min(end_block, end)):
+                    mask[j - start_block] = True
+                if tail_start + need <= reach or tail_start >= end_block:
+                    continue
+                fallback = (reach - need) // alignment_blocks * alignment_blocks
+                if fallback < 0:
+                    continue
+                for j in range(
+                    max(start_block, fallback), min(end_block, fallback + need)
+                ):
                     mask[j - start_block] = True
 
         return mask

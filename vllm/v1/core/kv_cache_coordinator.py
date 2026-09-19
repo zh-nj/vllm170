@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -110,6 +111,30 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+
+        if envs.VLLM_KV_CACHE_DEBUG:
+            logger.info(
+                "KV cache layout: scheduler_block_size=%d hash_block_size=%d "
+                "num_blocks=%d use_eagle=%s eagle_group_ids=%s",
+                scheduler_block_size,
+                hash_block_size,
+                kv_cache_config.num_blocks,
+                use_eagle,
+                sorted(self.eagle_group_ids),
+            )
+            for i, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                logger.info(
+                    "  group %d: %s block_size=%d prefix_cacheable=%s "
+                    "tokens_per_state=%s sliding_window=%s layers=%d",
+                    i,
+                    type(spec).__name__,
+                    spec.block_size,
+                    spec.prefix_cacheable,
+                    getattr(spec, "tokens_per_state", None),
+                    getattr(spec, "sliding_window", None),
+                    len(group.layer_names),
+                )
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state
@@ -903,6 +928,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        if envs.VLLM_KV_CACHE_DEBUG:
+            logger.info(
+                "prefix lookup: max=%d hit=%d longest=%d uncached_common=%d "
+                "groups=%s eagles=%s",
+                max_cache_hit_length,
+                hit_length,
+                longest_hit_length,
+                num_uncached_common_prefix_tokens,
+                [
+                    (type(g.spec).__name__, g.spec.block_size, g.use_eagle,
+                     hit_length_by_group[g.group_ids[0]])
+                    for g in self.attention_groups
+                ],
+                sorted(self.eagle_group_ids),
+            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

@@ -21,15 +21,17 @@ block-aligned hits, ~2x lower TTFT on a repeated 1.5-2.5K prompt, ~11x on a repe
 against the caching-off server, and working multimodal reuse. Decode throughput is
 unchanged within the noise of this box.
 
-Two behaviours showed up while verifying it, and both are documented below because
-they are what a "did prefix caching change my outputs?" report will look like:
+Two behaviours showed up while verifying it, and both are documented below:
 
-- **Prefill batch shape perturbs the logits** (~0.1 nat), which flips near-tied greedy
-  tokens and can make a cached and an uncached completion diverge. This is a property
-  of the model's kernels, not of the cache (proved below with zero reuse involved).
-- **A prompt that ends 1..32 tokens past a 128-block boundary reconciles to zero
-  reuse**, even though its blocks are cached. Deterministic and reproducible; it is in
-  the upstream scheduler/coordinator, which this port does not touch.
+- **Prefill is not batch-invariant** (~0.1-1.4 nats on the same token in the same
+  context, depending only on the shape of the batch it is computed in), so greedy
+  continuations can diverge between a cached and an uncached serving. Proved below with
+  zero reuse involved: it is a property of the model's kernels, not of the cache, and it
+  is not fixable at the prefix-cache layer. Diagnosed, not fixed.
+- **A prompt that ends 1..32 tokens past a 128-block boundary reconciled to zero
+  reuse**, even though its blocks were cached. Root-caused to the sparse-retention tail
+  in `SlidingWindowManager.reachable_block_mask` and **fixed**; the whole band now
+  reuses the aligned prefix.
 
 ## Why it was off
 
@@ -121,75 +123,152 @@ configuration is 76.4-91.5 ms (about 7%). The two distributions overlap, so ther
 measurable decode cost to the flag, and no measurable gain either -- the benefit is
 entirely in prefill (TTFT).
 
-## Finding 1: prefill batch shape perturbs the logits, and greedy decoding amplifies it
+## Finding 1 (diagnosed, not fixed): prefill is not batch-invariant
 
 Cold and warm runs of the same prompt can produce different completions. It is not the
-cache. Proof, with no reuse in the picture at all:
+cache, and it is not fixable at the prefix-cache layer: a row's prefill result depends on
+how many tokens are in the batch it is computed in, so *any* change in chunking changes
+it. A prefix-cache hit is simply the most common way to change chunking.
 
-`ids[0:1500]` is a prefix of `ids[0:1628]`, so the token at index 1499 has a
-byte-identical context in both. Chunked prefill computes it in a 476-token batch for
-the first prompt and a 604-token batch for the second. Its own prompt logprob differs:
-
-```
-index 1499: -0.5303 (476-token chunk)  vs  -0.4345 (604-token chunk)
-index 1300: -10.7913 (rank 8)          vs  -10.6855 (rank 9)
-index 1100: -0.00417                   vs  -0.00701
-```
-
-The same magnitude (~0.1 nat) appears as the cold/warm difference at the last prompt
-position, e.g.
+Evidence, all of it with **zero reuse** (every request carries a unique `cache_salt`, so
+each is a full cold prefill):
 
 ```
-cold top5 {'e': -1.678, 'k': -1.803, ...}
-warm top5 {'k': -1.257, 'e': -1.882, ...}   # top-1 flips; the two are 0.125 apart cold
+logprob of token 1300 vs the length of the chunk it is computed in
+(first chunk fixed at 1024, so the second chunk is n - 1024):
+
+  n=[1304,1336]  tail=[280,312]  logprob=-10.063070
+  n=[1344,1392]  tail=[320,368]  logprob=-9.922690
+  n=[1408,1464]  tail=[384,440]  logprob=-10.570042
+  n=[1472,1528]  tail=[448,504]  logprob=-10.791334
+  n=[1536,1568]  tail=[512,544]  logprob=-11.281863
+  n=[1596,1621]  tail=[572,597]  logprob=-10.685512
 ```
 
-So: a cache hit necessarily recomputes its tail in a much smaller batch than the cold
-prefill did (a hit of `n - (n mod 128)` leaves at most 129 tokens to compute), that
-batch-shape change moves the logits by a few tenths of a nat, and on a near-tied token
-greedy decoding flips, after which the two continuations diverge chaotically. This is
-the same class of change as editing `max_num_batched_tokens`, and it is why the gate
-does not assert byte-identical cold/warm output.
+Bit-identical over a range, then a discrete jump of up to 1.4 nats. Two controls say
+what kind of effect this is:
 
-What *is* an invariant, and is asserted:
+- **Not leakage.** The token at index 900, in the always-1024-token first chunk, is
+  bit-identical (`-0.000127`) across every `n`, so the effect is local to the batch a row
+  is computed in rather than non-causal influence from later tokens.
+- **Not content.** Replacing the tokens after the probe with different tokens *of the
+  same length* leaves the probe bit-identical (`-9.867739`, four different tails), so the
+  later tokens themselves are irrelevant.
 
-- two cold prefills of the same prompt with the same batch shape are bit-identical
-  (they are given distinct `cache_salt` values so they cannot share blocks),
+So the jump is a kernel-configuration change keyed on the batch's token count. The
+plateaus land on 64-token multiples of the recomputed chunk, which is the bucket size of
+`ceil(num_tokens * topk / num_experts)` -- 384 experts and topk 6 give exactly
+`ceil(M / 64)`. What is *not* the cause, checked directly:
+
+- MHC pre-norm: both call sites are gated on `is_deep_gemm_supported()`, which is False
+  on SM80, and the TileLang path pins `n_splits=1` for `num_tokens >= 128`.
+- MoE grouped GEMM: its `Params` carry no `split_k_slices`, so it walks the full K per
+  tile and a row's result cannot depend on the grid size.
+- Indexer logits KV grouping: `_select_prefill_kv_group` returns 1 below
+  `_KV_GROUP_MIN_N = 16384`, far above any prefix length here.
+
+The remaining suspects are the sparse-MLA prefill attention and the indexer's top-k
+selection (512 of ~651 compressed keys, so the selection boundary is dense and a tiny
+logit change flips which keys are attended). Fixing it means making those kernels
+batch-invariant; upstream's `VLLM_BATCH_INVARIANT` covers none of this model's kernels.
+
+**Impact**, measured on eight realistic 1200-token prompts built from this repo's docs,
+128 greedy tokens each, cold against cached:
+
+```
+diverged 8/8    first difference at token 0, 8, 11, 12, 24, 58, 88, 107
+```
+
+versus 5/5 byte-identical on the five reference prompts and 3/3 on the vision example, so
+the divergence needs a long free-form continuation and a near-tied token to appear. It is
+still the reason a cached and an uncached serving of the same long prompt should be
+expected to differ.
+
+What *is* an invariant, and is asserted by the gate:
+
+- two cold prefills of the same prompt with the same batch shape are bit-identical,
 - two runs that both hit the cache are bit-identical,
 - the hit length is exact.
 
-Consequences worth knowing: on peaked text (the five reference prompts, the vision
-example) cached and uncached runs agree byte for byte; on long free-form answers over
-repetitive prompts they can diverge at a near-tied token. A user comparing cached and
-uncached servings of the same long prompt should expect occasional divergence, and
-should not read it as cache corruption.
+`prefix_cache_shape_probe.py` re-runs the sweep above.
 
-## Finding 2: a 1..32 token tail block reconciles to zero reuse
+## Finding 2 (fixed): a 1..32 token tail block reconciled to zero reuse
 
-With genuinely unique prompts (fresh random ids, `cold_hits == 0` proving the cold run
-was cold), reuse depends on where the prompt ends inside its last full 128-block:
+With genuinely unique prompts (`cold_hits == 0` proving the cold run was cold), reuse
+depended on where the prompt ends inside its last 128-block:
 
 ```
-tail   0 : 1280 reused
-tail 1-32: 0 reused          <- no reuse at all
-tail  33+: 1408 reused
+before the fix            after the fix
+  tail   0 : 1280           tail   0 : 1280
+  tail 1-32: 0              tail 1-32: 1280      <- full band restored
+  tail  33+: 1408           tail  33+: 1408
 ```
 
-It is not a race (a 3 s gap changes nothing), not content (six different contents at
-the same length behave identically), and not a failure to cache: a 1408-token *prefix*
-of a failing prompt hits 1280 immediately afterwards, and a 1424-token prompt whose
-prefix was cached by a separate 1408-token request hits 1280. Only the request's own
-blocks are unreachable to itself.
+It was not a race (a 3 s gap changed nothing), not content (six different contents at the
+same length behaved identically), and not a failure to cache: a 1408-token *prefix* of a
+failing prompt hit 1280 immediately afterwards. Only the request's own blocks were
+unreachable to itself.
 
-The 32/33 boundary points at the SWA group, whose `block_size` is 32 while the
-compressed/indexer groups use 128 and the scheduler block (the hit alignment) is 128.
-Confirming the mechanism needs scheduler-side tracing; it lives in
-`vllm/v1/core/` (untouched by this port -- `git status vllm/v1/core/` is clean), so it
-is an upstream issue rather than a port regression.
+### Root cause
 
-Practical impact: prompt lengths that land in that band pay a full prefill on every
-request. `prefix_cache_gate.py` pins the observation as a case with
-`expected_hit_tokens=0` so a future fix flips it visibly instead of silently.
+Two facts meet, and the first one is easy to miss:
+
+1. `prefix_cache_retention_interval` **defaults to `0`, not `None`**
+   (`config/cache.py:_get_prefix_cache_retention_interval`). Sparse retention means the
+   SWA group stores only the `need`-block tail ending at each reachable boundary --
+   for this model `need = cdiv(128 - 1, 32) + 1 = 5` blocks of 32, out of the whole
+   prompt.
+2. `SlidingWindowManager.find_longest_cache_hit` only matches a run of `need` blocks that
+   *starts* on an `alignment_tokens` boundary and stays below
+   `min(end, (num_prompt - 1) // block_size)`.
+
+The store computes `end = aligned // 32 + shift` with `aligned = (num_prompt - 1) // 128
+* 128` and `shift = 1` under EAGLE, so the retained tail is `[end - 5, end)`. When the
+prompt ends fewer than 33 tokens past the aligned boundary, block `end - 1` is not a full
+block of that request -- `num_prompt // 32` is one short -- so the store skips it, only 4
+of the 5 blocks exist, and the finder can never reach `need`. Every lookup of that prompt
+reconciles to 0 and the whole prompt is re-prefilled.
+
+`VLLM_KV_CACHE_DEBUG=1` shows it directly; `mask=5` is what the mask asked for, and only
+four blocks exist:
+
+```
+cache_blocks: group=0 SlidingWindowManager block_size=32 cached_before=29
+              num_full_blocks=45 hashes=45 mask=5
+prefix lookup: max=1423 hit=0 longest=1408 ... groups=[('MLAAttentionSpec',128,False,0),
+              ('SlidingWindowMLASpec',32,True,0)]
+```
+
+### Fix
+
+`SlidingWindowManager.reachable_block_mask` now also retains the previous *aligned* run
+when the boundary tail cannot be matched:
+
+```python
+reach = min(end, end_block, boundary_tokens // block_size)
+if tail_start + need > reach or tail_start >= end_block:
+    fallback = (reach - need) // alignment_blocks * alignment_blocks
+    for j in range(max(start_block, fallback), min(end_block, fallback + need)):
+        mask[j - start_block] = True
+```
+
+Outside the broken band nothing changes: when the tail is matchable, `reach` already
+covers it and the branch is skipped, so the retained set is byte-identical to before.
+
+The band sweep after the fix (same probe, fresh content per length):
+
+```
+tail   0: 1280   tail   1: 1280   tail   2: 1280   tail   4: 1280
+tail   8: 1280   tail  16: 1280   tail  24: 1280   tail  31: 1280
+tail  32: 1280   tail  33: 1408   tail  40: 1408   tail  64: 1408
+tail  96: 1408   tail 127: 1408          no-reuse lengths: none
+```
+
+`prefix_cache_gate.py` carries the `short-tail` case, and it asserts a *bound* rather
+than the exact value: the hit must land in `[(full - 1) * block_size, full * block_size]`
+of the aligned prefix. Asserting the exact per-length value would only mirror the
+implementation, and the exact value legitimately depends on how much of the tail the
+retention policy could keep.
 
 ## Reproducing
 
@@ -205,6 +284,12 @@ request. `prefix_cache_gate.py` pins the observation as a case with
 
 # cross-config output equality
 .venv/bin/python benchmarks/deepseek_v4_1/dspark_output_dump.py --out /tmp/on.json   # on both servers
+
+# prefill batch-shape sensitivity (Finding 1), zero reuse
+.venv/bin/python benchmarks/deepseek_v4_1/prefix_cache_shape_probe.py
+
+# the KV cache group layout and per-group hit lengths (Finding 2)
+VLLM_KV_CACHE_DEBUG=1 ... benchmarks/deepseek_v4_1/run_port_pp5.sh
 ```
 
 Two traps the gate scripts now avoid, both of which produced wrong conclusions first:
@@ -226,3 +311,9 @@ Two traps the gate scripts now avoid, both of which produced wrong conclusions f
   lengths, TTFT, the `cache_salt` cold/cold control, and the pinned short-tail case.
 - `benchmarks/deepseek_v4_1/vision_reference_example.py`: `--repeat N`, which turns the
   reference example into a multimodal reuse check.
+- `benchmarks/deepseek_v4_1/prefix_cache_shape_probe.py`: new. The Finding 1 sweep.
+- `vllm/v1/core/single_type_kv_cache_manager.py`: the retention-tail fix, plus
+  `VLLM_KV_CACHE_DEBUG`-gated store/lookup diagnostics that made Finding 2 legible.
+- `vllm/v1/core/kv_cache_coordinator.py`: the same env var dumps the group layout once
+  per engine and the per-group hit lengths per lookup.
+- `vllm/envs.py`: `VLLM_KV_CACHE_DEBUG`.

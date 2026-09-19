@@ -386,6 +386,9 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    # Log the resolved KV cache group layout once per engine and the
+    # per-group prefix-cache hit lengths around every lookup.
+    VLLM_KV_CACHE_DEBUG: bool = False
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -1409,6 +1412,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PLUGINS" not in os.environ
         else os.environ["VLLM_PLUGINS"].split(",")
     ),
+    "VLLM_KV_CACHE_DEBUG": lambda: bool(int(os.getenv("VLLM_KV_CACHE_DEBUG", "0"))),
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
