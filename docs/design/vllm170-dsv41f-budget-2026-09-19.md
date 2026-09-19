@@ -242,9 +242,29 @@ Quality, measured at every one of those budgets, changed nowhere:
   accepted per draft position, i.e. 94.55% / 98.18% / 90.00% and accepted length
   5.727 / 5.909 / 5.500.
 
-So **2048**: the fastest measured point (32K TTFT 6.67-6.81 s across three
-boots, 4810-4916 tok/s), images up to 2042 tokens instead of 1018, and 2.4-3.0
-GiB still free on the busiest rank (PP2, which carries a DSpark draft stage).
+Under a concurrent decode the budget is a cost, not a gain, so the pick depends
+on which half matters (`mixed_gate.py`: a 256-token request streaming 48 tokens,
+then a cold 32K prefill launched 0.6 s later; three repeats each, spread under
+5%):
+
+| budget | decode tokens served during the ~9 s prefill | median gap | worst gap | quiet ITL | solo 32K TTFT |
+| --- | --- | --- | --- | --- | --- |
+| 1024 | 6 | 1486 ms | 1615 ms | 86 ms | 7.35 s |
+| 2048 | 5 | 1866 ms | 2836 ms | 83 ms | 6.7-6.8 s |
+
+Both budgets starve the decode -- it is served about once per prefill chunk --
+because a long prefill takes the whole per-request budget and a DSpark decode
+step needs `1 + num_speculative_tokens = 6` tokens of it, so the two rarely share
+a step; the scheduler's prefill throttling lets a few decode-only steps through.
+The wider budget widens the gap (worst case 1.6 s -> 2.8 s) while buying 8% on
+TTFT.
+
+So **2048** when prefill throughput and image room matter more than a concurrent
+decode's latency -- the fastest measured point (32K TTFT 6.67-6.81 s across
+three boots, 4810-4916 tok/s), images up to 2042 tokens instead of 1018, and
+2.4-3.0 GiB still free on the busiest rank (PP2, which carries a DSpark draft
+stage) -- and **1024 or 1152** when a decode running beside a long prefill has to
+stay under about 1.5 s.
 4096 was expected to be the better answer for prefill throughput and is not -- it
 is slower end to end and leaves 0.79 GiB. 1025 is the smallest budget that
 restores the checkpoint's own 1023-token image budget. 1152 is the value the
@@ -333,6 +353,9 @@ Tests:
 * `benchmarks/deepseek_v4_1/prefill_gate.py` -- cold-prompt TTFT and prefill
   tokens/s, with a per-run salt nonce, an idle before each repeat and the
   prefix-cache hit counter read around every request.
+* `benchmarks/deepseek_v4_1/mixed_gate.py` -- what a cold 32K prefill does to a
+  decode running beside it: decode tokens served inside the prefill window, and
+  the gaps between them.
 * `benchmarks/deepseek_v4_1/run_port_pp5.sh` -- the image cap follows the budget
   and the drafting reservation instead of pinning the budget to 1024.
 * `tests/v1/attention/test_attention_splitting.py` -- short-extend split policy
