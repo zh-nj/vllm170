@@ -433,6 +433,23 @@ layers, not proven for every operator: each new batch-shaped heuristic in a
 kernel launcher is a new instance of the same class of bug, and the row probe is
 what finds them.
 
+Two candidates were ruled out rather than left in the background, because both
+are the only *literal* 512-row boundaries in the tree and either would be a
+coincidence worth checking before trusting the explanation above:
+
+- `split_indexer_prefill_chunks` sub-chunks the indexer's prefill rows at
+  `VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS` (512), and switches top-k
+  implementations with them. It is gated on
+  `VLLM_INDEXER_PREFILL_STREAMING_TOPK`, which defaults off, and neither the
+  worker environment nor the launcher sets any of that family.
+- The same function caps a sub-chunk at `VLLM_SPARSE_INDEXER_MAX_QUERY_ROWS`,
+  which defaults to 1024 -- above every chunk this deployment schedules
+  (`max_num_batched_tokens` is 1024, and the first chunk is 1020).
+
+Both were confirmed unset on the running instance. The `N = 512` in the
+compressor is the cr-dependent parameter, and it is the stage the dump
+convicts.
+
 ### Upstream comparison
 
 The user-provided `/mnt/data/apps/vllm` contains current fetched refs. Its working
