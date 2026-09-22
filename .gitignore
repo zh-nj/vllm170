@@ -258,3 +258,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 
 # Local serving and measurement output (server logs, decode gate records).
 /logs/
+/artifacts/
