@@ -23,6 +23,50 @@ class _MatmulShapeConfig(NamedTuple):
 _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
     str, dict[tuple[int, int], _MatmulShapeConfig]
 ] = {
+    "ampere": {
+        (129280, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 256, 8, 4)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (5120, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 128, 4, 3)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (2304, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 64, 8, 3)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (1536, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 32, 4, 5)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (512, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 32, 4, 5)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (384, 5120): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (1, _MatmulMConfig(16, 32, 8, 2)),
+                (2**31, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+    },
     "ada": {
         (12288, 2048): _MatmulShapeConfig(
             block_k=64,
@@ -259,12 +303,15 @@ _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
 _TUNED_MATMUL_CONFIGS_FOR_DEVICE: dict[tuple[int, int], _MatmulShapeConfig] | None = (
     None
 )
+_TUNED_MATMUL_ARCH_FAMILY: str | None = None
 _TUNED_MATMUL_CONFIGS_RESOLVED = False
 
 
 def _get_tuned_matmul_arch_family(capability: DeviceCapability | None) -> str | None:
     if capability is None:
         return None
+    if capability.major == 8 and capability.minor == 0:
+        return "ampere"
     if capability.major == 10:
         return "blackwell"
     if capability.major == 9:
@@ -276,6 +323,7 @@ def _get_tuned_matmul_arch_family(capability: DeviceCapability | None) -> str | 
 
 def resolve_tuned_matmul_configs() -> None:
     global _TUNED_MATMUL_CONFIGS_FOR_DEVICE
+    global _TUNED_MATMUL_ARCH_FAMILY
     global _TUNED_MATMUL_CONFIGS_RESOLVED
 
     if _TUNED_MATMUL_CONFIGS_RESOLVED:
@@ -286,6 +334,7 @@ def resolve_tuned_matmul_configs() -> None:
         current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     arch_family = _get_tuned_matmul_arch_family(capability)
+    _TUNED_MATMUL_ARCH_FAMILY = arch_family
     if arch_family is None:
         _TUNED_MATMUL_CONFIGS_FOR_DEVICE = None
     else:
@@ -326,4 +375,29 @@ def _get_matmul_config(
         "GROUP_SIZE_M": 8,
         "num_warps": m_config.num_warps,
         "num_stages": m_config.num_stages,
+    }
+
+
+def _get_bmm_config(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    default: dict[str, int],
+) -> dict[str, int]:
+    if not _TUNED_MATMUL_CONFIGS_RESOLVED:
+        resolve_tuned_matmul_configs()
+    if (
+        dtype != torch.bfloat16
+        or (B, M, K, N) != (8, 1, 4096, 1024)
+        or _TUNED_MATMUL_ARCH_FAMILY != "ampere"
+    ):
+        return default
+    return {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "num_stages": 4,
+        "num_warps": 8,
     }

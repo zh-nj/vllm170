@@ -90,6 +90,11 @@ PORT_EXTRA_ARGS=${PORT_EXTRA_ARGS:-}
 # once the whole budget is reserved, so this doubles as the lever for the
 # documented startup OOM flake.
 PORT_GPU_UTIL=${PORT_GPU_UTIL:-0.98}
+# Bounded decoder SWA replay (dsv41_fast_prefill): the layers from the tail
+# boundary on compute only the last min(chunk, window) rows of each prefill
+# chunk, plus every decode row. On by default for this PP5 launcher; set
+# PORT_FAST_PREFILL=0 for the unbounded prefill path.
+PORT_FAST_PREFILL=${PORT_FAST_PREFILL:-1}
 # Draft execution. 0 captures the rank-local draft step into FULL CUDA graphs:
 # each of the three stage ranks captures its share of the draft blocks, the head
 # rank captures the draft-state collapse plus the sequential Markov head. Only
@@ -104,14 +109,9 @@ else
     dspark_eager=true
 fi
 
-# Prefix caching. This launcher used to hard-code --no-enable-prefix-caching,
-# which does not merely skip reuse: it turns block hashing off altogether, so
-# vllm:prefix_cache_queries_total stays 0 and a repeated prompt can never hit.
-# Nothing here needs it off (CED, which does, is not used by this launcher),
-# and the SM80 sparse-SWA backend plus the cross-rank KV replicas both write
-# through the ordinary slot_mapping, so a hit reuses the same blocks on every
-# rank. 0 restores the old behavior for A/B measurement.
-PORT_PREFIX_CACHING=${PORT_PREFIX_CACHING:-1}
+# Prefix caching defaults off independently of fast prefill. Set
+# PORT_PREFIX_CACHING=1 to enable it; fast prefill may remain enabled.
+PORT_PREFIX_CACHING=${PORT_PREFIX_CACHING:-0}
 pc_args=(--enable-prefix-caching)
 if [[ "${PORT_PREFIX_CACHING}" == "0" ]]; then
     pc_args=(--no-enable-prefix-caching)
@@ -184,8 +184,39 @@ if [[ "${PORT_MM_IMAGES}" != "0" ]]; then
 fi
 
 # PORT_EXTRA_ARGS carries a flag list (the documented way to pass
-# --additional-config here), so it has to word-split.
-# shellcheck disable=SC2086
+# --additional-config here), so split it into the argv array used below.
+read -r -a extra_args <<< "${PORT_EXTRA_ARGS}"
+
+# Merge the fast-prefill switch into the caller's additional config rather than
+# replacing it, because the documented invocation also carries marlin_full_k
+# and the strict-kernel switches.
+if [[ "${PORT_FAST_PREFILL}" == "1" ]]; then
+    merged_extra_args=$("${REPO_ROOT}/.venv/bin/python" - "${extra_args[@]}" <<'PY'
+import json
+import sys
+
+words = sys.argv[1:]
+kept = []
+config = {}
+index = 0
+while index < len(words):
+    word = words[index]
+    if word == "--additional-config":
+        index += 1
+        config = json.loads(words[index])
+    elif word.startswith("--additional-config="):
+        config = json.loads(word.split("=", 1)[1])
+    else:
+        kept.append(word)
+    index += 1
+config["dsv41_fast_prefill"] = True
+kept += ["--additional-config", json.dumps(config, separators=(",", ":"))]
+print(" ".join(kept))
+PY
+)
+    read -r -a extra_args <<< "${merged_extra_args}"
+fi
+
 exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --served-model-name dsv41f-port \
     --host 0.0.0.0 \
@@ -212,5 +243,5 @@ exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --reasoning-parser deepseek_v41 \
     --enable-auto-tool-choice \
     --tool-call-parser deepseek_v41 \
-    ${PORT_EXTRA_ARGS} \
+    "${extra_args[@]}" \
     "$@"

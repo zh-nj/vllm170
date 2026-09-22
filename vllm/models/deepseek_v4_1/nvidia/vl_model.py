@@ -325,6 +325,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
             ced_step=kwargs.get("ced_step"),
+            fast_prefill_step=kwargs.get("fast_prefill_step"),
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

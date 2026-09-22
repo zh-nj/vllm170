@@ -1728,6 +1728,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # graph state on the following decode step.
             skip_compiled = True
 
+        if (
+            self.model_state is not None
+            and getattr(self.model_state, "requires_eager_prefill", False)
+            and batch_req_state is not None
+            and bool(np.any(batch_req_state.is_prefilling_np))
+        ):
+            # Bounded prefill changes the batch's row count and swaps attention
+            # metadata mid-forward; neither survives a captured graph.
+            skip_compiled = True
+
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,

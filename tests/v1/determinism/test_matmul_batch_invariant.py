@@ -15,6 +15,7 @@ import torch
 from utils import skip_if_not_cuda, skip_unsupported
 
 from vllm.model_executor.determinism.batch_invariant import (
+    bmm_batch_invariant,
     matmul_batch_invariant,
     matmul_persistent,
 )
@@ -140,6 +141,24 @@ def test_matmul_batch_invariance_across_tuned_m_buckets(m, transpose_b):
     batch_output = matmul_batch_invariant(a, b)
 
     assert torch.equal(single_output[0], batch_output[0])
+
+
+@skip_if_not_cuda
+def test_bmm_batch_invariance_across_tuned_m1_bucket():
+    capability = current_platform.get_device_capability()
+    if _get_tuned_matmul_arch_family(capability) != "ampere":
+        pytest.skip("The M=1 BMM config is tuned for SM80")
+
+    device = torch.device(DEVICE_TYPE)
+    batch, m, k, n = 8, 8, 4096, 1024
+    torch.manual_seed(42)
+    a = torch.rand((batch, m, k), dtype=torch.bfloat16, device=device)
+    b = torch.rand((batch, k, n), dtype=torch.bfloat16, device=device)
+
+    single_output = bmm_batch_invariant(a[:, :1], b)
+    batch_output = bmm_batch_invariant(a, b)
+
+    assert torch.equal(single_output[:, 0], batch_output[:, 0])
 
 
 # An `out_dtype=` GEMM is how the LM head projects logits and how the DeepSeek

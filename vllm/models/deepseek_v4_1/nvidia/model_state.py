@@ -8,7 +8,13 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
-from vllm.models.deepseek_v4_1.ced import CEDMetadata, ced_prefill_enabled
+from vllm.models.deepseek_v4_1.ced import CEDMetadata, CEDStep, ced_prefill_enabled
+from vllm.models.deepseek_v4_1.fast_prefill import (
+    FastPrefillMetadata,
+    FastPrefillStep,
+    fast_prefill_enabled,
+    tail_layer,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -16,6 +22,10 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
+
+# Modalities whose prompt spans carry their own position grid; a bounded tail
+# would have to keep every row of them.
+_BOUNDED_UNSUPPORTED_MODALITIES = frozenset(("image", "video"))
 
 
 @triton.jit
@@ -59,6 +69,12 @@ class DeepseekV41ModelState(DefaultModelState):
     hidden states and replays the decoder layers on it once per request; the
     replay metadata is built here, before the forward, and handed to the
     model through ``model_inputs["ced_step"]``.
+
+    Fast prefill (``fast_prefill.py``) bounds the same tail differently: the
+    layers at or after ``tail_layer`` compute only the last
+    ``min(chunk, sliding_window)`` rows of each prefill chunk, with the bounded
+    attention metadata built here and handed to the model with
+    ``model_inputs["fast_prefill_step"]``.
     """
 
     def __init__(
@@ -69,14 +85,32 @@ class DeepseekV41ModelState(DefaultModelState):
         device: torch.device,
     ):
         super().__init__(vllm_config, model, encoder_cache, device)
-        self.requires_eager_prefill = ced_prefill_enabled(vllm_config)
-        self.ced_metadata = (
+        self.fast_prefill_enabled = fast_prefill_enabled(vllm_config)
+        # Keep the two prefill transforms independent.  Fast prefill needs an
+        # eager model call, but it must not create or prepare the legacy CED
+        # suffix/replay state (the two transforms are mutually exclusive).
+        self.ced_prefill_enabled = ced_prefill_enabled(vllm_config)
+        self.requires_eager_prefill = (
+            self.ced_prefill_enabled or self.fast_prefill_enabled
+        )
+        self.ced_metadata: CEDMetadata | None = (
             CEDMetadata(vllm_config, device)
-            if self.requires_eager_prefill and get_pp_group().is_last_rank
+            if self.ced_prefill_enabled and get_pp_group().is_last_rank
             else None
         )
-        self.ced_step = None
+        self.fast_prefill_metadata: FastPrefillMetadata | None = (
+            FastPrefillMetadata(
+                vllm_config,
+                device,
+                tail_layer(vllm_config.model_config.hf_config),
+            )
+            if self.fast_prefill_enabled
+            else None
+        )
+        self.ced_step: CEDStep | None = None
+        self.fast_prefill_step: FastPrefillStep | None = None
         self.ced_disabled_requests: set[str] = set()
+        self.fast_prefill_disabled_requests: set[str] = set()
         depth = model.token_lookback_depth
         self.lookback_token_ids: torch.Tensor | None = None
         if depth > 0:
@@ -89,8 +123,10 @@ class DeepseekV41ModelState(DefaultModelState):
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
-        if self.requires_eager_prefill:
+        if self.ced_prefill_enabled:
             model_inputs["ced_step"] = self.ced_step
+        if self.fast_prefill_enabled:
+            model_inputs["fast_prefill_step"] = self.fast_prefill_step
         window = self.lookback_token_ids
         if window is None:
             return model_inputs
@@ -110,16 +146,31 @@ class DeepseekV41ModelState(DefaultModelState):
         return model_inputs
 
     def add_request(self, req_index, new_req_data):
-        if self.requires_eager_prefill:
-            params = new_req_data.sampling_params
-            if params is not None and params.prompt_logprobs is not None:
+        ced_enabled = getattr(
+            self, "ced_prefill_enabled", getattr(self, "ced_metadata", None) is not None
+        )
+        fast_enabled = getattr(self, "fast_prefill_enabled", False)
+        params = new_req_data.sampling_params
+        if params is not None and params.prompt_logprobs is not None:
+            if ced_enabled:
+                # Prompt logprobs (including 0) read every prompt row, so the
+                # chunk cannot be bounded on any rank.
                 self.ced_disabled_requests.add(new_req_data.req_id)
+            if fast_enabled:
+                self.fast_prefill_disabled_requests.add(new_req_data.req_id)
+        if fast_enabled and any(
+            feature.modality in _BOUNDED_UNSUPPORTED_MODALITIES
+            for feature in getattr(new_req_data, "mm_features", None) or ()
+        ):
+            self.fast_prefill_disabled_requests.add(new_req_data.req_id)
         return super().add_request(req_index, new_req_data)
 
     def remove_request(self, req_id):
         self.ced_disabled_requests.discard(req_id)
-        if self.ced_metadata is not None:
-            self.ced_metadata.remove_request(req_id)
+        getattr(self, "fast_prefill_disabled_requests", set()).discard(req_id)
+        ced_metadata = getattr(self, "ced_metadata", None)
+        if ced_metadata is not None:
+            ced_metadata.remove_request(req_id)
         model = getattr(self, "model", None)
         if model is not None:
             for module in model.modules():
@@ -148,8 +199,16 @@ class DeepseekV41ModelState(DefaultModelState):
             for_capture,
         )
         self.ced_step = None
-        if self.ced_metadata is not None and not all(
-            req_id in self.ced_disabled_requests for req_id in input_batch.req_ids
+        if (
+            getattr(
+                self,
+                "ced_prefill_enabled",
+                getattr(self, "ced_metadata", None) is not None,
+            )
+            and self.ced_metadata is not None
+            and not all(
+                req_id in self.ced_disabled_requests for req_id in input_batch.req_ids
+            )
         ):
             self.ced_step = self.ced_metadata.prepare(
                 input_batch,
@@ -158,6 +217,25 @@ class DeepseekV41ModelState(DefaultModelState):
                 attn_groups,
                 kv_cache_config,
                 disabled_requests=self.ced_disabled_requests,
+            )
+        self.fast_prefill_step = None
+        fast_prefill_metadata = getattr(self, "fast_prefill_metadata", None)
+        if (
+            fast_prefill_metadata is not None
+            and not any(
+                req_id in self.fast_prefill_disabled_requests
+                for req_id in input_batch.req_ids
+            )
+            and getattr(input_batch, "num_draft_tokens", 0) == 0
+        ):
+            # A verification batch computes every candidate position, so it
+            # keeps the full chunk.
+            self.fast_prefill_step = fast_prefill_metadata.prepare(
+                input_batch,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
             )
         return metadata
 

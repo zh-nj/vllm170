@@ -43,6 +43,12 @@ def _combine_kernel(
     else:
         topk_len = 0
     swa_len = tl.minimum(tl.maximum(position + 1, 0), WINDOW_SIZE)
+    # The gather block holds only the request's last `gather_len` rows, so the
+    # local window cannot start before it: columns the block does not cover are
+    # masked instead of addressed. Unbounded prefill gathers the whole chunk
+    # plus the window in front of it, which makes this a no-op.
+    block_rows = query - query_start + gather_len - (query_end - query_start) + 1
+    swa_len = tl.minimum(swa_len, block_rows)
     columns = tl.arange(0, BLOCK_COLS)
     topk = tl.load(
         topk_ptr + token.to(tl.int64) * topk_stride + columns,

@@ -9,6 +9,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.determinism.batch_invariant_configs import (
+    _get_bmm_config,
     _get_matmul_config,
     resolve_tuned_matmul_configs,
 )
@@ -703,7 +704,7 @@ def bmm_batch_invariant(a, b, *, out=None):
         },
     }
 
-    cfg = configs[dtype]
+    cfg = _get_bmm_config(B, M, N, K, dtype, configs[dtype])
     # grid = (B, num_tiles_per_matrix)
     grid = (
         B,

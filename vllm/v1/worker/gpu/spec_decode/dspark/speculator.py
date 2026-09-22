@@ -34,6 +34,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.phase_profile import (
+    phase_profile_enabled,
     phase_profile_stage,
     profile_parallel_draft_step,
 )
@@ -53,6 +54,63 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
+
+
+def _relay_profile_extra(
+    package: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Describe one DSpark relay package when the opt-in profile is active."""
+    if not phase_profile_enabled("dspark"):
+        return None
+
+    tensor_keys: list[str] = []
+    non_tensor_keys: list[str] = []
+    tensor_bytes = 0
+    bytes_by_dtype: dict[str, int] = {}
+    for key, value in package.items():
+        if not isinstance(value, torch.Tensor):
+            non_tensor_keys.append(key)
+            continue
+        tensor_keys.append(key)
+        size = value.numel() * value.element_size()
+        tensor_bytes += size
+        dtype_name = str(value.dtype)
+        bytes_by_dtype[dtype_name] = bytes_by_dtype.get(dtype_name, 0) + size
+    return {
+        "tensor_count": len(tensor_keys),
+        "tensor_bytes": tensor_bytes,
+        "tensor_bytes_by_dtype": bytes_by_dtype,
+        "tensor_keys": tensor_keys,
+        "non_tensor_count": len(non_tensor_keys),
+        "non_tensor_keys": non_tensor_keys,
+    }
+
+
+def _send_relay_package(
+    group: Any,
+    package: dict[str, Any],
+    *,
+    dst: int,
+    ref: torch.Tensor,
+    stage: str,
+) -> None:
+    """Split a profiled relay send into launch and handle-wait phases."""
+    if not phase_profile_enabled("dspark"):
+        group.send_tensor_dict(package, dst=dst)
+        return
+
+    with phase_profile_stage(f"{stage}.launch", ref, level="detail"):
+        handles = group.isend_tensor_dict(package, dst=dst)
+    if handles:
+        with phase_profile_stage(f"{stage}.metadata_wait", ref, level="detail"):
+            handles[0].wait()
+        with phase_profile_stage(f"{stage}.tensor_wait", ref, level="detail"):
+            for handle in handles[1:]:
+                handle.wait()
+
+    pending = getattr(group, "_pending_isends", None)
+    if pending and pending[-1][0] is handles:
+        pending.pop()
 
 
 class _DSparkStageStaging:
@@ -178,6 +236,16 @@ class DSparkSpeculator(DFlashSpeculator):
 
         self.distributed = self.speculative_config.use_distributed_dspark()
         self._distributed_step_id = -1
+        self._compact_v41_relay = False
+        if (
+            getattr(vllm_config.model_config.hf_config, "model_type", None)
+            == "deepseek_v41"
+        ):
+            from vllm.models.deepseek_v4_1.dspark_relay import compact_relay_enabled
+
+            self._compact_v41_relay = compact_relay_enabled(vllm_config)
+        if self._compact_v41_relay:
+            logger.info("DSV41F DSpark compact relay enabled for pure decode steps.")
         if self.distributed:
             self._pp_group = get_pp_group()
             stage_ranks = self.speculative_config.dspark_pipeline_stage_ranks
@@ -455,6 +523,7 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         """The rank-local draft blocks, with the relayed state read from staging."""
         staging = self.staging
+        assert staging is not None
         if self._stage_index == 0:
             # The first stage embeds its own query block from the static input
             # buffer, so only its outputs need staging.
@@ -506,6 +575,7 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         """The head rank's step: collapse the draft state, then Markov sampling."""
         staging = self.staging
+        assert staging is not None
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -673,8 +743,12 @@ class DSparkSpeculator(DFlashSpeculator):
             # those runs stay on the eager path. The whole rank-local draft step
             # is otherwise one graph; only the relayed state has to move in and
             # out of it.
+            staging = self.staging
+            manager = self.query_cudagraph_manager
+            assert staging is not None
+            assert manager is not None
             if self._stage_index != 0:
-                self.staging.copy_in(
+                staging.copy_in(
                     num_query_tokens,
                     hidden=package["hidden_states"],
                     residual=package["residual"],
@@ -686,12 +760,12 @@ class DSparkSpeculator(DFlashSpeculator):
             with phase_profile_stage(
                 "draft.stage.forward", input_batch.input_ids, level="stage"
             ):
-                self.query_cudagraph_manager.run_fullgraph(batch_desc)
-            hidden_states = self.staging.out("hidden", num_query_tokens)
-            residual = self.staging.out("residual", num_query_tokens)
-            post_mix = self.staging.out("post_mix", num_query_tokens)
-            res_mix = self.staging.out("res_mix", num_query_tokens)
-            pre_mix = self.staging.out("pre_mix", num_query_tokens)
+                manager.run_fullgraph(batch_desc)
+            hidden_states = staging.out("hidden", num_query_tokens)
+            residual = staging.out("residual", num_query_tokens)
+            post_mix = staging.out("post_mix", num_query_tokens)
+            res_mix = staging.out("res_mix", num_query_tokens)
+            pre_mix = staging.out("pre_mix", num_query_tokens)
         else:
             if self._stage_index == 0:
                 hidden_states = self.model.prepare_pipeline_query(
@@ -732,18 +806,31 @@ class DSparkSpeculator(DFlashSpeculator):
             post_mix=post_mix,
             res_mix=res_mix,
             pre_mix=pre_mix,
-            query_input_ids=self.input_buffers.input_ids[:num_query_tokens],
-            sample_indices=self.sample_indices[
-                : input_batch.num_reqs * self.num_speculative_steps
-            ],
-            sample_pos=self.sample_pos[
-                : input_batch.num_reqs * self.num_speculative_steps
-            ],
-            sample_idx_mapping=self.sample_idx_mapping[
-                : input_batch.num_reqs * self.num_speculative_steps
-            ],
         )
         is_last_stage = self._stage_index == len(self._stage_ranks) - 1
+        if (
+            self._compact_v41_relay
+            and not is_last_stage
+            and not input_batch.has_prefill
+            and not package["dummy_run"]
+        ):
+            # Only the head consumes these locally rebuilt buffers. Avoid
+            # constructing unused views and discard any inbound copies.
+            for key in (
+                "query_input_ids",
+                "sample_indices",
+                "sample_pos",
+                "sample_idx_mapping",
+            ):
+                package.pop(key, None)
+        else:
+            num_sample = input_batch.num_reqs * self.num_speculative_steps
+            package.update(
+                query_input_ids=self.input_buffers.input_ids[:num_query_tokens],
+                sample_indices=self.sample_indices[:num_sample],
+                sample_pos=self.sample_pos[:num_sample],
+                sample_idx_mapping=self.sample_idx_mapping[:num_sample],
+            )
         if is_last_stage:
             for key in (
                 "context_main_x",
@@ -761,9 +848,18 @@ class DSparkSpeculator(DFlashSpeculator):
             else self._stage_ranks[self._stage_index + 1]
         )
         with phase_profile_stage(
-            "draft.stage.send", self.input_buffers.input_ids, level="stage"
+            "draft.stage.send",
+            self.input_buffers.input_ids,
+            level="stage",
+            extra=_relay_profile_extra(package),
         ):
-            self._pp_group.send_tensor_dict(package, dst=dst)
+            _send_relay_package(
+                self._pp_group,
+                package,
+                dst=dst,
+                ref=self.input_buffers.input_ids,
+                stage="draft.stage.send",
+            )
 
     def _publish_ced_draft_context(self, input_batch: Any) -> None:
         """Write the CED-replayed suffix into the draft KV cache before proposing.
@@ -782,17 +878,13 @@ class DSparkSpeculator(DFlashSpeculator):
         request_ids = context.request_ids or (context.request_id,)
         if not set(request_ids).issubset(input_batch.req_ids):
             raise ValueError("CED draft context belongs to another request")
-        states = self.model.combine_hidden_states(
-            torch.cat(context.auxiliary, dim=-1)
-        )
+        states = self.model.combine_hidden_states(torch.cat(context.auxiliary, dim=-1))
         assert self._layer_group_idx is not None
         slots = [
             context.slots[self.draft_kv_cache_group_ids[index]]
             for index in self._layer_group_idx
         ]
-        self.model.precompute_and_store_context_kv(
-            states, context.positions, slots
-        )
+        self.model.precompute_and_store_context_kv(states, context.positions, slots)
 
     @torch.inference_mode()
     def propose(
@@ -897,9 +989,18 @@ class DSparkSpeculator(DFlashSpeculator):
             "seeds": seeds,
         }
         with phase_profile_stage(
-            "draft.head.send", input_batch.input_ids, level="stage"
+            "draft.head.send",
+            input_batch.input_ids,
+            level="stage",
+            extra=_relay_profile_extra(package),
         ):
-            self._pp_group.send_tensor_dict(package, dst=self._stage_ranks[0])
+            _send_relay_package(
+                self._pp_group,
+                package,
+                dst=self._stage_ranks[0],
+                ref=input_batch.input_ids,
+                stage="draft.head.send",
+            )
         with phase_profile_stage(
             "draft.head.recv_wait", input_batch.input_ids, level="stage"
         ):
@@ -928,10 +1029,13 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self._prepare_eplb_forward(num_query_tokens)
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.query_cudagraph_manager is not None
+            manager = self.query_cudagraph_manager
+            staging = self.staging
+            assert manager is not None
+            assert staging is not None
             # One graph covers both the collapse of the draft state and the
             # sequential Markov head; only the relayed state moves in and out.
-            self.staging.copy_in(
+            staging.copy_in(
                 num_query_tokens,
                 hidden=result["hidden_states"],
                 residual=result["residual"],
@@ -943,7 +1047,7 @@ class DSparkSpeculator(DFlashSpeculator):
             with phase_profile_stage(
                 "draft.markov_total", input_batch.input_ids, level="stage"
             ):
-                self.query_cudagraph_manager.run_fullgraph(batch_desc)
+                manager.run_fullgraph(batch_desc)
         else:
             with phase_profile_stage(
                 "draft.head.finish", input_batch.input_ids, level="stage"

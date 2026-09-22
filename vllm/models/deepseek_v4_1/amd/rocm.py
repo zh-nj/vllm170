@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -43,6 +44,54 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+_SHAPE_PROBE_TRIGGER = "/tmp/dsv41_fastprefill_shapes_on"
+_SHAPE_PROBE_BASE = "/tmp/dsv41_fastprefill_shapes"
+
+
+def _shape_probe(prefix, q, positions, swa_metadata, attn_metadata, compress_ratio):
+    """Dump the bounded prefill's row bookkeeping, then synchronize.
+
+    Temporary diagnostic for the switch-on CUDA fault: the reported site is a
+    one-element division, so the error is sticky and belongs to an earlier
+    launch. Writing the shapes first shows whether metadata and activations
+    disagree, and the synchronize attributes any pending fault to whatever ran
+    before this point instead of to the division after it.
+    """
+    if not os.path.exists(_SHAPE_PROBE_TRIGGER):
+        return
+    rank = torch.accelerator.current_device_index()
+    fields = [
+        prefix,
+        f"q={q.shape[0]}",
+        f"pos={positions.numel()}",
+        f"ndec={swa_metadata.num_decodes}",
+        f"ndec_tok={swa_metadata.num_decode_tokens}",
+        f"npref={swa_metadata.num_prefills}",
+        f"npref_tok={swa_metadata.num_prefill_tokens}",
+    ]
+    lengths = swa_metadata.prefill_gather_lens
+    if lengths is not None:
+        fields.append(f"gather_len={lengths.numel()}:{int(lengths.max().item())}")
+    seq = swa_metadata.prefill_seq_lens
+    if seq is not None:
+        fields.append(f"seq={seq.numel()}:{int(seq.max().item())}")
+    slots = swa_metadata.slot_mapping
+    if slots is not None:
+        fields.append(f"slots={slots.numel()}")
+    if attn_metadata is not None:
+        prefill_tokens = getattr(
+            attn_metadata,
+            "num_prefill_tokens",
+            getattr(attn_metadata, "num_actual_tokens", -1),
+        )
+        fields.append(f"mpref_tok={prefill_tokens}")
+        fields.append(f"mmax_seq={getattr(attn_metadata, 'max_seq_len', -1)}")
+        fields.append(f"ratio={compress_ratio}")
+    with open(f"{_SHAPE_PROBE_BASE}.rank{rank}.tsv", "a") as handle:
+        handle.write("\t".join(str(value) for value in fields) + "\n")
+    torch.accelerator.synchronize()
 
 
 def _trust_dsv4_extra_cache_nan_free(
@@ -828,6 +877,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
     ) -> None:
         swa_only = attn_metadata is None
+        _shape_probe(
+            self.prefix, q, positions, swa_metadata, attn_metadata, self.compress_ratio
+        )
 
         num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens

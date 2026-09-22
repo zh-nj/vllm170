@@ -79,6 +79,10 @@ from vllm.models.deepseek_v4_1.common.ops import indexer_k_norm_rope_store
 from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import (
     rope_quant_insert,
 )
+from vllm.models.deepseek_v4_1.fast_prefill import (
+    FastPrefillStep,
+    record_layer_rows,
+)
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -1044,6 +1048,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
         ced_step: CEDStep | None = None,
+        fast_prefill_step: FastPrefillStep | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1118,6 +1123,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
 
         full_num_tokens = positions.shape[0]
+        # The tail may temporarily replace `positions` with its compact row
+        # list. PP cache state still has the original batch width and must be
+        # exported with the same positions as the hidden-state message.
+        full_positions = positions
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -1142,38 +1151,106 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
         row_probe.bind(None if _ROW_DUMP is None else _ROW_DUMP.capture)
         row_dump = _ROW_DUMP
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if idx == 20 and ced_step is not None:
-                assert self.ced_prefill is not None
-                return self.ced_prefill.forward(
-                    self, ced_step, hidden_states, residual, post_mix, res_mix, pre_mix
+        # The bounded tail collapses the batch to the plan's rows at the tail
+        # boundary: the metadata becomes the merged bounded dict, positions and
+        # input_ids follow, and the mHC states are gathered to match. The swap
+        # is undone in ``finally`` so a failure inside the bounded layers
+        # cannot leak it.
+        step_context = None
+        original_attn_metadata = None
+        step_applied = False
+        buffer_swap = None
+        rank_in_group = get_pp_group().rank_in_group
+        bounded_tail = (
+            fast_prefill_step.tail_layer if fast_prefill_step is not None else -1
+        )
+        try:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                if idx == 20 and ced_step is not None:
+                    assert self.ced_prefill is not None
+                    return self.ced_prefill.forward(
+                        self,
+                        ced_step,
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        pre_mix,
+                    )
+                if (
+                    fast_prefill_step is not None
+                    and not step_applied
+                    and idx >= fast_prefill_step.tail_layer
+                ):
+                    step_context = get_forward_context()
+                    if step_context is None:
+                        raise RuntimeError("dsv41_fast_prefill needs a forward context")
+                    step_metadata = step_context.attn_metadata
+                    if not isinstance(step_metadata, dict):
+                        raise ValueError(
+                            "dsv41_fast_prefill needs dict attention metadata"
+                        )
+                    original_attn_metadata = step_metadata
+                    step_context.attn_metadata = {
+                        **step_metadata,
+                        **fast_prefill_step.metadata,
+                    }
+                    hidden_states = fast_prefill_step.gather(hidden_states)
+                    if residual is not None:
+                        residual = fast_prefill_step.gather(residual)
+                    if post_mix is not None:
+                        post_mix = fast_prefill_step.gather(post_mix)
+                    if res_mix is not None:
+                        res_mix = fast_prefill_step.gather(res_mix)
+                    if pre_mix is not None:
+                        pre_mix = fast_prefill_step.gather(pre_mix)
+                    positions = fast_prefill_step.positions
+                    input_ids = fast_prefill_step.input_ids
+                    # Every engram layer sits below the tail boundary.
+                    engram_hashes = None
+                    engram_mask = None
+                    # The tail reads top-k and candidate rows by prefill-region
+                    # row, so those buffers are gathered at the same boundary.
+                    buffer_swap = fast_prefill_step.bind_tail_buffers(self)
+                    step_applied = True
+                hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    engram_hashes,
+                    engram_mask,
                 )
-            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-                engram_hashes,
-                engram_mask,
-            )
-            if row_dump is not None:
-                row_dump.capture(idx, hidden_states, positions)
-            if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                if row_dump is not None:
+                    row_dump.capture(idx, hidden_states, positions)
+                # Per-layer row counts are the port's central claim: no other
+                # surface reports how many rows a layer actually ran.
+                record_layer_rows(
+                    rank_in_group, idx, hidden_states.shape[0], bounded_tail
                 )
-                aux_hidden_state = aux_recon.mean(dim=1)
-                if self.use_sequence_parallel:
-                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
-                aux_hidden_states.append(aux_hidden_state)
-                final_aux_recon = aux_recon
+                if idx + 1 in self.aux_hidden_state_layers:
+                    # Reconstruct the aux hidden state for draft models
+                    aux_recon = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = aux_recon.mean(dim=1)
+                    if self.use_sequence_parallel:
+                        aux_hidden_state = sp_all_gather(aux_hidden_state)[
+                            :full_num_tokens
+                        ]
+                    aux_hidden_states.append(aux_hidden_state)
+                    final_aux_recon = aux_recon
+        finally:
+            if original_attn_metadata is not None and step_context is not None:
+                step_context.attn_metadata = original_attn_metadata
+            if buffer_swap is not None:
+                buffer_swap.restore()
         if row_dump is not None:
             row_dump.flush()
         _ROW_DUMP = None
@@ -1187,6 +1264,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, residual, post_mix, res_mix
                 )
 
+        if step_applied:
+            assert fast_prefill_step is not None
+            # Back to the unbounded width, before the PP message, the MTP
+            # buffer and the collapse read these: the rows the bounded tail
+            # never computed stay zero and are never read (the sampler's logits
+            # indices and the drafter are bounded on this rank).
+            hidden_states = fast_prefill_step.scatter(hidden_states, full_num_tokens)
+            if pre_mix is not None:
+                pre_mix = fast_prefill_step.scatter(pre_mix, full_num_tokens)
+            aux_hidden_states = [
+                fast_prefill_step.scatter(value, full_num_tokens)
+                for value in aux_hidden_states
+            ]
+
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             if self.pp_shared_kv is not None:
@@ -1195,7 +1286,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         full_num_tokens, self.topk_indices_buffer
                     )
                 )
-            self._append_pp_attention_state(tensors, positions, intermediate_tensors)
+            self._append_pp_attention_state(
+                tensors, full_positions, intermediate_tensors
+            )
             return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
@@ -1622,6 +1715,7 @@ class DeepseekV41LLMForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
         ced_step: CEDStep | None = None,
+        fast_prefill_step: FastPrefillStep | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1630,6 +1724,7 @@ class DeepseekV41LLMForCausalLM(
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
             ced_step=ced_step,
+            fast_prefill_step=fast_prefill_step,
         )
         return hidden_states
 

@@ -15,7 +15,8 @@ It was off, and off in the strong sense: the launcher hard-coded
 hashing off altogether. `vllm:prefix_cache_queries_total` sat at exactly 0, so no
 prompt could ever hit, no matter how often it was sent.
 
-It is now on by default (`PORT_PREFIX_CACHING=1`), and it works end to end: exact
+It is available as an explicit mode (`PORT_PREFIX_CACHING=1`) and works end to
+end alongside the independently configured fast-prefill mode: exact
 block-aligned hits, ~2x lower TTFT on a repeated 1.5-2.5K prompt, ~11x on a repeated
 32K prompt, 59-69% engine hit rate in normal serving, byte-identical reference text
 against the caching-off server, and working multimodal reuse. Decode throughput is
@@ -91,7 +92,8 @@ VLLM_DSV41_PREFILL_WORKSPACE_TOKENS=32768 \
   benchmarks/deepseek_v4_1/start_pp5_patient.sh <log> ...
 ```
 
-`PORT_PREFIX_CACHING` defaults to 1; `0` restores the old behaviour for A/B runs.
+`PORT_PREFIX_CACHING` defaults to 0 independently of fast prefill. Enable it
+explicitly with `PORT_PREFIX_CACHING=1`; fast prefill may remain enabled.
 Nothing else changed, and the KV capacity is identical either way (499,062 tokens,
 same `kv-cache-memory-bytes`, same graph capture list) -- so a comparison isolates the
 flag.
