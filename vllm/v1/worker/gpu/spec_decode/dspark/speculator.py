@@ -237,15 +237,24 @@ class DSparkSpeculator(DFlashSpeculator):
         self.distributed = self.speculative_config.use_distributed_dspark()
         self._distributed_step_id = -1
         self._compact_v41_relay = False
+        self._prepare_ahead = False
         if (
             getattr(vllm_config.model_config.hf_config, "model_type", None)
             == "deepseek_v41"
         ):
-            from vllm.models.deepseek_v4_1.dspark_relay import compact_relay_enabled
+            from vllm.models.deepseek_v4_1.dspark_relay import (
+                compact_relay_enabled,
+                prepare_ahead_enabled,
+            )
 
             self._compact_v41_relay = compact_relay_enabled(vllm_config)
+            self._prepare_ahead = prepare_ahead_enabled(vllm_config)
         if self._compact_v41_relay:
             logger.info("DSV41F DSpark compact relay enabled for pure decode steps.")
+        if self._prepare_ahead:
+            logger.info(
+                "DSV41F DSpark prepare-ahead relay enabled for pure decode steps."
+            )
         if self.distributed:
             self._pp_group = get_pp_group()
             stage_ranks = self.speculative_config.dspark_pipeline_stage_ranks
@@ -613,6 +622,40 @@ class DSparkSpeculator(DFlashSpeculator):
         if package["num_reqs"] != input_batch.num_reqs:
             raise RuntimeError("Distributed DSpark request count mismatch.")
 
+    def _uses_prepare_ahead(self, input_batch: Any, dummy_run: bool) -> bool:
+        """Whether this step splits context/control from the layer states.
+
+        Only a pure decode step can: a prefill-carrying batch keeps the single
+        package, and a dummy step must stay on the path its capture uses.
+        """
+        return self._prepare_ahead and not input_batch.has_prefill and not dummy_run
+
+    def _relay_prepare_package(
+        self,
+        package: dict[str, Any],
+        input_batch: Any,
+    ) -> None:
+        """Forward the shared context/control package to the next draft stage.
+
+        Nothing in it depends on this stage's draft output, so passing it on
+        first is what lets the downstream stages prepare in parallel with this
+        stage's query. The last stage has no one to forward to.
+        """
+        assert self._stage_index is not None
+        next_index = self._stage_index + 1
+        if next_index >= len(self._stage_ranks):
+            return
+        with phase_profile_stage(
+            "draft.stage.prepare_send", input_batch.input_ids, level="stage"
+        ):
+            _send_relay_package(
+                self._pp_group,
+                package,
+                dst=self._stage_ranks[next_index],
+                ref=input_batch.input_ids,
+                stage="draft.stage.prepare_send",
+            )
+
     def _prepare_distributed_stage(
         self,
         input_batch: Any,
@@ -720,12 +763,32 @@ class DSparkSpeculator(DFlashSpeculator):
             package = self._pp_group.recv_tensor_dict(src=src)
         assert package is not None
         self._validate_distributed_package(package, input_batch)
+        prepare_ahead = bool(package.get("prepare_ahead"))
+        if prepare_ahead:
+            # The context and sampling controls do not depend on the layer
+            # below, so hand them on before doing any local work: every later
+            # stage then prepares while this one still owes it a state.
+            self._relay_prepare_package(package, input_batch)
         with phase_profile_stage(
             "draft.stage.prepare", package["context_main_x"], level="stage"
         ):
             num_query_tokens, attn_metadata, slot_mappings = (
                 self._prepare_distributed_stage(input_batch, package)
             )
+        if prepare_ahead and self._stage_index != 0:
+            # The first draft stage builds its own query input; every later one
+            # consumes the state this message carries, which was sent after the
+            # prepare package on the same edge.
+            with phase_profile_stage(
+                "draft.stage.state_wait", input_batch.input_ids, level="stage"
+            ):
+                package = self._pp_group.recv_tensor_dict(src=src)
+            assert package is not None
+            if package.get("prepare_ahead"):
+                raise RuntimeError(
+                    "Distributed DSpark state package carries the prepare marker."
+                )
+            self._validate_distributed_package(package, input_batch)
 
         batch_desc, _ = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
@@ -841,7 +904,24 @@ class DSparkSpeculator(DFlashSpeculator):
                 "temperature",
                 "seeds",
             ):
-                package.pop(key)
+                package.pop(key, None)
+        if prepare_ahead:
+            # Under prepare-ahead only the states still depend on the layer
+            # below; the context controls travelled in their own package, so
+            # drop the copies this state package still carries. The marker goes
+            # too: it describes the prepare package, not this one.
+            for key in (
+                "prepare_ahead",
+                "context_main_x",
+                "num_sampled",
+                "num_rejected",
+                "last_sampled",
+                "next_prefill_tokens",
+                "temperature",
+                "seeds",
+                "idx_mapping",
+            ):
+                package.pop(key, None)
         dst = (
             self._head_rank
             if is_last_stage
@@ -973,6 +1053,9 @@ class DSparkSpeculator(DFlashSpeculator):
                 last_hidden_states, aux_hidden_states, num_target_tokens
             )
         self._copy_request_inputs(num_reqs, input_batch.idx_mapping, temperature, seeds)
+        # Pure decode steps may split the relay so the stages prepare in
+        # parallel; prefill-carrying and dummy steps keep the single package.
+        prepare_ahead = self._uses_prepare_ahead(input_batch, dummy_run)
         package: dict[str, Any] = {
             "scheduler_step_id": self._distributed_step_id,
             "dummy_run": dummy_run,
@@ -980,6 +1063,7 @@ class DSparkSpeculator(DFlashSpeculator):
             "num_reqs": num_reqs,
             "idx_mapping": input_batch.idx_mapping[:num_reqs],
             "skip_attn": dummy_run and skip_attn_for_dummy_run,
+            "prepare_ahead": prepare_ahead,
             "context_main_x": context_main_x,
             "num_sampled": num_sampled,
             "num_rejected": num_rejected,

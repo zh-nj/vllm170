@@ -20,7 +20,10 @@ from benchmarks.deepseek_v4_1.dspark_relay_bench import (
 )
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import _split_tensor_dict
-from vllm.models.deepseek_v4_1.dspark_relay import compact_relay_enabled
+from vllm.models.deepseek_v4_1.dspark_relay import (
+    compact_relay_enabled,
+    prepare_ahead_enabled,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark import speculator as module
 
 pytestmark = pytest.mark.cpu_test
@@ -80,6 +83,35 @@ def test_compact_relay_requires_distributed_dspark_tp1():
     config.parallel_config.tensor_parallel_size = 1
     config.speculative_config.use_distributed_dspark = lambda: False
     assert not compact_relay_enabled(config)
+
+
+def _prepare_ahead_config(**kwargs):
+    config = _config(**kwargs)
+    flag = config.additional_config.pop("dsv41_dspark_compact_relay")
+    config.additional_config["dsv41_dspark_prepare_ahead"] = flag
+    return config
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, True),
+        ({"enabled": False}, False),
+        ({"enabled": "true"}, False),
+        ({"target": "deepseek_v4"}, False),
+        ({"draft": "deepseek_v4"}, False),
+        ({"layers": 43}, False),
+    ],
+)
+def test_prepare_ahead_matches_the_compact_relay_gate(kwargs, expected):
+    assert prepare_ahead_enabled(_prepare_ahead_config(**kwargs)) is expected
+
+
+def test_prepare_ahead_and_compact_relay_are_independent_flags():
+    config = _config(enabled=True)
+    assert compact_relay_enabled(config) and not prepare_ahead_enabled(config)
+    config.additional_config["dsv41_dspark_prepare_ahead"] = True
+    assert compact_relay_enabled(config) and prepare_ahead_enabled(config)
     config.speculative_config = None
     assert not compact_relay_enabled(config)
 
@@ -196,6 +228,7 @@ def _relay(
     dummy,
     graph,
     views=None,
+    prepare_ahead=False,
 ):
     count, width = len(req_ids), 5
     rows = count * width
@@ -221,8 +254,13 @@ def _relay(
         temperature=torch.zeros(count),
         seeds=torch.arange(count),
     )
+    if prepare_ahead:
+        package["prepare_ahead"] = True
     controls = {key: package[key] for key in package}
+    head_prepare = dict(package)
+    state: dict[str, Any] = {}
     messages = []
+    events = []
     prepare_signature = inspect.signature(module.prepare_dflash_inputs)
 
     class SampleBuffer:
@@ -319,20 +357,65 @@ def _relay(
             )
         )
 
-        def prepare(batch, package, spec=spec):
+        def prepare(batch, package, spec=spec, stage=stage):
+            events.append(("prepare", stage))
             spec._prepare_stage_inputs(batch, package)
             return rows, None, None
 
         spec._prepare_distributed_stage = prepare
+        inbox = []
+        if prepare_ahead:
+            # Stage 0 receives the head's prepare package; a later stage also
+            # receives the state of the stage below it, in that order.
+            inbox.append(dict(head_prepare))
+            if stage > 0:
+                inbox.append(dict(state))
+        else:
+            inbox.append(package)
+
+        def recv(src, inbox=inbox):
+            assert inbox, "stage received more packages than the chain sent"
+            return inbox.pop(0)
+
+        def send(msg, dst, stage=stage):
+            messages.append(dict(msg))
+            events.append(
+                ("send_prepare" if msg.get("prepare_ahead") else "send_state", stage)
+            )
+
         spec._pp_group = SimpleNamespace(
-            recv_tensor_dict=lambda src, package=package: package,
-            send_tensor_dict=lambda msg, dst: messages.append(dict(msg)),
+            recv_tensor_dict=recv,
+            send_tensor_dict=send,
         )
+        sent_from = len(messages)
         inspect.unwrap(module.DSparkSpeculator.participate_distributed)(spec, batch)
+        if prepare_ahead:
+            sent = messages[sent_from:]
+            forwarded = [msg for msg in sent if msg.get("prepare_ahead")]
+            states = [msg for msg in sent if not msg.get("prepare_ahead")]
+            assert len(states) == 1, "a stage sends exactly one state package"
+            if stage < 2:
+                assert len(forwarded) == 1, "a stage with a successor forwards once"
+                assert sent[0].get("prepare_ahead"), (
+                    "the prepare package must be forwarded before this stage's state"
+                )
+                assert "context_main_x" in forwarded[0]
+                assert "context_main_x" not in states[0], (
+                    "the context controls belong to the prepare package only"
+                )
+                assert events.index(("send_prepare", stage)) < events.index(
+                    ("prepare", stage)
+                ), "the forward must happen before the local prepare"
+            else:
+                assert not forwarded, "the last stage has no successor to forward to"
+            state = dict(states[0])
         package = dict(messages[-1])
         if stage < 2:
+            carrier = forwarded[-1] if prepare_ahead else package
             for key, value in controls.items():
-                assert package[key] is value
+                assert carrier[key] is value, (
+                    "the head's control tensors must reach the next stage unchanged"
+                )
     return messages
 
 
@@ -388,3 +471,68 @@ def test_v41_relay_preserves_head_inputs_and_only_trims_decode(
             assert removed == (
                 SAMPLING_KEYS if not has_prefill and not dummy else set()
             )
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_v41_prepare_ahead_keeps_head_inputs(monkeypatch, compact):
+    """Splitting the relay must not change what the head finally receives.
+
+    The stages forward the head's context package, then report the same states
+    and sampling controls as before, so the head's assembled inputs are equal
+    field by field.
+    """
+    for req_ids in (["r0", "r1"], ["r1", "r2", "r0"]):
+        common = dict(
+            compact=compact,
+            req_ids=req_ids,
+            has_prefill=False,
+            dummy=False,
+            graph=False,
+        )
+        with monkeypatch.context() as patch:
+            baseline = _relay(patch, **common)
+        with monkeypatch.context() as patch:
+            split = _relay(patch, prepare_ahead=True, **common)
+
+        # The head consumes the sampling controls, the layer state and the batch
+        # identity; those must survive the split unchanged.
+        head_inputs = SAMPLING_KEYS | {
+            "hidden_states",
+            "residual",
+            "post_mix",
+            "res_mix",
+            "pre_mix",
+            "scheduler_step_id",
+            "dummy_run",
+            "req_ids",
+            "num_reqs",
+            "skip_attn",
+        }
+        assert head_inputs <= baseline[-1].keys()
+        assert head_inputs <= split[-1].keys()
+        for key in sorted(head_inputs):
+            expected = baseline[-1][key]
+            actual = split[-1][key]
+            if isinstance(expected, torch.Tensor):
+                torch.testing.assert_close(actual, expected)
+            else:
+                assert actual == expected
+        # Only the request-index map leaves the state package: no stage below
+        # the head reads it there.
+        assert "idx_mapping" in baseline[-1] and "idx_mapping" not in split[-1]
+        # Two packages per stage with a successor, one from the last stage.
+        assert len(split) == 5 and len(baseline) == 3
+
+
+def test_v41_prepare_ahead_is_confined_to_pure_decode():
+    """Only a pure decode step may split; prefill and dummy steps stay whole."""
+    spec = module.DSparkSpeculator.__new__(module.DSparkSpeculator)
+    spec._prepare_ahead = True
+    batch = SimpleNamespace(has_prefill=False)
+    assert spec._uses_prepare_ahead(batch, dummy_run=False)
+    assert not spec._uses_prepare_ahead(
+        SimpleNamespace(has_prefill=True), dummy_run=False
+    )
+    assert not spec._uses_prepare_ahead(batch, dummy_run=True)
+    spec._prepare_ahead = False
+    assert not spec._uses_prepare_ahead(batch, dummy_run=False)
