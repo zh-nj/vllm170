@@ -16,6 +16,8 @@ The kernel is imported via
 `torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -141,6 +143,10 @@ def _full_cache_bf16_op_available() -> bool:
 
 def _kv_only_op_available() -> bool:
     return hasattr(torch.ops._C, "deepseek_v4_kv_rope_quant_insert")
+
+
+def _kv_only_full_cache_op_available() -> bool:
+    return hasattr(torch.ops._C, "fused_deepseek_v4_kv_rope_insert")
 
 
 pytestmark = pytest.mark.skipif(
@@ -428,6 +434,229 @@ def test_kv_only_insert_matches_fused_q_kv_path(
     )
 
     torch.testing.assert_close(cache_actual, cache_ref, rtol=0, atol=0)
+
+
+# ── Test 2a-ii: KV-only insert on the full-cache (bf16 / per-tensor fp8) paths ─
+
+
+@pytest.mark.skipif(
+    not _kv_only_full_cache_op_available(),
+    reason="KV-only DeepseekV4 full-cache op not built in",
+)
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_tokens", [1, 4, 17, 2048])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_kv_only_full_cache_insert_matches_dummy_q_path(
+    cache_dtype: torch.dtype, num_tokens: int, block_size: int
+):
+    """The KV-only entry stores what the dummy-Q call stored, byte for byte.
+
+    Context insert has no query, so the two calls may differ only in the work
+    they schedule. Rows without a slot keep their previous contents, and a slot
+    that crosses or reverses block order lands where it did before.
+    """
+    torch.manual_seed(12)
+    device = "cuda"
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    if num_tokens > 1:
+        slot_mapping[num_tokens // 2] = -1
+    if num_tokens > 3:
+        slot_mapping[0] = num_blocks * block_size - 1
+
+    cache_ref = torch.zeros(
+        num_blocks, block_size, HEAD_DIM, dtype=cache_dtype, device=device
+    )
+    cache_actual = torch.zeros_like(cache_ref)
+    dummy_q = torch.zeros(num_tokens, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    fp8_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+    if cache_dtype == torch.bfloat16:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q,
+            kv,
+            cache_ref,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            1e-6,
+            block_size,
+            False,
+        )
+        torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            kv, cache_actual, slot_mapping, positions, cos_sin_cache, block_size
+        )
+    else:
+        dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            dummy_q,
+            kv,
+            dummy_q_fp8,
+            cache_ref,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            fp8_scale,
+            torch.tensor([1.0], dtype=torch.float32, device=device),
+            1e-6,
+            block_size,
+            False,
+        )
+        torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            kv,
+            cache_actual,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            block_size,
+            fp8_scale,
+        )
+
+    # Both sides run the same KV body, so compare the stored bytes, not values
+    # that a dtype-aware comparison could round together.
+    torch.testing.assert_close(
+        cache_actual.view(torch.uint8), cache_ref.view(torch.uint8), rtol=0, atol=0
+    )
+
+
+# ── Test 2a-iii: the unified KV-only entry vs the packed-only op ─────────────
+
+
+@pytest.mark.skipif(
+    not _kv_only_full_cache_op_available() or not _kv_only_op_available(),
+    reason="KV-only DeepseekV4 ops not built in",
+)
+@pytest.mark.parametrize("num_tokens", [1, 17, 2048])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_kv_only_packed_insert_matches_packed_only_op(num_tokens: int, block_size: int):
+    """The unified KV-only entry reproduces the packed-only op byte for byte."""
+    torch.manual_seed(13)
+    device = "cuda"
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    if num_tokens > 4:
+        slot_mapping[1] = -1
+
+    cache_ref = torch.zeros(
+        num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    cache_actual = torch.zeros_like(cache_ref)
+    torch.ops._C.deepseek_v4_kv_rope_quant_insert(
+        kv, cache_ref, slot_mapping, positions, cos_sin_cache, block_size
+    )
+    torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+        kv, cache_actual, slot_mapping, positions, cos_sin_cache, block_size
+    )
+
+    torch.testing.assert_close(cache_actual, cache_ref, rtol=0, atol=0)
+
+
+# ── Test 2a-iv: the V41 context-KV helper picks the right cache layout ───────
+
+
+@pytest.mark.skipif(
+    not _kv_only_full_cache_op_available(),
+    reason="KV-only DeepseekV4 full-cache op not built in",
+)
+@pytest.mark.parametrize(
+    "cache_dtype", [torch.uint8, torch.bfloat16, torch.float8_e4m3fn]
+)
+def test_context_kv_helper_stores_what_the_dummy_q_op_stored(cache_dtype):
+    """The production context-insert helper must match the old dummy-Q call.
+
+    The helper chooses the cache view and, for a per-tensor fp8 cache, which
+    scale to hand the kernel; passing the Q scale instead of the KV scale would
+    corrupt every context row silently, so compare stored bytes against the
+    dummy-Q call with the same inputs.
+    """
+    from vllm.models.deepseek_v4_1.nvidia.dspark import _insert_context_kv
+
+    torch.manual_seed(14)
+    device = "cuda"
+    num_tokens, block_size, num_blocks, n_heads = 6, 16, 3, 64
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device) + 7
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    slot_mapping[-1] = -1
+    dummy_q = torch.zeros(
+        num_tokens, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    # A KV scale far from 1 catches a helper that hands over the Q scale.
+    fp8_kv_scale = torch.tensor([0.5], dtype=torch.float32, device=device)
+    fp8_q_scale_inv = torch.tensor([2.0], dtype=torch.float32, device=device)
+
+    cache_ref = (
+        torch.zeros(
+            num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+        )
+        if cache_dtype == torch.uint8
+        else torch.zeros(
+            num_blocks, block_size, HEAD_DIM, dtype=cache_dtype, device=device
+        )
+    )
+    cache_actual = torch.zeros_like(cache_ref)
+    attn = SimpleNamespace(
+        swa_cache_layer=SimpleNamespace(kv_cache=cache_actual, block_size=block_size),
+        rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin_cache),
+        head_dim=HEAD_DIM,
+        n_local_heads=n_heads,
+        padded_heads=n_heads,
+        eps=1e-6,
+        _flashinfer_fp8_kv_scale=fp8_kv_scale,
+    )
+
+    if cache_dtype == torch.uint8:
+        _call_fused(
+            dummy_q,
+            n_heads,
+            kv,
+            cache_ref,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            1e-6,
+            block_size,
+        )
+    elif cache_dtype == torch.bfloat16:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q,
+            kv,
+            cache_ref,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            1e-6,
+            block_size,
+            False,
+        )
+    else:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            dummy_q,
+            kv,
+            torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn),
+            cache_ref,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            fp8_kv_scale,
+            fp8_q_scale_inv,
+            1e-6,
+            block_size,
+            False,
+        )
+
+    _insert_context_kv(attn, kv, positions, slot_mapping)
+
+    torch.testing.assert_close(
+        cache_actual.view(torch.uint8), cache_ref.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 # ── Test 2b: DP padding (slot_mapping shorter than q/kv) ─────────────────────

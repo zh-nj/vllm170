@@ -229,9 +229,7 @@ class DSparkDeepseekV4Model(nn.Module):
             raise RuntimeError("This rank does not own a distributed DSpark block.")
         if self.use_sequence_parallel:
             raise RuntimeError("Distributed DSpark does not support sequence parallel.")
-        with phase_profile_stage(
-            "draft.stage.forward", hidden_states, level="stage"
-        ):
+        with phase_profile_stage("draft.stage.forward", hidden_states, level="stage"):
             for stage_index in self.local_stage_indices:
                 layer = self.layers[stage_index]
                 assert not isinstance(layer, PPMissingLayer)
@@ -258,8 +256,12 @@ class DSparkDeepseekV4Model(nn.Module):
         """Reconstruct and collapse the final distributed draft state."""
         if not self.is_head_rank:
             raise RuntimeError("Only the DSpark head rank owns the output heads.")
-        with phase_profile_stage("draft.head.reconstruct", hidden_states, level="stage"):
-            hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        with phase_profile_stage(
+            "draft.head.reconstruct", hidden_states, level="stage"
+        ):
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
             return hc_collapse_triton(hidden_states, pre_mix)
 
     def precompute_and_store_context_kv(
@@ -362,63 +364,36 @@ def _insert_context_kv(
 ) -> None:
     """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV.
 
-    Reuses the DSV4 fused insert ops (which also process a query; we pass a dummy
-    query and discard it, since context tokens have no query). Mirrors
+    Context tokens carry no query, so this uses the KV-only entry: it schedules
+    just the KV branch of the fused insert instead of allocating a dummy query
+    and running Q work the caller then discarded. Same cache layouts as
     ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
     """
     swa_cache = attn.swa_cache_layer.kv_cache
     block_size = attn.swa_cache_layer.block_size
-    cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
-    n_ctx = kv.shape[0]
-    dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
-        dtype=kv.dtype,
-        device=kv.device,
-    )
+    fp8_scale = None
     if cache_dtype == torch.uint8:
-        # fp8_ds_mla UE8M0 paged layout
-        swa_2d = swa_cache.view(swa_cache.shape[0], -1)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            dummy_q,
-            kv,
-            swa_2d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn.padded_heads,
-            attn.eps,
-            block_size,
-        )
-    elif cache_dtype == torch.bfloat16:
-        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
-            dummy_q,
-            kv,
-            swa_3d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn.eps,
-            block_size,
-        )
-    else:  # per-tensor fp8 (torch.float8_e4m3fn)
-        # TODO(ben): double-check if this is being dispatched correctly for FI backend
-        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
-        dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
-            dummy_q,
-            kv,
-            dummy_q_fp8,
-            swa_3d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn._flashinfer_fp8_kv_scale,
-            attn._flashinfer_fp8_q_scale_inv,
-            attn.eps,
-            block_size,
-        )
+        # fp8_ds_mla UE8M0 paged layout: one flat byte row per block.
+        k_cache = swa_cache.view(swa_cache.shape[0], -1)
+    else:
+        # Plain-row path: [num_blocks, block_size, 512] in its element dtype.
+        assert cache_dtype in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ), f"unsupported SWA cache dtype for context KV: {cache_dtype}"
+        k_cache = swa_cache.view(-1, block_size, attn.head_dim)
+        if cache_dtype == torch.float8_e4m3fn:
+            fp8_scale = attn._flashinfer_fp8_kv_scale
+    torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        attn.rotary_emb.cos_sin_cache,
+        block_size,
+        fp8_scale,
+    )
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
