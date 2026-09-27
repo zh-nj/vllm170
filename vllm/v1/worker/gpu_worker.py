@@ -435,6 +435,27 @@ class Worker(WorkerBase):
                 current_platform.dist_backend,
             )
 
+            spec_config = self.vllm_config.speculative_config
+            if (
+                spec_config is not None
+                and spec_config.use_distributed_dspark()
+                and getattr(self.model_config.hf_config, "model_type", None)
+                == "deepseek_v41"
+            ):
+                pp_group = get_pp_group()
+                stage_ranks = spec_config.dspark_pipeline_stage_ranks
+                assert stage_ranks is not None
+                relay_ranks = (pp_group.world_size - 1, *stage_ranks)
+                probe = torch.zeros(1, dtype=torch.int32, device=self.device)
+                for src, dst in zip(relay_ranks, (*stage_ranks, relay_ranks[0])):
+                    if pp_group.rank_in_group == src:
+                        pp_group.send_tensor_dict({"probe": probe}, dst=dst)
+                    elif pp_group.rank_in_group == dst:
+                        pp_group.recv_tensor_dict(src=src)
+                    torch.distributed.barrier(group=pp_group.device_group)
+                self.synchronize_device()
+                logger.info("Warmed distributed DSpark relay NCCL pairs.")
+
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
 
