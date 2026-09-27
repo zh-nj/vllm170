@@ -268,6 +268,7 @@ def _relay(
         num_tokens=count * 6,
         input_ids=torch.arange(count * 6),
         has_prefill=has_prefill,
+        seq_lens_cpu_upper_bound=torch.full((count,), 106, dtype=torch.int32),
     )
     package = dict(
         scheduler_step_id=-1 if dummy else 17,
@@ -324,6 +325,7 @@ def _relay(
 
     monkeypatch.setattr(module, "prepare_dflash_inputs", prepare_inputs)
     monkeypatch.setattr(module, "set_forward_context", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(module, "build_slot_mappings_by_layer", lambda *a: {})
     monkeypatch.setattr(
         module,
         "dispatch_cg_and_sync_dp",
@@ -362,6 +364,9 @@ def _relay(
             )
         spec.temperature = spec.seeds = torch.empty(count)
         spec.draft_kv_cache_group_ids = [0]
+        spec._layer_group_idx = [0]
+        spec._group_causal = False
+        spec.kv_cache_config = None
         spec.block_tables = SimpleNamespace(
             slot_mappings=torch.zeros(1, rows),
             input_block_tables=[torch.zeros(count, 1)],
@@ -378,6 +383,7 @@ def _relay(
         spec.staging = module._DSparkStageStaging(rows, 2, 2, torch.float32, "cpu")
         spec._note_graph_replay = lambda: None
         spec.model = SimpleNamespace(
+            precompute_and_store_context_kv=lambda *a: None,
             prepare_pipeline_query=lambda ids: ids.float().unsqueeze(1).expand(-1, 2),
             forward_local_stage=lambda hidden, pos, ids, *state: (
                 hidden + 1,
@@ -395,10 +401,16 @@ def _relay(
 
         def prepare(batch, package, spec=spec, stage=stage):
             events.append(("prepare", stage))
-            spec._prepare_stage_inputs(batch, package)
-            return rows, None, None
+            return module.DSparkSpeculator._prepare_distributed_stage(
+                spec, batch, package
+            )
+
+        def metadata(stage=stage, **kwargs):
+            events.append(("metadata", stage))
+            return {}
 
         spec._prepare_distributed_stage = prepare
+        spec._build_draft_attn_metadata = metadata
         inbox = []
         if prepare_ahead:
             # Stage 0 receives the head's prepare package; a later stage also
@@ -419,12 +431,38 @@ def _relay(
                 ("send_prepare" if msg.get("prepare_ahead") else "send_state", stage)
             )
 
+        def irecv(src, stage=stage):
+            assert src == 1 and stage == 1
+            events.append(("state_launch", stage))
+            incoming = recv(src)
+
+            def wait():
+                assert ("metadata", stage) in events
+                assert ("state_wait", stage) not in events
+                events.append(("state_wait", stage))
+
+            def postprocess():
+                assert ("state_wait", stage) in events
+                events.append(("state_ready", stage))
+
+            return incoming, [SimpleNamespace(wait=wait)], [postprocess]
+
         spec._pp_group = SimpleNamespace(
             recv_tensor_dict=recv,
+            irecv_tensor_dict=irecv,
             send_tensor_dict=send,
         )
         sent_from = len(messages)
         inspect.unwrap(module.DSparkSpeculator.participate_distributed)(spec, batch)
+        assert not inbox, "each package must be consumed exactly once"
+        assert getattr(spec, "_pending_distributed_state", None) is None
+        if prepare_ahead and stage == 1:
+            assert events.index(("state_launch", stage)) < events.index(
+                ("metadata", stage)
+            )
+            assert events.index(("state_ready", stage)) < events.index(
+                ("send_state", stage)
+            )
         if prepare_ahead:
             sent = messages[sent_from:]
             forwarded = [msg for msg in sent if msg.get("prepare_ahead")]
@@ -634,20 +672,21 @@ def test_v41_relay_preserves_head_inputs_and_only_trims_decode(
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_v41_prepare_ahead_keeps_head_inputs(monkeypatch, compact):
+@pytest.mark.parametrize("graph", [False, True])
+def test_v41_prepare_ahead_keeps_head_inputs(monkeypatch, compact, graph):
     """Splitting the relay must not change what the head finally receives.
 
     The stages forward the head's context package, then report the same states
     and sampling controls as before, so the head's assembled inputs are equal
     field by field.
     """
-    for req_ids in (["r0", "r1"], ["r1", "r2", "r0"]):
+    for req_ids in (["r0"], ["r0", "r1"], ["r1", "r2", "r0"]):
         common = dict(
             compact=compact,
             req_ids=req_ids,
             has_prefill=False,
             dummy=False,
-            graph=False,
+            graph=graph,
         )
         with monkeypatch.context() as patch:
             baseline = _relay(patch, **common)

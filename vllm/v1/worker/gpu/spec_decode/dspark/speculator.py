@@ -703,6 +703,18 @@ class DSparkSpeculator(DFlashSpeculator):
         with phase_profile_stage(
             "draft.stage.metadata", package["context_main_x"], level="stage"
         ):
+            # PP2 receives late in PP5. Post its state transfer before metadata
+            # work, which does not read the incoming tensors. irecv still reads
+            # the message schema synchronously; defer only the tensor waits.
+            if package.get("prepare_ahead") and self._stage_index == 1:
+                with phase_profile_stage(
+                    "draft.stage.state_launch",
+                    input_batch.input_ids,
+                    level="stage",
+                ):
+                    self._pending_distributed_state = self._pp_group.irecv_tensor_dict(
+                        src=self._stage_ranks[self._stage_index - 1]
+                    )
             draft_attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs,
@@ -716,6 +728,18 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.kv_cache_config,
             )
         return num_query_tokens, draft_attn_metadata, slot_mappings
+
+    def _finish_distributed_state_receive(self) -> dict[str, Any] | None:
+        pending = getattr(self, "_pending_distributed_state", None)
+        self._pending_distributed_state = None
+        if pending is None:
+            return None
+        package, handles, postprocess = pending
+        for handle in handles:
+            handle.wait()
+        for fn in postprocess:
+            fn()
+        return package
 
     def _restore_distributed_ced_context(self, package: dict[str, Any]) -> None:
         from vllm.models.deepseek_v4_1.dspark_relay import ced_context_slot_mappings
@@ -813,7 +837,9 @@ class DSparkSpeculator(DFlashSpeculator):
             with phase_profile_stage(
                 "draft.stage.state_wait", input_batch.input_ids, level="stage"
             ):
-                package = self._pp_group.recv_tensor_dict(src=src)
+                package = self._finish_distributed_state_receive()
+                if package is None:
+                    package = self._pp_group.recv_tensor_dict(src=src)
             assert package is not None
             if package.get("prepare_ahead"):
                 raise RuntimeError(
