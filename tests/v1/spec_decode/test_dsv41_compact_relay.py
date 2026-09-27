@@ -85,35 +85,63 @@ def test_compact_relay_requires_distributed_dspark_tp1():
     assert not compact_relay_enabled(config)
 
 
-def _prepare_ahead_config(**kwargs):
+def _prepare_ahead_config(extra, **kwargs):
     config = _config(**kwargs)
-    flag = config.additional_config.pop("dsv41_dspark_compact_relay")
-    config.additional_config["dsv41_dspark_prepare_ahead"] = flag
+    config.additional_config = extra
     return config
 
 
 @pytest.mark.parametrize(
-    "kwargs,expected",
+    "extra,expected",
     [
         ({}, True),
-        ({"enabled": False}, False),
-        ({"enabled": "true"}, False),
-        ({"target": "deepseek_v4"}, False),
-        ({"draft": "deepseek_v4"}, False),
-        ({"layers": 43}, False),
+        ({"dsv41_dspark_prepare_ahead": True}, True),
+        ({"dsv41_dspark_prepare_ahead": False}, False),
+        ({"dsv41_dspark_compact_relay": True}, True),
     ],
 )
-def test_prepare_ahead_matches_the_compact_relay_gate(kwargs, expected):
-    assert prepare_ahead_enabled(_prepare_ahead_config(**kwargs)) is expected
+def test_prepare_ahead_is_on_by_default_and_opt_out(extra, expected):
+    assert prepare_ahead_enabled(_prepare_ahead_config(extra)) is expected
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"target": "deepseek_v4"},
+        {"draft": "deepseek_v4"},
+        {"layers": 43},
+    ],
+)
+def test_prepare_ahead_needs_the_v41_flash_distributed_relay(kwargs):
+    assert not prepare_ahead_enabled(_prepare_ahead_config({}, **kwargs))
+
+
+def test_prepare_ahead_requires_distributed_dspark_tp1():
+    config = _prepare_ahead_config({})
+    assert prepare_ahead_enabled(config)
+    config.parallel_config.tensor_parallel_size = 2
+    assert not prepare_ahead_enabled(config)
+    config.parallel_config.tensor_parallel_size = 1
+    config.speculative_config.use_distributed_dspark = lambda: False
+    assert not prepare_ahead_enabled(config)
+
+
+def test_prepare_ahead_rejects_a_non_boolean_value():
+    config = _prepare_ahead_config({"dsv41_dspark_prepare_ahead": "false"})
+    with pytest.raises(ValueError, match="must be a boolean"):
+        prepare_ahead_enabled(config)
 
 
 def test_prepare_ahead_and_compact_relay_are_independent_flags():
     config = _config(enabled=True)
-    assert compact_relay_enabled(config) and not prepare_ahead_enabled(config)
-    config.additional_config["dsv41_dspark_prepare_ahead"] = True
     assert compact_relay_enabled(config) and prepare_ahead_enabled(config)
+    config.additional_config["dsv41_dspark_prepare_ahead"] = False
+    assert compact_relay_enabled(config) and not prepare_ahead_enabled(config)
+    config.additional_config.pop("dsv41_dspark_compact_relay")
+    assert not compact_relay_enabled(config) and not prepare_ahead_enabled(config)
+    config.additional_config.pop("dsv41_dspark_prepare_ahead")
     config.speculative_config = None
-    assert not compact_relay_enabled(config)
+    assert not compact_relay_enabled(config) and not prepare_ahead_enabled(config)
 
 
 def test_relay_profile_extra_reports_wire_inventory(monkeypatch):
