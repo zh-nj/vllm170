@@ -15,6 +15,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.amd.rocm import build_swa_ragged_indices_direct
 from vllm.models.deepseek_v4_1 import row_probe
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
@@ -473,6 +474,15 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
     supports_draft_decode_metadata_update = False
 
+    def _requires_dense_decode_swa_indices(self) -> bool:
+        return not (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA
+            and current_platform.is_device_capability_family(80)
+        )
+
+    def _requires_decode_swa_lens_tail_clear(self) -> bool:
+        return not self._use_direct_ragged_swa
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -490,6 +500,55 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
             dtype=torch.int32,
             device=self.device,
         )
+        self._use_direct_ragged_swa = (
+            envs.VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA
+            and current_platform.is_device_capability_family(80)
+        )
+        self._direct_decode_swa_ragged: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _build_decode_swa_indices(
+        self,
+        *,
+        num_decode_tokens: int,
+        non_causal: bool,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        is_valid_token: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._use_direct_ragged_swa:
+            return super()._build_decode_swa_indices(
+                num_decode_tokens=num_decode_tokens,
+                non_causal=non_causal,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                token_to_req_indices=token_to_req_indices,
+                is_valid_token=is_valid_token,
+                block_table=block_table,
+            )
+
+        index_width = self.noncausal_index_width if non_causal else self.window_size
+        with optional_phase_profile_stage(
+            "target.attn_metadata.swa.direct_ragged", query_start_loc
+        ):
+            self._direct_decode_swa_ragged = build_swa_ragged_indices_direct(
+                num_decode_tokens=num_decode_tokens,
+                window_size=self.window_size,
+                index_width=index_width,
+                non_causal=non_causal,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                token_to_req_indices=token_to_req_indices,
+                is_valid_token=is_valid_token,
+                block_table=block_table,
+                block_size=self.block_size,
+                swa_lens=self.decode_swa_lens,
+                ragged_indices_buffer=self.decode_swa_ragged_indices_buffer,
+                ragged_indptr_buffer=self.decode_swa_ragged_indptr_buffer,
+            )
+        # DSpark decode consumes the ragged fields; dense rows remain unused.
+        return self.decode_swa_indices[:, :, :0]
 
     def build(
         self,
@@ -497,6 +556,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV4ROCMAiterSparseSWAMetadata:
+        self._direct_decode_swa_ragged = None
         base = super().build(
             common_prefix_len=common_prefix_len,
             common_attn_metadata=common_attn_metadata,
@@ -505,7 +565,9 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
 
         ragged_indices = None
         ragged_indptr = None
-        if (
+        if self._direct_decode_swa_ragged is not None:
+            ragged_indices, ragged_indptr = self._direct_decode_swa_ragged
+        elif (
             base.num_decode_tokens > 0
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
