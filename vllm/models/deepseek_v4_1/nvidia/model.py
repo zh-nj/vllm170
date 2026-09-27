@@ -808,12 +808,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 source_layer.attn.indexer.export_normalized_k = True
 
         self.ced_prefill = None
-        if ced_prefill_enabled(vllm_config) and get_pp_group().is_last_rank:
-            if not self.start_layer < 20 or self.end_layer != 40:
-                raise ValueError(
-                    "CED prefill requires encoder layer 19 and all decoder layers "
-                    "on the last PP rank"
-                )
+        if ced_prefill_enabled(vllm_config) and self.end_layer > 20:
             self.ced_prefill = CEDPrefill(config.sliding_window)
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
@@ -1169,7 +1164,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 islice(self.layers, self.start_layer, self.end_layer),
                 start=self.start_layer,
             ):
-                if idx == 20 and ced_step is not None:
+                if ced_step is not None and self.ced_prefill is not None and idx >= 20:
                     assert self.ced_prefill is not None
                     return self.ced_prefill.forward(
                         self,
@@ -1179,6 +1174,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         post_mix,
                         res_mix,
                         pre_mix,
+                        intermediate_tensors=intermediate_tensors,
                     )
                 if (
                     fast_prefill_step is not None
@@ -1251,10 +1247,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 step_context.attn_metadata = original_attn_metadata
             if buffer_swap is not None:
                 buffer_swap.restore()
-        if row_dump is not None:
-            row_dump.flush()
-        _ROW_DUMP = None
-        row_probe.bind(None)
+            if row_dump is not None:
+                row_dump.flush()
+            _ROW_DUMP = None
+            row_probe.bind(None)
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:

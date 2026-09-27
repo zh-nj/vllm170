@@ -54,15 +54,9 @@ export VLLM_DSV41_PREFILL_WORKSPACE_TOKENS=${VLLM_DSV41_PREFILL_WORKSPACE_TOKENS
 # (35.25 -> 36.51 token/s), so the port launcher exposes the same knob; 0 keeps
 # the heuristic.
 export VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS=${VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS:-0}
-# The PP2 rank (layers 16-23 plus its DSpark draft stage) keeps only ~1.1 GiB of
-# device memory free during serving, and the default allocator cannot satisfy a
-# 128 MiB request from its fragmented free pool: at 2048 prefill tokens that
-# raised "memory allocation failed with OOM on device 2 while trying to allocate
-# 134217728 bytes (free: 118226944)".
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True does NOT rescue 2048 (same
-# OOM, and it raises the resident pool by ~450 MiB per rank), so the chunk size
-# below stays at 1024 with the stock allocator. Override PORT_MAX_BATCHED only
-# after PP2 gains real headroom (fewer layers, smaller KV, or no draft stage).
+# The default chunk is 2048. Earlier DSpark-enabled runs exhausted PP2's
+# activation headroom at this size; PORT_MAX_BATCHED=1024 remains available
+# for that configuration. The CED/DSpark-off path is measured separately.
 
 PORT_PORT=${PORT_PORT:-26663}
 # Images per prompt, 0 = text only. The checkpoint carries the vision tower
@@ -73,7 +67,7 @@ PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
 PORT_MAX_MODEL_LEN=${PORT_MAX_MODEL_LEN:-1048576}
 # Empty means "let the engine profile and size the KV cache itself" (see kv_args).
 PORT_KV_BYTES=${PORT_KV_BYTES-1300000000}
-PORT_MAX_BATCHED=${PORT_MAX_BATCHED:-1024}
+PORT_MAX_BATCHED=${PORT_MAX_BATCHED:-2048}
 PORT_MAX_SEQS=${PORT_MAX_SEQS:-8}
 PORT_DSPARK_TOKENS=${PORT_DSPARK_TOKENS:-5}
 PORT_MOE_BACKEND=${PORT_MOE_BACKEND:-mxfp4_int8_sm80}

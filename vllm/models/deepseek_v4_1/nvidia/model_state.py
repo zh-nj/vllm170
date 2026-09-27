@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4_1.ced import CEDMetadata, CEDStep, ced_prefill_enabled
 from vllm.models.deepseek_v4_1.fast_prefill import (
@@ -93,9 +94,15 @@ class DeepseekV41ModelState(DefaultModelState):
         self.requires_eager_prefill = (
             self.ced_prefill_enabled or self.fast_prefill_enabled
         )
+        pp = get_pp_group()
+        _, end_layer = get_pp_indices(
+            vllm_config.model_config.hf_config.num_hidden_layers,
+            pp.rank_in_group,
+            pp.world_size,
+        )
         self.ced_metadata: CEDMetadata | None = (
             CEDMetadata(vllm_config, device)
-            if self.ced_prefill_enabled and get_pp_group().is_last_rank
+            if self.ced_prefill_enabled and end_layer > 20
             else None
         )
         self.fast_prefill_metadata: FastPrefillMetadata | None = (

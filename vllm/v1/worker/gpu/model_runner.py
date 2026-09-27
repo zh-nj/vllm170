@@ -1944,6 +1944,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             if dst.data_ptr() != src.data_ptr():
                                 dst.copy_(src)
                         new_tensors[key] = dst
+                    if received_tensors is not None:
+                        # Dynamic side tensors can have a different row count
+                        # from the scheduler batch. Preserve their received shape;
+                        # only eager calls may consume uncaptured buffers.
+                        for key, tensor in received_tensors.items():
+                            if key not in new_tensors:
+                                assert batch_desc.cg_mode == CUDAGraphMode.NONE
+                                new_tensors[key] = tensor
                 model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
                 del intermediate_tensors
         self.step_timing.inputs_end()

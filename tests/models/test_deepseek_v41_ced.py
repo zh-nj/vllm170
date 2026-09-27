@@ -247,7 +247,7 @@ def test_v41_engram_injection_is_independent_of_pp_boundary(
         engram_hashes=hashes if has_hashes else None,
         engram_mask=mask,
     )
-    forward = model_module.DeepseekV4DecoderLayer.forward
+    forward = model_module.DeepseekV4DecoderLayer._forward
     ordinary = forward(layer, x, residual=residual, **kwargs)
     boundary = forward(layer, stream, **kwargs)
     expected = (
@@ -541,3 +541,204 @@ def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(monkeyp
     assert set(state.suffixes) == {"ced"}
     state.remove_request("ced")
 
+
+@pytest.mark.parametrize("final_chunk", [1, 2, 128])
+def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
+    monkeypatch, final_chunk
+):
+    """PP boundaries must carry the entire mHC suffix past short final chunks."""
+    from vllm.models.deepseek_v4_1 import ced
+    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+        DeepseekV41AmpereMLAAttention,
+    )
+
+    context = SimpleNamespace(attn_metadata={}, slot_mapping={}, is_padding=None)
+    monkeypatch.setattr(ced, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4_1.fast_prefill.record_layer_rows", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+
+    def post(hidden, residual, *unused):
+        assert hidden.ndim == 2 and residual.ndim == 3
+        return residual + hidden[:, None, :]
+
+    monkeypatch.setattr(ced, "mhc_post_tilelang", post)
+    monkeypatch.setattr(
+        ced,
+        "mhc_pre_delayed_tilelang",
+        lambda stream, *args, **kwargs: (None, None, stream.mean(1), None),
+    )
+
+    def publish(attn, normalized, positions):
+        attn._last_compressed_latent = positions[:, None].float().clone()
+        attn.indexer._last_normalized_k = positions[:, None].float() + 100
+        return attn._last_compressed_latent
+
+    monkeypatch.setattr(ced, "publish_decoder_kv", publish)
+
+    class Layer:
+        def __init__(self, index):
+            self.index = index
+            self.attn = object.__new__(DeepseekV41AmpereMLAAttention)
+            self.attn.indexer = SimpleNamespace()
+            for name in (
+                "hc_attn_fn",
+                "hc_attn_scale",
+                "hc_attn_base",
+                "rms_norm_eps",
+                "hc_eps",
+                "hc_post_alpha",
+                "hc_sinkhorn_iters",
+            ):
+                setattr(self, name, None)
+            self.attn_norm = SimpleNamespace(weight=None, variance_epsilon=1e-6)
+
+        def __call__(self, hidden, positions, ids, pre_mix, pm, rm, residual):
+            stream = post(hidden, residual) if residual is not None else hidden
+            assert stream.shape == (positions.numel(), 4, 2)
+            if self.index == 20:
+                publish(self.attn, stream.mean(1), positions)
+            # Nonconstant residual and mix make a missing mHC boundary observable.
+            return stream.mean(1) * 0.01 + self.index, stream, None, None, pre_mix
+
+    def model(start, end):
+        value = SimpleNamespace(
+            start_layer=start,
+            end_layer=end,
+            config=SimpleNamespace(hidden_size=2, num_hidden_layers=40),
+            layers=[Layer(i) for i in range(40)],
+            aux_hidden_state_layers=[],
+            _mtp_hidden_buffer=None,
+            _pp_incoming_topk=False,
+            _pp_incoming_candidates=start > 20,
+            _pp_outgoing_topk=False,
+            _pp_outgoing_candidates=end < 40,
+            _pp_outgoing_index=end < 40,
+            candidate_block_buffer=torch.zeros(1024, 2),
+            norm=lambda x: x,
+        )
+
+        def append(tensors, positions, incoming):
+            if start <= 20:
+                latent = value.layers[20].attn._last_compressed_latent
+                index_k = value.layers[20].attn.indexer._last_normalized_k
+            else:
+                latent, index_k = incoming["full_kv"], incoming["full_index_k"]
+            torch.testing.assert_close(latent[:, 0], positions.float())
+            torch.testing.assert_close(index_k[:, 0], positions.float() + 100)
+            tensors["full_kv"], tensors["full_index_k"] = latent, index_k
+
+        value._append_pp_attention_state = append
+        return value
+
+    monkeypatch.setattr(ced, "hc_collapse_triton", lambda x, mix: x.mean(1))
+    models = [model(16, 24), model(24, 32), model(32, 40)]
+    states = [ced.CEDPrefill(128) for _ in models]
+    unsplit, reference = model(16, 40), ced.CEDPrefill(128)
+    original_metadata = context.attn_metadata
+    for start, count in [(0, 1024), (1024, final_chunk)]:
+        final = start > 0
+        positions = torch.arange(start, start + count)
+        replay_positions = torch.arange(start + count - 128, start + count)
+        stream = positions.float()[:, None, None].expand(-1, 4, 2).clone()
+        mix = torch.ones(count, 4)
+        step = ced.CEDStep(
+            "request",
+            start,
+            count,
+            final,
+            replay_metadata={},
+            positions=replay_positions,
+            input_ids=replay_positions,
+            requests=[
+                ced.CEDRequest(
+                    "request", start, 0, count, True, True, final, 128 if final else 0
+                )
+            ],
+            source_positions=positions,
+        )
+        expected = reference.forward(unsplit, step, stream, None, None, None, mix)
+        incoming = None
+        for stage, state in zip(models, states):
+            result = state.forward(
+                stage,
+                step,
+                stream if incoming is None else incoming["hidden_states"],
+                None,
+                None,
+                None,
+                mix if incoming is None else incoming["pre_mix"],
+                intermediate_tensors=incoming,
+            )
+            if stage.end_layer < 40:
+                assert result["hidden_states"].shape == (count, 4, 2)
+                assert result["pre_mix"].shape == (count, 4)
+                if final:
+                    assert result[ced.CED_REPLAY_HIDDEN].shape == (128, 4, 2)
+                    assert result[ced.CED_REPLAY_CANDIDATES].shape == (128, 2)
+                else:
+                    assert ced.CED_REPLAY_HIDDEN not in result.tensors
+                incoming = result
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        assert context.attn_metadata is original_metadata
+    assert [s.decoder_tokens for s in states] == [128, 128, 128]
+    assert states[0].encoder_tokens == 1024 + final_chunk
+    assert all(not state.suffixes for state in states)
+
+
+def test_ced_replay_metadata_keeps_source_keys_in_independent_builders(monkeypatch):
+    """Compact queries must not reuse or overwrite full-chunk source metadata."""
+    from vllm.models.deepseek_v4_1 import ced
+
+    made = []
+
+    class Group:
+        def __init__(self, backend, names, spec, group_id):
+            self.backend, self.layer_names = backend, names
+            self.kv_cache_spec, self.kv_cache_group_id = spec, group_id
+            self.builder = SimpleNamespace(kernel_block_size=32)
+            made.append(self)
+
+        def get_metadata_builder(self):
+            return self.builder
+
+        def create_metadata_builders(self, *args, **kwargs):
+            assert kwargs["kernel_block_size"] == 32
+
+    group = Group(None, ["model.layers.14.cache", "model.layers.20.swa"], None, 0)
+    monkeypatch.setattr(ced, "AttentionGroup", Group)
+    captured = []
+
+    def capture_metadata(**kwargs):
+        captured.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(ced, "build_attn_metadata", capture_metadata)
+    state = ced.CEDMetadata(
+        SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128))
+        ),
+        torch.device("cpu"),
+    )
+    positions = torch.arange(256)
+    batch = SimpleNamespace(
+        has_prefill=True,
+        num_tokens=256,
+        req_ids=["request"],
+        num_computed_prefill_tokens_np=[0],
+        is_prefilling_np=[True],
+        prefill_len_np=[256],
+        positions=positions,
+        input_ids=positions,
+        seq_lens=torch.tensor([256]),
+        seq_lens_cpu_upper_bound=torch.tensor([256]),
+    )
+    state.prepare(batch, (), positions[None], [[group]], None)
+    replay_group = captured[0]["attn_groups"][0][0]
+    assert replay_group.layer_names == group.layer_names
+    assert replay_group.builder is not group.builder
+    assert captured[0]["num_tokens"] == 128
+    assert positions.numel() == 256
