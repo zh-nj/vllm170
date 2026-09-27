@@ -604,13 +604,13 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
             # Nonconstant residual and mix make a missing mHC boundary observable.
             return stream.mean(1) * 0.01 + self.index, stream, None, None, pre_mix
 
-    def model(start, end):
+    def model(start, end, aux_layers=()):
         value = SimpleNamespace(
             start_layer=start,
             end_layer=end,
             config=SimpleNamespace(hidden_size=2, num_hidden_layers=40),
             layers=[Layer(i) for i in range(40)],
-            aux_hidden_state_layers=[],
+            aux_hidden_state_layers=list(aux_layers),
             _mtp_hidden_buffer=None,
             _pp_incoming_topk=False,
             _pp_incoming_candidates=start > 20,
@@ -635,14 +635,17 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
         return value
 
     monkeypatch.setattr(ced, "hc_collapse_triton", lambda x, mix: x.mean(1))
-    models = [model(16, 24), model(24, 32), model(32, 40)]
+    models = [model(16, 24), model(24, 32), model(32, 40, (37, 38, 39))]
     states = [ced.CEDPrefill(128) for _ in models]
-    unsplit, reference = model(16, 40), ced.CEDPrefill(128)
+    unsplit, reference = model(16, 40, (37, 38, 39)), ced.CEDPrefill(128)
     original_metadata = context.attn_metadata
     for start, count in [(0, 1024), (1024, final_chunk)]:
         final = start > 0
         positions = torch.arange(start, start + count)
         replay_positions = torch.arange(start + count - 128, start + count)
+        replay_slots = torch.stack(
+            [replay_positions + group * 2048 for group in range(6)]
+        )
         stream = positions.float()[:, None, None].expand(-1, 4, 2).clone()
         mix = torch.ones(count, 4)
         step = ced.CEDStep(
@@ -653,6 +656,7 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
             replay_metadata={},
             positions=replay_positions,
             input_ids=replay_positions,
+            replay_slots=replay_slots,
             requests=[
                 ced.CEDRequest(
                     "request", start, 0, count, True, True, final, 128 if final else 0
@@ -683,10 +687,81 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
                     assert ced.CED_REPLAY_HIDDEN not in result.tensors
                 incoming = result
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        if final:
+            assert reference.draft_context is not None
+            assert states[-1].draft_context is not None
+            actual_context = states[-1].draft_context
+            expected_context = reference.draft_context
+            assert actual_context.request_ids == ("request",)
+            assert actual_context.request_lengths == (128,)
+            assert expected_context.request_ids == actual_context.request_ids
+            assert expected_context.request_lengths == actual_context.request_lengths
+            torch.testing.assert_close(
+                actual_context.positions, expected_context.positions
+            )
+            torch.testing.assert_close(actual_context.positions, replay_positions)
+            torch.testing.assert_close(actual_context.slots, expected_context.slots)
+            torch.testing.assert_close(actual_context.slots, replay_slots)
+            assert len(actual_context.auxiliary) == 3
+            for actual, expected in zip(
+                actual_context.auxiliary, expected_context.auxiliary
+            ):
+                torch.testing.assert_close(actual, expected)
         assert context.attn_metadata is original_metadata
     assert [s.decoder_tokens for s in states] == [128, 128, 128]
     assert states[0].encoder_tokens == 1024 + final_chunk
     assert all(not state.suffixes for state in states)
+
+    if final_chunk != 2:
+        return
+
+    # Only a final CED prefill request may seed the distributed draft context.
+    # Decode rows and requests that use the full fallback path still share the
+    # replay forward, but must not contribute their rows to the CED payload.
+    mixed_model = model(32, 40, (37, 38, 39))
+    mixed_state = ced.CEDPrefill(128)
+    replay_count = 128 + 2 + 2
+    mixed_positions = torch.arange(replay_count)
+    mixed_slots = torch.stack([mixed_positions + group * 4096 for group in range(6)])
+    mixed_step = ced.CEDStep(
+        "ced",
+        1024,
+        5,
+        True,
+        replay_metadata={},
+        positions=mixed_positions,
+        input_ids=mixed_positions + 100,
+        replay_slots=mixed_slots,
+        requests=[
+            ced.CEDRequest("ced", 1024, 0, 1, True, True, True, 128),
+            ced.CEDRequest("decode", 0, 1, 2, False, False, True, 2),
+            ced.CEDRequest("fallback", 0, 3, 2, True, False, True, 2),
+        ],
+        source_positions=mixed_positions,
+    )
+    mixed_hidden = torch.zeros(replay_count, 4, 2)
+    mixed_pre_mix = torch.zeros(replay_count, 4)
+    mixed_state.forward(
+        mixed_model,
+        mixed_step,
+        torch.zeros(5, 4, 2),
+        None,
+        None,
+        None,
+        torch.zeros(5, 4),
+        intermediate_tensors={
+            ced.CED_REPLAY_HIDDEN: mixed_hidden,
+            ced.CED_REPLAY_PRE_MIX: mixed_pre_mix,
+            ced.CED_REPLAY_CANDIDATES: torch.zeros(replay_count, 2),
+        },
+    )
+    assert mixed_state.draft_context is not None
+    mixed_context = mixed_state.draft_context
+    assert mixed_context.request_ids == ("ced",)
+    assert mixed_context.request_lengths == (128,)
+    torch.testing.assert_close(mixed_context.positions, mixed_positions[:128])
+    torch.testing.assert_close(mixed_context.slots, mixed_slots[:, :128])
+    assert all(value.shape[0] == 128 for value in mixed_context.auxiliary)
 
 
 def test_ced_replay_metadata_keeps_source_keys_in_independent_builders(monkeypatch):

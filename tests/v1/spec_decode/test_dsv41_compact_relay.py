@@ -21,6 +21,7 @@ from benchmarks.deepseek_v4_1.dspark_relay_bench import (
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import _split_tensor_dict
 from vllm.models.deepseek_v4_1.dspark_relay import (
+    ced_context_slot_mappings,
     compact_relay_enabled,
     prepare_ahead_enabled,
 )
@@ -257,6 +258,7 @@ def _relay(
     graph,
     views=None,
     prepare_ahead=False,
+    ced=False,
 ):
     count, width = len(req_ids), 5
     rows = count * width
@@ -284,6 +286,12 @@ def _relay(
     )
     if prepare_ahead:
         package["prepare_ahead"] = True
+    if ced:
+        package.update(
+            ced_context_main_x=torch.ones(128 * count, 2),
+            ced_context_positions=torch.arange(128).repeat(count),
+            ced_context_req_indices=torch.arange(count).repeat_interleave(128),
+        )
     controls = {key: package[key] for key in package}
     head_prepare = dict(package)
     state: dict[str, Any] = {}
@@ -445,6 +453,130 @@ def _relay(
                     "the head's control tensors must reach the next stage unchanged"
                 )
     return messages
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_ced_suffix_reaches_all_draft_stages_and_is_dropped_before_head(
+    monkeypatch, graph
+):
+    messages = _relay(
+        monkeypatch,
+        compact=False,
+        req_ids=["second", "first"],
+        has_prefill=True,
+        dummy=False,
+        graph=graph,
+        ced=True,
+    )
+    for message in messages[:-1]:
+        assert message["ced_context_main_x"].shape[0] == 256
+    assert not any(key.startswith("ced_context_") for key in messages[-1])
+
+
+def test_ced_head_packs_complete_suffix_with_current_batch_order():
+    from vllm.models.deepseek_v4_1.ced import CEDDraftContext, CEDPrefill
+
+    ced = CEDPrefill(128)
+    positions = torch.cat((torch.arange(898, 1026), torch.arange(3)))
+    auxiliary = [positions[:, None].float() + i for i in range(3)]
+    ced.draft_context = CEDDraftContext(
+        "a", positions, torch.empty(0), auxiliary, ("a", "b"), (128, 3)
+    )
+    spec = module.DSparkSpeculator.__new__(module.DSparkSpeculator)
+    spec._ced_context_source = ced.take_draft_context
+    spec.dtype = torch.bfloat16
+
+    def combine(value):
+        assert value.dtype == torch.bfloat16
+        return value + 10
+
+    spec.model = SimpleNamespace(combine_hidden_states=combine)
+    batch = SimpleNamespace(req_ids=["decode", "b", "a"])
+
+    package = spec._ced_draft_context_package(batch)
+
+    torch.testing.assert_close(
+        package["ced_context_main_x"],
+        torch.cat(auxiliary, dim=-1).to(torch.bfloat16) + 10,
+    )
+    torch.testing.assert_close(package["ced_context_positions"], positions)
+    assert package["ced_context_req_indices"].tolist() == [2] * 128 + [1] * 3
+    assert spec._ced_draft_context_package(batch) == {}
+    ced.draft_context = CEDDraftContext("missing", positions, None, auxiliary)
+    with pytest.raises(ValueError, match="another request"):
+        spec._ced_draft_context_package(batch)
+
+
+def test_ced_slots_use_local_group_tables_and_mask_evicted_history():
+    positions = torch.tensor([126, 128, 256, 0, 129, 512, -1])
+    requests = torch.tensor([1, 1, 1, 0, 0, 0, 0])
+    tables = SimpleNamespace(
+        input_block_tables=[
+            torch.tensor([[8, 7, 6], [0, 3, 4]]),
+            torch.tensor([[9, 2, 5], [1, 0, 7]]),
+        ],
+        kernel_block_sizes=[128, 128],
+        cp_size=1,
+        cp_rank=0,
+        cp_interleave=1,
+    )
+    slots = ced_context_slot_mappings(positions, requests, tables, [1, 0])
+    assert slots[0].tolist() == [254, -1, 896, 1152, 257, -1, -1]
+    assert slots[1].tolist() == [-1, 384, 512, 1024, 897, -1, -1]
+
+
+def test_ced_suffix_restored_after_padded_chunk_before_query_metadata(monkeypatch):
+    spec = module.DSparkSpeculator.__new__(module.DSparkSpeculator)
+    spec.num_query_per_req = 5
+    spec.max_model_len = 2048
+    spec.context_positions = torch.tensor([1024, 1025])
+    spec._context_slot_mappings = torch.tensor([[128, 129]])
+    spec._layer_group_idx = [0]
+    spec.draft_kv_cache_group_ids = [1]
+    spec._stage_index = 1
+    spec._group_causal = True
+    spec.kv_cache_config = None
+    spec.block_tables = SimpleNamespace(
+        input_block_tables=[None, torch.tensor([[0] * 7 + [3, 1]])],
+        kernel_block_sizes=[128, 128],
+        cp_size=1,
+        cp_rank=0,
+        cp_interleave=1,
+        slot_mappings=torch.zeros(2, 5),
+    )
+    cache = torch.full((512,), -10.0)
+    calls = []
+
+    def insert(states, positions, mappings):
+        calls.append(positions.clone())
+        cache[mappings[0]] = states[:, 0]
+
+    def metadata(**kwargs):
+        # The two current rows were first overwritten by scheduler padding;
+        # all 128 replay rows must be restored before the query can read KV.
+        assert len(calls) == 2
+        torch.testing.assert_close(cache[386:512], torch.arange(898, 1024).float())
+        torch.testing.assert_close(cache[128:130], torch.tensor([1024.0, 1025.0]))
+        return {}
+
+    spec.model = SimpleNamespace(precompute_and_store_context_kv=insert)
+    spec._prepare_stage_inputs = lambda *args: None
+    spec._build_draft_attn_metadata = metadata
+    monkeypatch.setattr(module, "build_slot_mappings_by_layer", lambda *args: {})
+    batch = SimpleNamespace(
+        num_reqs=1, num_tokens=2, seq_lens_cpu_upper_bound=torch.tensor([1026])
+    )
+    positions = torch.arange(898, 1026)
+    package = dict(
+        skip_attn=False,
+        context_main_x=torch.zeros(2, 1),
+        ced_context_main_x=positions[:, None].float(),
+        ced_context_positions=positions,
+        ced_context_req_indices=torch.zeros(128, dtype=torch.long),
+    )
+
+    assert spec._prepare_distributed_stage(batch, package) == (5, {}, {})
+    assert [len(positions) for positions in calls] == [2, 128]
 
 
 @pytest.mark.parametrize("graph", [False, True])

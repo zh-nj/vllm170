@@ -45,11 +45,6 @@ def ced_prefill_enabled(config: VllmConfig) -> bool:
         and config.speculative_config.method != "dspark"
     ):
         raise ValueError("CED prefill currently supports only DSpark speculation")
-    if (
-        config.speculative_config is not None
-        and config.speculative_config.use_distributed_dspark()
-    ):
-        raise ValueError("CED prefill does not yet support distributed DSpark")
     return True
 
 
@@ -114,6 +109,7 @@ class CEDDraftContext:
     slots: torch.Tensor
     auxiliary: list[torch.Tensor]
     request_ids: tuple[str, ...] = ()
+    request_lengths: tuple[int, ...] = ()
 
 
 class CEDMetadata:
@@ -467,6 +463,8 @@ class CEDPrefill:
             return (output, auxiliary_output) if auxiliary_output else output
         collapsed = model.norm(hc_collapse_triton(hidden, pre_mix))
         replay_offset = 0
+        draft_slices = []
+        draft_requests = []
         assert step.requests is not None
         for request in step.requests:
             if not request.replay_count:
@@ -481,16 +479,24 @@ class CEDPrefill:
                 model._mtp_hidden_buffer[destination].copy_(hidden[source].flatten(1))
             for padded, value in zip(auxiliary_output, auxiliary):
                 padded[destination].copy_(value[source])
+            if request.use_ced and request.final:
+                draft_slices.append(slice(replay_offset, replay_end))
+                draft_requests.append(request)
             replay_offset = replay_end
         if auxiliary_output:
             if len(auxiliary) != len(auxiliary_output):
                 raise ValueError("CED auxiliary states must come from decoder layers")
-            self.draft_context = CEDDraftContext(
-                step.request_id,
-                step.positions,
-                step.replay_slots,
-                auxiliary,
-                tuple(r.request_id for r in step.requests if r.replay_count),
-            )
+            if draft_requests:
+                self.draft_context = CEDDraftContext(
+                    draft_requests[0].request_id,
+                    torch.cat([step.positions[s] for s in draft_slices]),
+                    torch.cat([step.replay_slots[:, s] for s in draft_slices], dim=1),
+                    [
+                        torch.cat([value[s] for s in draft_slices])
+                        for value in auxiliary
+                    ],
+                    tuple(r.request_id for r in draft_requests),
+                    tuple(r.replay_count for r in draft_requests),
+                )
             return output, auxiliary_output
         return output

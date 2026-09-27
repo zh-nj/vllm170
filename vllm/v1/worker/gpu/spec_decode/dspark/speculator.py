@@ -696,6 +696,10 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )
+        if "ced_context_main_x" in package:
+            # Scheduler rows can contain CED padding; restore the real suffix
+            # after that write so it also covers a final chunk shorter than SWA.
+            self._restore_distributed_ced_context(package)
         with phase_profile_stage(
             "draft.stage.metadata", package["context_main_x"], level="stage"
         ):
@@ -712,6 +716,33 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.kv_cache_config,
             )
         return num_query_tokens, draft_attn_metadata, slot_mappings
+
+    def _restore_distributed_ced_context(self, package: dict[str, Any]) -> None:
+        from vllm.models.deepseek_v4_1.dspark_relay import ced_context_slot_mappings
+
+        positions = package["ced_context_positions"]
+        with phase_profile_stage(
+            "draft.ced_context_kv", package["ced_context_main_x"], level="stage"
+        ):
+            group_slots = ced_context_slot_mappings(
+                positions,
+                package["ced_context_req_indices"],
+                self.block_tables,
+                self.draft_kv_cache_group_ids,
+            )
+            assert self._layer_group_idx is not None
+            self.model.precompute_and_store_context_kv(
+                package["ced_context_main_x"],
+                positions,
+                [group_slots[index] for index in self._layer_group_idx],
+            )
+        if not getattr(self, "_ced_context_logged", False):
+            self._ced_context_logged = True
+            logger.info(
+                "Distributed DSpark restored %d CED context rows on draft stage %d.",
+                positions.numel(),
+                self._stage_index,
+            )
 
     def _prepare_stage_inputs(self, input_batch: Any, package: dict[str, Any]) -> None:
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
@@ -897,6 +928,9 @@ class DSparkSpeculator(DFlashSpeculator):
         if is_last_stage:
             for key in (
                 "context_main_x",
+                "ced_context_main_x",
+                "ced_context_positions",
+                "ced_context_req_indices",
                 "num_sampled",
                 "num_rejected",
                 "last_sampled",
@@ -941,6 +975,43 @@ class DSparkSpeculator(DFlashSpeculator):
                 stage="draft.stage.send",
             )
 
+    def _take_ced_draft_context(self, input_batch: Any) -> Any:
+        source = getattr(self, "_ced_context_source", None)
+        context = source() if source is not None else None
+        if context is not None:
+            request_ids = context.request_ids or (context.request_id,)
+            if not set(request_ids).issubset(input_batch.req_ids):
+                raise ValueError("CED draft context belongs to another request")
+        return context
+
+    def _ced_draft_context_package(self, input_batch: Any) -> dict[str, torch.Tensor]:
+        context = self._take_ced_draft_context(input_batch)
+        if context is None:
+            return {}
+        request_ids = context.request_ids or (context.request_id,)
+        lengths = context.request_lengths or (context.positions.numel(),)
+        if (
+            len(request_ids) != len(lengths)
+            or sum(lengths) != context.positions.numel()
+        ):
+            raise ValueError("CED draft context request lengths do not match its rows")
+        row_requests = [
+            input_batch.req_ids.index(request_id)
+            for request_id, length in zip(request_ids, lengths)
+            for _ in range(length)
+        ]
+        return {
+            "ced_context_main_x": self.model.combine_hidden_states(
+                # Match the ordinary context workspace's projection dtype;
+                # mHC replay can retain FP32 residual/auxiliary states.
+                torch.cat(context.auxiliary, dim=-1).to(dtype=self.dtype)
+            ),
+            "ced_context_positions": context.positions,
+            "ced_context_req_indices": torch.tensor(
+                row_requests, dtype=torch.long, device=context.positions.device
+            ),
+        }
+
     def _publish_ced_draft_context(self, input_batch: Any) -> None:
         """Write the CED-replayed suffix into the draft KV cache before proposing.
 
@@ -949,15 +1020,9 @@ class DSparkSpeculator(DFlashSpeculator):
         exactly the states the drafter needs for its context KV, so publishing
         them here skips a redundant projection on the draft side.
         """
-        source = getattr(self, "_ced_context_source", None)
-        if source is None:
-            return
-        context = source()
+        context = self._take_ced_draft_context(input_batch)
         if context is None:
             return
-        request_ids = context.request_ids or (context.request_id,)
-        if not set(request_ids).issubset(input_batch.req_ids):
-            raise ValueError("CED draft context belongs to another request")
         states = self.model.combine_hidden_states(torch.cat(context.auxiliary, dim=-1))
         assert self._layer_group_idx is not None
         slots = [
@@ -986,7 +1051,7 @@ class DSparkSpeculator(DFlashSpeculator):
         mm_inputs: Any = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        if not dummy_run:
+        if not dummy_run and not self.distributed:
             self._publish_ced_draft_context(input_batch)
         if not self.distributed:
             # ``DFlashSpeculator.propose`` carries its own phase-profile step.
@@ -1072,6 +1137,8 @@ class DSparkSpeculator(DFlashSpeculator):
             "temperature": temperature,
             "seeds": seeds,
         }
+        if not dummy_run:
+            package.update(self._ced_draft_context_package(input_batch))
         with phase_profile_stage(
             "draft.head.send",
             input_batch.input_ids,
