@@ -908,6 +908,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     is_profile=is_profile,
                 )
             self.step_timing.drafter_end()
+        else:
+            # Same invariant as the serving path: only closing the pair lets
+            # this rank log anything, so a rank without a speculator reports a
+            # zero-length draft slice.
+            self.step_timing.drafter_start()
+            self.step_timing.drafter_end()
 
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
@@ -2091,14 +2097,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_end()
 
         if not self.is_last_pp_rank:
-            # No draft work on this rank: close the step's event pair with a
-            # zero-length draft so the target slice is still reported.
-            self.step_timing.drafter_start()
-            self.step_timing.drafter_end()
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
+            # A rank owning a distributed draft stage times that slice of the
+            # chain; one without a stage closes the pair with a zero-length
+            # draft so the target slice is still reported.
+            self.step_timing.drafter_start()
             if (
                 self.speculator is not None
                 and self.speculator.distributed
@@ -2107,6 +2113,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.speculator.set_distributed_step_id(scheduler_step_id)
                 self.speculator.participate_distributed(input_batch)
+            self.step_timing.drafter_end()
             all_decode_next = self.pp_handler.receive(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
@@ -2233,6 +2240,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+        else:
+            # The step's event pair is what resolves and logs this rank's
+            # timings, so it has to close on every rank. Without a speculator
+            # this rank does no draft work: report a zero-length draft slice
+            # instead of no line at all.
+            self.step_timing.drafter_start()
+            self.step_timing.drafter_end()
 
         if self.num_speculative_steps > 0 and grammar_output is not None:
             # Diffusion also uses draft tokens without a speculator.

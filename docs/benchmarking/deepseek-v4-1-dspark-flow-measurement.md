@@ -50,9 +50,13 @@ git diff > "$RUN/source.patch"
 export VLLM_DEEPSEEK_V4_PHASE_PROFILE=1
 export VLLM_DEEPSEEK_V4_PHASE_PROFILE_PATH="$TRACE/phase-{pp_rank}-{pid}.jsonl"
 export VLLM_DEEPSEEK_V4_PHASE_PROFILE_CONTROL_PATH="$CONTROL"
-export VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS=dspark
+export VLLM_DEEPSEEK_V4_PHASE_PROFILE_FLOWS=dspark,decode
 export VLLM_DEEPSEEK_V4_PHASE_PROFILE_RECORD_FUNCTION=0
-export VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES='draft.propose_total,draft.stage.recv_wait,draft.stage.prepare_send,draft.stage.prepare,draft.stage.prepare_inputs,draft.context_kv,draft.stage.metadata,draft.stage.state_launch,draft.stage.state_wait,draft.stage.forward,draft.stage.send,draft.head.context_hidden,draft.head.send,draft.head.recv_wait,draft.head.result_copy,draft.markov_total'
+export VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES='draft.propose_total,draft.stage.recv_wait,draft.stage.prepare_send,draft.stage.prepare,draft.stage.prepare_inputs,draft.context_kv,draft.stage.metadata,draft.stage.state_launch,draft.stage.state_wait,draft.stage.forward,draft.stage.send,draft.head.context_hidden,draft.head.send,draft.head.recv_wait,draft.head.result_copy,draft.markov_total,target.model_graph_replay,target.model_forward,target.graph_input_staging,target.model_inputs,target.attn_metadata,target.pp_recv_wait,target.pp_recv_copy,target.sampling_total,target.logits,target.sample,target.rejection,target.rejection.verify,target.rejection.verify_total,target.rejection.counts'
+# Low-perturbation serving-time split of the same loop. Unlike the phase
+# profiler this needs no control file, so the normal requests in the same run
+# carry a budget that was not measured through a per-record device sync.
+export VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY=10
 ATTEMPTS=1 HOST_FREE_TARGET_GIB=145 \
   bash benchmarks/deepseek_v4_1/start_pp5_with_retry.sh "$RUN/server.log" \
   PORT_PORT=26662 PORT_MM_IMAGES=0 PORT_MAX_BATCHED=2048 PORT_MAX_SEQS=8 \
@@ -75,9 +79,31 @@ ATTEMPTS=1 HOST_FREE_TARGET_GIB=145 \
 control 不在启动或 graph capture 时创建；不用旧实验 `runtime_probe.py` 注入代码。
 客户端异常会关闭 control；若进程被 SIGKILL，手动 `unlink "$CONTROL"`。
 
+三轮基线同时带着 `VLLM_DEEPSEEK_V4_STEP_TIMING_EVERY` 的**低扰动预算**：它不依赖 control
+文件，每个 worker 每 N 步解析一对 CUDA event，在 server 日志里打印
+`step timing over N steps: target p50 ... draft p50 ... prep p50 (attn_meta, inputs),
+period p50 ... (other ...)`。**先读这三行再读 profile 表**：phase profiler 每条 scope
+都要 `torch.accelerator.synchronize()`，会把 PP 流水线串行化（实测 decode 从 81 掉到 52
+tok/s），只能用于归因，不能用于定预算。`prep` 是 `prepare_start→forward_start`，
+`period` 是相邻两步 `forward_start` 之差，`other = period - target - draft - prep`。
+PP1–PP3 的分布式 draft 参与现在计入 `draft`（此前记成零长度，被并进 `other`）；
+PP0 无 draft 角色，仍是零长度。
+
 需要独占请求窗口：engine counters 是实例总量，其他请求会污染差值。baseline 与 profile
 的接受统计或 token IDs 不一致时，脚本报错并保留 `request.json`，先排查而不报告速度收益。
 该比较验证测量没有改变本次输出，不代替 target-only/语义评测。
+
+离线合成整轮预算（两个 flow 必须都在 trace 里）：
+
+```bash
+.venv/bin/python -m benchmarks.deepseek_v4_1.dspark_round_timeline \
+  "$TRACE" --out-dir "$RUN/round"
+```
+
+以 head rank 的 target 前向为锚，把 `[head_forward(n), head_forward(n+1))` 一个窗口拆成
+head 前向、head 采样、draft 链、PP0–PP3 上游 target 跨度和残差，并给出相对 head 前向的
+中位时间线。上游四个 rank 不全的轮次仍计入阶段统计，但 `rounds_with_all_upstream` 会
+少一，跨度只是下界。
 
 profile 前必须保持 trace 目录无 JSONL。同实例再次采样可在 control 关闭、请求已结束后，
 将上一批 JSONL **移动到独立归档目录**，保持服务配置的 trace 路径不变，使用新 `--out-dir`。
@@ -92,21 +118,26 @@ profile 前必须保持 trace 目录无 JSONL。同实例再次采样可在 cont
 export VLLM_DEEPSEEK_V4_PHASE_PROFILE_STAGES=''
 ```
 
-空字符串表示所有已有 scope，仍只记录 `dspark` flow。可看到：
+空字符串表示所有已有 scope，只记录 `FLOWS` 里列出的 flow。可看到：
 
-| 环节 | 主要 scope |
-| --- | --- |
-| head context | `draft.head.context_hidden` 及现有子项 |
-| prepare | `draft.stage.prepare_inputs`、`draft.context_kv`、`draft.stage.metadata` |
-| context KV | `draft.context_kv.input_gemm`、`.norm`、`.insert` |
-| metadata | `target.attn_metadata.common`、`.builder.*`、`.swa.noncausal.*`、`.swa.direct_ragged` |
-| relay | `draft.stage.prepare_send`、`draft.stage.send`、`draft.head.send` 下的 `.launch`、`.metadata_wait`、`.tensor_wait` |
-| 状态接收 | `draft.stage.state_launch`、`draft.stage.state_wait` |
-| query / head | `draft.stage.forward`、`draft.head.result_copy`、`draft.markov_total` |
+| 环节 | flow | 主要 scope |
+| --- | --- | --- |
+| target 前向 | `decode` | `target.attn_metadata`、`target.model_inputs`、`target.graph_input_staging`、`target.model_graph_replay`（FULL）/`target.model_forward`（eager） |
+| PP 交接 | `decode` | `target.pp_recv_wait`、`target.pp_recv_copy` |
+| 拒绝采样 | `dspark` | `target.sampling_total`、`target.logits`、`target.sample`、`target.rejection.verify*`、`target.rejection.counts` |
+| head context | `dspark` | `draft.head.context_hidden` 及现有子项 |
+| prepare | `dspark` | `draft.stage.prepare_inputs`、`draft.context_kv`、`draft.stage.metadata` |
+| context KV | `dspark` | `draft.context_kv.input_gemm`、`.norm`、`.insert` |
+| metadata | `dspark` | `draft.stage.metadata` 下的 `target.attn_metadata.common`、`.builder.*`、`.swa.noncausal.*`、`.swa.direct_ragged` |
+| relay | `dspark` | `draft.stage.prepare_send`、`draft.stage.send`、`draft.head.send` 下的 `.launch`、`.metadata_wait`、`.tensor_wait` |
+| 状态接收 | `dspark` | `draft.stage.state_launch`、`draft.stage.state_wait` |
+| query / head | `dspark` | `draft.stage.forward`、`draft.head.result_copy`、`draft.markov_total` |
 
-`flow=dspark` 下的 `target.attn_metadata.*` 是 draft metadata。FULL graph 内部的算子
-不会因打开这些 scope 自动变成逐层计量：这里的 forward/Markov 是 graph 边界。
-需要图内 kernel 分析时另做针对性测量，不要为了表格完整改成 eager 后当作生产耗时。
+带 speculator 时 `sample()` 按 speculator 归类，所以拒绝采样落在 `dspark` 而不是
+`decode`；`decode` flow 只有 target 前向本身。`flow=dspark` 下的 `target.attn_metadata.*`
+是 draft metadata。FULL graph 内部的算子不会因打开这些 scope 自动变成逐层计量：
+这里的 forward/Markov 是 graph 边界。需要图内 kernel 分析时另做针对性测量，不要为了
+表格完整改成 eager 后当作生产耗时。
 
 ## 读表与停止规则
 
