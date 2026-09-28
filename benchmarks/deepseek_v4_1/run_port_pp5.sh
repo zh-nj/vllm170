@@ -84,11 +84,20 @@ PORT_EXTRA_ARGS=${PORT_EXTRA_ARGS:-}
 # once the whole budget is reserved, so this doubles as the lever for the
 # documented startup OOM flake.
 PORT_GPU_UTIL=${PORT_GPU_UTIL:-0.98}
-# Bounded decoder SWA replay (dsv41_fast_prefill): the layers from the tail
-# boundary on compute only the last min(chunk, window) rows of each prefill
-# chunk, plus every decode row. On by default for this PP5 launcher; set
-# PORT_FAST_PREFILL=0 for the unbounded prefill path.
-PORT_FAST_PREFILL=${PORT_FAST_PREFILL:-1}
+# Fast prefill has produced divergent output and incorrect EOS behavior on this
+# PP5 DSpark deployment. Reject it even if an older caller sets its launcher
+# switch; the additional-config path is checked below.
+PORT_FAST_PREFILL=${PORT_FAST_PREFILL:-0}
+if [[ "${PORT_FAST_PREFILL}" != "0" ]]; then
+    echo "PORT_FAST_PREFILL must be 0; fast prefill is disabled for this deployment." >&2
+    exit 2
+fi
+# CED is the validated prefill default. Set PORT_CED_PREFILL=0 for a baseline.
+PORT_CED_PREFILL=${PORT_CED_PREFILL:-1}
+if [[ "${PORT_CED_PREFILL}" != "0" && "${PORT_CED_PREFILL}" != "1" ]]; then
+    echo "PORT_CED_PREFILL must be 0 or 1." >&2
+    exit 2
+fi
 # Draft execution. 0 captures the rank-local draft step into FULL CUDA graphs:
 # each of the three stage ranks captures its share of the draft blocks, the head
 # rank captures the draft-state collapse plus the sequential Markov head. Only
@@ -103,16 +112,31 @@ else
     dspark_eager=true
 fi
 
-# Prefix caching defaults off independently of fast prefill. Set
-# PORT_PREFIX_CACHING=1 to enable it; fast prefill may remain enabled.
-PORT_PREFIX_CACHING=${PORT_PREFIX_CACHING:-0}
+# CED cache hits leave a full decoder replay suffix uncached.
+PORT_PREFIX_CACHING=${PORT_PREFIX_CACHING:-1}
+if [[ "${PORT_PREFIX_CACHING}" != "0" && "${PORT_PREFIX_CACHING}" != "1" ]]; then
+    echo "PORT_PREFIX_CACHING must be 0 or 1." >&2
+    exit 2
+fi
 pc_args=(--enable-prefix-caching)
 if [[ "${PORT_PREFIX_CACHING}" == "0" ]]; then
     pc_args=(--no-enable-prefix-caching)
 fi
 
-spec_config=$(printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"greedy","moe_backend":"%s","enforce_eager":%s,"enable_adaptive_verification":false,"dspark_pipeline_stage_ranks":[1,2,3]}' \
-    "${PORT_DSPARK_TOKENS}" "${PORT_MOE_BACKEND}" "${dspark_eager}")
+# PORT_DSPARK_QUERY_TOKENS sets the draft backbone's query block separately from
+# the number of proposed tokens (default: they are equal). The checkpoint was
+# trained with dspark_block_size 5, and raising PORT_DSPARK_TOKENS alone makes the
+# query block 6 (q=7) or 7 (q=8), which fails startup with an illegal memory
+# access during the draft graph replay. Setting this to a multiple of 5 (10)
+# starts cleanly, so exceeding the trained block needs it. See
+# docs/design/vllm170-dsv41f-verify-q1-q6-2026-09-28.md section 9.
+PORT_DSPARK_QUERY_TOKENS=${PORT_DSPARK_QUERY_TOKENS:-}
+dspark_query_arg=""
+if [[ -n "${PORT_DSPARK_QUERY_TOKENS}" ]]; then
+    dspark_query_arg=",\"dspark_num_query_tokens\":${PORT_DSPARK_QUERY_TOKENS}"
+fi
+spec_config=$(printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"greedy","moe_backend":"%s","enforce_eager":%s,"enable_adaptive_verification":false,"dspark_pipeline_stage_ranks":[1,2,3]%s}' \
+    "${PORT_DSPARK_TOKENS}" "${PORT_MOE_BACKEND}" "${dspark_eager}" "${dspark_query_arg}")
 
 # DSpark off means "no speculative config at all": passing num_speculative_tokens=0
 # still builds the draft stages and reserves their weights and KV on PP1-PP3.
@@ -181,15 +205,14 @@ fi
 # --additional-config here), so split it into the argv array used below.
 read -r -a extra_args <<< "${PORT_EXTRA_ARGS}"
 
-# Merge the fast-prefill switch into the caller's additional config rather than
-# replacing it, because the documented invocation also carries marlin_full_k
-# and the strict-kernel switches.
-if [[ "${PORT_FAST_PREFILL}" == "1" ]]; then
-    merged_extra_args=$("${REPO_ROOT}/.venv/bin/python" - "${extra_args[@]}" <<'PY'
+# Merge the CED default with caller config and reject fast prefill in either
+# --additional-config form.
+merged_extra_args=$("${REPO_ROOT}/.venv/bin/python" - "${PORT_CED_PREFILL}" "${extra_args[@]}" <<'PY'
 import json
 import sys
 
-words = sys.argv[1:]
+ced_enabled = sys.argv[1] == "1"
+words = sys.argv[2:]
 kept = []
 config = {}
 index = 0
@@ -197,19 +220,32 @@ while index < len(words):
     word = words[index]
     if word == "--additional-config":
         index += 1
+        if index == len(words):
+            raise SystemExit("--additional-config requires a JSON object")
         config = json.loads(words[index])
     elif word.startswith("--additional-config="):
         config = json.loads(word.split("=", 1)[1])
     else:
         kept.append(word)
     index += 1
-config["dsv41_fast_prefill"] = True
+if not isinstance(config, dict):
+    raise SystemExit("--additional-config must be a JSON object")
+if config.get("dsv41_fast_prefill"):
+    raise SystemExit("dsv41_fast_prefill is disabled for this deployment")
+config.pop("dsv41_fast_prefill", None)
+config["ced_prefill"] = ced_enabled
 kept += ["--additional-config", json.dumps(config, separators=(",", ":"))]
 print(" ".join(kept))
 PY
 )
-    read -r -a extra_args <<< "${merged_extra_args}"
-fi
+read -r -a extra_args <<< "${merged_extra_args}"
+
+for arg in "$@"; do
+    if [[ "${arg}" == "--additional-config" || "${arg}" == --additional-config=* ]]; then
+        echo "Pass --additional-config through PORT_EXTRA_ARGS so prefill switches can be checked." >&2
+        exit 2
+    fi
+done
 
 exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --served-model-name dsv41f-port \

@@ -3417,6 +3417,36 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
     assert len(computed_blocks.blocks[1]) == 0
 
 
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_prefix_hit_retains_and_recomputes_bounded_prefill_suffix(use_eagle):
+    """CED must retain a usable earlier SWA junction and recompute 128 rows."""
+    block_size = 32
+    config = make_kv_cache_config_hybrid_model(block_size, 100, 4)
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=use_eagle,
+    )
+    tokens = list(range(416))
+    cold = make_request("cold", tokens, block_size, sha256)
+    cold.num_prefix_cache_recompute_tokens = 128
+    assert manager.allocate_slots(cold, len(tokens)) is not None
+    manager.free(cold)
+
+    warm = make_request("warm", tokens, block_size, sha256)
+    warm.num_prefix_cache_recompute_tokens = 128
+    blocks, hit, _ = manager.get_computed_blocks(warm)
+    assert 0 < hit <= len(tokens) - 128
+    assert manager.allocate_slots(warm, len(tokens) - hit, hit, blocks) is not None
+
+    short = make_request("short", tokens[:100], block_size, sha256)
+    short.num_prefix_cache_recompute_tokens = 128
+    _, hit, _ = manager.get_computed_blocks(short)
+    assert hit == 0
+
+
 def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     """Verify MTP/EAGLE SWA retention keeps the extra proof block.
 

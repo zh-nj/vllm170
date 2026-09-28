@@ -14,16 +14,19 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
 @pytest.mark.parametrize("chunks", [[1024] * 32, [128, 2], [31, 31, 31, 31, 9], [17]])
-def test_ced_suffix_survives_chunk_boundaries_and_reused_input_buffers(chunks):
+@pytest.mark.parametrize("prefix_hit", [0, 512])
+def test_ced_suffix_survives_chunk_boundaries_and_reused_input_buffers(
+    chunks, prefix_hit
+):
     suffix = SuffixBuffer(128)
-    consumed = 0
+    consumed = prefix_hit
     for count in chunks:
         positions = torch.arange(consumed, consumed + count)
         saved = suffix.append("first", consumed, positions=positions)
         positions.zero_()
         consumed += count
         torch.testing.assert_close(
-            saved["positions"], torch.arange(max(0, consumed - 128), consumed)
+            saved["positions"], torch.arange(max(prefix_hit, consumed - 128), consumed)
         )
         assert saved["positions"].untyped_storage().nbytes() <= 128 * 8
     saved = suffix.append("second", 0, positions=torch.arange(3))
@@ -32,11 +35,17 @@ def test_ced_suffix_survives_chunk_boundaries_and_reused_input_buffers(chunks):
 
 def test_ced_suffix_rejects_missing_encoder_history():
     suffix = SuffixBuffer(128)
+    suffix.append("request", 512, positions=torch.arange(512, 640))
     with pytest.raises(ValueError, match="contiguous"):
-        suffix.append("request", 1024, positions=torch.arange(128))
+        suffix.append("request", 1024, positions=torch.arange(1024, 1152))
+    with pytest.raises(ValueError, match="contiguous"):
+        suffix.append("other", 640, positions=torch.arange(640, 768))
 
 
-def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
+@pytest.mark.parametrize("prefix_hit", [0, 512, 896, 1024])
+def test_ced_replay_limits_swa_without_shortening_global_context(
+    monkeypatch, prefix_hit
+):
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128))
     )
@@ -59,7 +68,10 @@ def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
         }
 
     monkeypatch.setattr("vllm.models.deepseek_v4_1.ced.build_attn_metadata", build)
-    for start, count in [(0, 1024), (1024, 2)]:
+    chunks = [(prefix_hit, 1024 - prefix_hit), (1024, 2)]
+    for start, count in chunks:
+        if count == 0:
+            continue
         positions = torch.arange(start, start + count)
         batch = SimpleNamespace(
             has_prefill=True,
@@ -74,8 +86,12 @@ def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
             seq_lens=torch.tensor([start + count]),
             seq_lens_cpu_upper_bound=torch.tensor([start + count]),
         )
+        if prefix_hit == 1024:
+            with pytest.raises(ValueError, match="full sliding-window suffix"):
+                state.prepare(batch, (), positions[None, :], [], None)
+            return
         step = state.prepare(batch, (), positions[None, :], [], None)
-        if not start:
+        if start == prefix_hit:
             assert not step.final and not captured
     assert len(captured) == 1
     assert captured[0]["num_tokens"] == 128
@@ -543,8 +559,9 @@ def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(monkeyp
 
 
 @pytest.mark.parametrize("final_chunk", [1, 2, 128])
+@pytest.mark.parametrize("prefix_hit", [0, 896])
 def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
-    monkeypatch, final_chunk
+    monkeypatch, final_chunk, prefix_hit
 ):
     """PP boundaries must carry the entire mHC suffix past short final chunks."""
     from vllm.models.deepseek_v4_1 import ced
@@ -639,8 +656,8 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
     states = [ced.CEDPrefill(128) for _ in models]
     unsplit, reference = model(16, 40, (37, 38, 39)), ced.CEDPrefill(128)
     original_metadata = context.attn_metadata
-    for start, count in [(0, 1024), (1024, final_chunk)]:
-        final = start > 0
+    for start, count in [(prefix_hit, 1024 - prefix_hit), (1024, final_chunk)]:
+        final = start == 1024
         positions = torch.arange(start, start + count)
         replay_positions = torch.arange(start + count - 128, start + count)
         replay_slots = torch.stack(
@@ -709,7 +726,7 @@ def test_ced_pp5_replay_matches_unsplit_decoder_and_keeps_full_kv(
                 torch.testing.assert_close(actual, expected)
         assert context.attn_metadata is original_metadata
     assert [s.decoder_tokens for s in states] == [128, 128, 128]
-    assert states[0].encoder_tokens == 1024 + final_chunk
+    assert states[0].encoder_tokens == 1024 + final_chunk - prefix_hit
     assert all(not state.suffixes for state in states)
 
     if final_chunk != 2:

@@ -203,6 +203,10 @@ class Request:
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
 
+        # Uncached suffix needed to rebuild model state after a prefix hit.
+        # Ordinary models only need the final token for logits.
+        self.num_prefix_cache_recompute_tokens = 1
+
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0

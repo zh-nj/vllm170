@@ -2580,6 +2580,21 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            extra = self.vllm_config.additional_config
+            text_config = self.vllm_config.model_config.hf_text_config
+            if (
+                isinstance(extra, dict)
+                and extra.get("ced_prefill")
+                and text_config.model_type in ("deepseek_v41", "deepseek_v41_text")
+            ):
+                # CED rebuilds decoder and draft SWA from encoder activations,
+                # which are not stored in the prefix cache.
+                request.num_prefix_cache_recompute_tokens = text_config.sliding_window
+                if (
+                    request.sampling_params is not None
+                    and request.sampling_params.prompt_logprobs is not None
+                ):
+                    request.skip_reading_prefix_cache = True
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)

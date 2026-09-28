@@ -38,8 +38,6 @@ def ced_prefill_enabled(config: VllmConfig) -> bool:
     parallel = config.parallel_config
     if parallel.tensor_parallel_size != 1 or parallel.use_ubatching:
         raise ValueError("CED prefill currently requires TP1 without microbatches")
-    if config.cache_config.enable_prefix_caching:
-        raise ValueError("CED prefill currently requires prefix caching disabled")
     if (
         config.speculative_config is not None
         and config.speculative_config.method != "dspark"
@@ -58,12 +56,14 @@ class SuffixBuffer:
         self.tensors: dict[str, torch.Tensor] = {}
 
     def append(self, request_id: str, start: int, **tensors) -> dict[str, torch.Tensor]:
-        if start == 0:
+        if self.request_id is None or start == 0:
             self.request_id = request_id
-            self.next_position = 0
+            self.next_position = start
             self.tensors = {}
         if request_id != self.request_id or start != self.next_position:
-            raise ValueError("CED prefill chunks must be contiguous from position zero")
+            raise ValueError(
+                "CED prefill chunks must be contiguous after the prefix hit"
+            )
         lengths = {value.shape[0] for value in tensors.values()}
         if len(lengths) != 1:
             raise ValueError("CED suffix tensors have different token counts")
@@ -155,6 +155,13 @@ class CEDMetadata:
             if use_ced:
                 buffer = self.suffixes.setdefault(request_id, SuffixBuffer(self.width))
                 values = buffer.append(request_id, start, **values)
+                if final and values["positions"].shape[0] < min(
+                    self.width, int(batch.prefill_len_np[index])
+                ):
+                    raise ValueError(
+                        "CED prefix hits must leave the full sliding-window suffix "
+                        "uncached for decoder replay"
+                    )
             if not use_ced or final:
                 request.replay_count = values["positions"].shape[0]
                 selected.append(index)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -120,6 +121,29 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v4"]
+)
+@pytest.mark.parametrize("ced_enabled", [False, True])
+@pytest.mark.parametrize("prompt_logprobs", [None, 0])
+def test_ced_prefix_cache_admission_preserves_replay_and_logprob_rows(
+    model_type, ced_enabled, prompt_logprobs
+):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.vllm_config.additional_config = {"ced_prefill": ced_enabled}
+    scheduler.vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type=model_type, sliding_window=128
+    )
+    request = create_requests(num_requests=1, prompt_logprobs=prompt_logprobs)[0]
+    request.skip_reading_prefix_cache = False
+    scheduler.add_request(request)
+    uses_ced = ced_enabled and model_type in ("deepseek_v41", "deepseek_v41_text")
+    assert request.num_prefix_cache_recompute_tokens == (128 if uses_ced else 1)
+    assert request.skip_reading_prefix_cache == (
+        uses_ced and prompt_logprobs is not None
+    )
 
 
 def test_finish_request():

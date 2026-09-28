@@ -148,9 +148,7 @@ def fresh_ids(base: str, rng: random.Random, n: int) -> list[int]:
     stable (uniformly sampled token ids are not: their near-flat logits flip
     the argmax on tiny shape-dependent rounding differences).
     """
-    text = " ".join(
-        WORDS[rng.randrange(len(WORDS))] for _ in range(n * 4 + 512)
-    )
+    text = " ".join(WORDS[rng.randrange(len(WORDS))] for _ in range(n * 4 + 512))
     with _post(f"{base}/tokenize", {"model": "", "prompt": text}) as resp:
         ids = json.loads(resp.read())["tokens"]
     if len(ids) < n:
@@ -189,6 +187,7 @@ def case(
     max_tokens: int,
     block_size: int,
     seed: int,
+    recompute_tokens: int = 1,
 ) -> dict:
     """One cold/warm pair on a prefix nothing earlier in this run has seen."""
     salt_a = f"gate-a-{name}-{seed}"
@@ -217,25 +216,25 @@ def case(
     first_diff = next(
         (
             i
-            for i, (a, b) in enumerate(
-                zip(cold["token_ids"], warm["token_ids"])
-            )
+            for i, (a, b) in enumerate(zip(cold["token_ids"], warm["token_ids"]))
             if a != b
         ),
         None,
     )
-    same = first_diff is None
+    same = cold["token_ids"] == warm["token_ids"] and all(
+        len(row["token_ids"]) == row["completion_tokens"] == max_tokens
+        for row in (cold, repeat, warm)
+    )
     tokens = cold["prompt_tokens"]
-    # A request never reuses its whole prompt: the last token has to be
-    # recomputed to obtain logits, so the hit is capped at num_tokens - 1 and
-    # then floored to the hit alignment (KVCacheManager.get_computed_blocks).
+    # CED needs the full replay suffix; ordinary prefill needs one logit row.
+    # The hit cap is then floored to the cache-hit alignment.
     #
     # Below that cap the exact hit depends on how much of the tail the sparse
     # retention policy kept, which is a property of the request's own length.
     # Assert the property that actually matters: the cache serves the aligned
     # prefix bar at most one block of it. Asserting the exact per-length value
     # would only mirror the implementation.
-    expected_max = ((tokens - 1) // block_size) * block_size
+    expected_max = (max(0, tokens - recompute_tokens) // block_size) * block_size
     expected = max(0, expected_max - block_size)
     row = {
         "case": name,
@@ -252,6 +251,7 @@ def case(
         "hit_fraction": hits / tokens if tokens else 0.0,
         "expected_hit_tokens": expected,
         "expected_hit_max": expected_max,
+        "recompute_tokens": recompute_tokens,
         "cold_runs_identical": cold_deterministic,
         "token_ids_identical": same,
         "first_divergence": first_diff,
@@ -282,6 +282,12 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=96)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument(
+        "--recompute-tokens",
+        type=int,
+        default=1,
+        help="Minimum uncached suffix: use 128 for DeepSeek V4.1 CED",
+    )
+    ap.add_argument(
         "--seed-base",
         type=int,
         default=None,
@@ -301,6 +307,8 @@ def main() -> None:
     )
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+    if args.recompute_tokens < 1:
+        ap.error("--recompute-tokens must be positive")
 
     base = f"http://{args.host}:{args.port}"
     if args.reset:
@@ -327,6 +335,7 @@ def main() -> None:
             args.max_tokens,
             args.block_size,
             seed,
+            args.recompute_tokens,
         ),
         # Longer than max_num_batched_tokens, so the cold request is prefilled
         # in chunks and the warm one must skip a chunk boundary mid-prefix.
@@ -338,6 +347,7 @@ def main() -> None:
             args.max_tokens,
             args.block_size,
             seed,
+            args.recompute_tokens,
         ),
         # Two requests sharing a prefix but diverging in the tail: reuse must
         # not depend on the whole prompt matching.
@@ -349,6 +359,7 @@ def main() -> None:
             args.max_tokens,
             args.block_size,
             seed,
+            args.recompute_tokens,
         ),
         # Exactly block-aligned plus a tail just above the short-tail band: the
         # warm request refills almost nothing and every other token it decodes
@@ -362,6 +373,7 @@ def main() -> None:
             args.max_tokens,
             args.block_size,
             seed,
+            args.recompute_tokens,
         ),
         # Regression case for the sparse-retention tail: a prompt ending 1..32
         # tokens past a block boundary used to reconcile to zero reuse, because
@@ -376,6 +388,7 @@ def main() -> None:
             args.max_tokens,
             args.block_size,
             seed,
+            args.recompute_tokens,
         ),
     ]
 
@@ -398,6 +411,10 @@ def main() -> None:
         "mean_warm_ttft_s": sum(r["warm_ttft_s"] for r in scored) / len(scored),
     }
     ok = True
+    mismatches = [r["case"] for r in rows if not r["token_ids_identical"]]
+    if mismatches:
+        print(f"FAIL: cold/warm token ids or completion lengths differ: {mismatches}")
+        ok = False
     if args.expect_hits:
         if any(r["warm_hits"] <= 0 for r in scored):
             print(
@@ -409,9 +426,7 @@ def main() -> None:
             print("FAIL: warm reuse outside the block-aligned prefix range")
             for r in scored:
                 if not (
-                    r["expected_hit_tokens"]
-                    <= r["warm_hits"]
-                    <= r["expected_hit_max"]
+                    r["expected_hit_tokens"] <= r["warm_hits"] <= r["expected_hit_max"]
                 ):
                     print(
                         f"  {r['case']}: hits={r['warm_hits']:.0f} not in "
