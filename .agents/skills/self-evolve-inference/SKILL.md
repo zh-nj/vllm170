@@ -77,5 +77,10 @@ command to read the result and checkpoint, explain the outcome, and update
 notes. The recovery prompt must not submit another experiment.
 
 Detailed JSON fields and the systemd installation procedure are in
-[references/supervisor.md](references/supervisor.md). Read that reference when
-creating releases, changing the supervisor, or diagnosing recovery.
+[references/supervisor.md](references/supervisor.md). The Chinese operations
+guide [references/operations.zh.md](references/operations.zh.md) maps the
+repository files, external installation/state trees, note schemas, pinned CLI
+usage, and production boundaries. For first adoption and fallback, also read
+[references/production.zh.md](references/production.zh.md). Read the relevant
+reference when creating releases, changing the supervisor, or diagnosing
+recovery.

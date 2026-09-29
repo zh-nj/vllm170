@@ -798,7 +798,8 @@ class Controller:
                 f"{self.root / 'notes/current.md'}。"
                 "本次仅解释结果，不提交新实验，不修改推理服务。"
                 "只更新 current.md 和 trajectory.md，保留历史。"
-                "这是 CPU 故障注入验收时不得声称已验证 GPU 服务。"
+                "按结果文件区分 CPU 故障注入和真实 GPU 服务验证，"
+                "不得把启动或探活成功解释成性能提升。"
                 "不要查找历史会话或其他项目文件，完成后立即给出简短中文结论。"
             )
             argv = [arg.replace("{prompt}", prompt) for arg in resume["argv"]]

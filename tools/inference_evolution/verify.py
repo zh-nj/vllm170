@@ -14,7 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from controller import Store, atomic, read
+from controller import Controller, Store, atomic, read
 
 
 def wait_for(predicate, timeout=60):
@@ -72,10 +72,82 @@ def experiment(name, candidate, baseline="good", observation=0):
     }
 
 
+def verify_adoption(root, fail=False):
+    from adopt import prepare as prepare_adoption
+    from adopt import run as run_adoption
+
+    store = Store(root)
+    installation = read(root / "installation.json")
+    unit = installation["unit"]
+    if read(root / "state.json")["stable"] or (root / "adoption.json").exists():
+        raise ValueError("Adoption verification requires a fresh instance")
+    subprocess.run(["systemctl", "--user", "stop", unit], check=True)
+    atomic(
+        root / "config.json",
+        {
+            "poll_seconds": 0.1,
+            "probe_timeout": 0.5,
+            "failure_threshold": 3,
+            "stable_restarts": 1,
+        },
+    )
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    original = subprocess.Popen(
+        [
+            installation["python"],
+            str(Path(__file__).parent / "tests/fake_server.py"),
+            "--port",
+            str(port),
+            "--mode",
+            "good",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    controller = Controller(root)
+    try:
+        prepare(
+            store,
+            installation["python"],
+            port,
+            "capsule",
+            mode="fail" if fail else "good",
+        )
+        controller.seal("capsule")
+        wait_for(lambda: controller.probe("capsule"))
+        prepare_adoption(controller, "capsule", original.pid)
+        run_adoption(controller, observation=0.5)
+        journal = read(root / "adoption.json")
+        assert journal["stage"] == ("fallback_running" if fail else "adopted"), journal
+        assert controller.probe("capsule")
+        assert original.poll() is not None
+        state = read(root / "state.json")
+        assert state["stable"] == (None if fail else "capsule")
+        report = {
+            "scope": "CPU adoption only",
+            "stage": journal["stage"],
+            "passed": True,
+        }
+        atomic(root / "verification.json", report)
+        print(json.dumps(report))
+    finally:
+        subprocess.run(["systemctl", "--user", "stop", unit], check=True)
+        controller.backend.stop("server")
+        if original.poll() is None:
+            original.terminate()
+        original.wait(timeout=10)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--adoption", choices=("success", "failure"))
     args = parser.parse_args()
+    if args.adoption:
+        verify_adoption(args.root, fail=args.adoption == "failure")
+        return
     store = Store(args.root)
     root = store.root
     installation = read(root / "installation.json")

@@ -42,16 +42,24 @@ def main():
         subprocess.run(
             ["uv", "venv", "--python", "3.12", str(prefix / ".venv")], check=True
         )
-    files = [
-        source / name for name in ("controller.py", "dsh_bridge.py", "dsh.patch.yml")
+    runtime_files = [
+        source / name
+        for name in (
+            "controller.py",
+            "dsh_bridge.py",
+            "dsh.patch.yml",
+            "adopt.py",
+            "snapshot.py",
+            "smoke.py",
+        )
     ]
     skill = repo / ".agents/skills/self-evolve-inference"
-    files += sorted(p for p in skill.rglob("*") if p.is_file())
+    files = runtime_files + sorted(p for p in skill.rglob("*") if p.is_file())
     version = hashlib.sha256(b"".join(p.read_bytes() for p in files)).hexdigest()[:16]
     package = prefix / "versions" / version
     if not package.exists():
         package.mkdir(parents=True)
-        for file in files[:3]:
+        for file in runtime_files:
             shutil.copy2(file, package / file.name)
         shutil.copytree(skill, package / "skills/self-evolve-inference")
     config = {

@@ -124,6 +124,100 @@ def test_failed_candidate_restores_sealed_baseline(setup):
     assert backend.running("server")
 
 
+@pytest.fixture
+def adoption(monkeypatch):
+    monkeypatch.setitem(sys.modules, "controller", evolution)
+    spec = importlib.util.spec_from_file_location(
+        "adoption", SOURCE.with_name("adopt.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_adoption_failure_restores_original_without_marking_it_sealed(
+    setup, adoption, monkeypatch, interrupted
+):
+    store, controller, backend = setup
+    release(store, "capsule", fail=True)
+    controller.seal("capsule")
+    evolution.atomic(store.root / "installation.json", {"unit": "fixture.service"})
+    evolution.atomic(
+        store.root / "adoption.json",
+        {
+            "stage": "starting_capsule" if interrupted else "prepared",
+            "release": "capsule",
+            "processes": [{"pid": 1}],
+            "original": {
+                "argv": ["/bin/true", "original"],
+                "cwd": str(store.root),
+                "env": {},
+            },
+        },
+    )
+    monkeypatch.setattr(adoption, "same_process", lambda item: True)
+    monkeypatch.setattr(adoption, "tree", lambda pid: [{"pid": pid}])
+    stopped = []
+    monkeypatch.setattr(adoption, "stop_original", stopped.append)
+    monkeypatch.setattr(adoption.subprocess, "run", lambda *a, **kw: None)
+    adoption.run(controller, observation=0)
+    assert stopped
+    assert backend.starts[-1] == ("server", ["/bin/true", "original"])
+    assert backend.running("server")
+    assert controller.state["stable"] is None
+    assert controller.state["phase"] == "blocked"
+    assert evolution.read(store.root / "adoption.json")["stage"] == "fallback_running"
+
+
+def test_adoption_commits_only_after_generation_and_checks(
+    setup, adoption, monkeypatch
+):
+    store, controller, backend = setup
+    release(store, "capsule")
+    controller.seal("capsule")
+    evolution.atomic(store.root / "installation.json", {"unit": "fixture.service"})
+    evolution.atomic(
+        store.root / "adoption.json",
+        {
+            "stage": "prepared",
+            "release": "capsule",
+            "processes": [{"pid": 1}],
+        },
+    )
+    monkeypatch.setattr(adoption, "same_process", lambda item: True)
+    monkeypatch.setattr(adoption, "tree", lambda pid: [{"pid": pid}])
+    monkeypatch.setattr(adoption, "stop_original", lambda items: None)
+    monkeypatch.setattr(adoption.subprocess, "run", lambda *a, **kw: None)
+    adoption.run(controller, observation=0)
+    assert controller.state["stable"] == controller.state["current"] == "capsule"
+    assert controller.state["phase"] == "idle"
+    assert any(slot == "job" for slot, _ in backend.starts)
+    assert evolution.read(store.root / "adoption.json")["stage"] == "adopted"
+
+
+def test_adoption_never_signals_reused_pid(adoption, monkeypatch):
+    old = {"pid": 1, "start": "10", "boot": "boot"}
+    monkeypatch.setattr(adoption, "identity", lambda pid: dict(old, start="11"))
+    monkeypatch.setattr(adoption, "pidfd_open", lambda pid: pytest.fail("PID reused"))
+    adoption.send(old, 15)
+
+
+def test_adoption_stops_only_captured_cpu_process(adoption):
+    target = subprocess.Popen(["/bin/sleep", "30"])
+    unrelated = subprocess.Popen(["/bin/sleep", "30"])
+    try:
+        items = adoption.tree(target.pid)
+        adoption.stop_original(items, timeout=2)
+        assert target.wait(timeout=2) == -15
+        assert unrelated.poll() is None
+    finally:
+        for process in (target, unrelated):
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+
 def test_build_failure_does_not_stop_working_service(setup):
     store, controller, backend = setup
     baseline(store, controller)
