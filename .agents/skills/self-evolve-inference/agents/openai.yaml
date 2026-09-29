@@ -1,0 +1,7 @@
+interface:
+  display_name: "Self evolve inference"
+  short_description: "Safely evolve a local inference service"
+  default_prompt: "Use $self-evolve-inference to run one bounded local inference optimization experiment."
+
+policy:
+  allow_implicit_invocation: true
