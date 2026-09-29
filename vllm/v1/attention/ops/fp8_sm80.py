@@ -163,6 +163,33 @@ def _decode_fp8_f32(u, USE_FNUZ: tl.constexpr):
         return _e4m3fn_to_f32_alu(u)
 
 
+_SCALED_E4M3FN_BF16_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def get_scaled_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
+    """65536-entry ``(ue8m0 scale, e4m3 byte) -> bf16`` decode table.
+
+    Indexed by ``byte | scale << 8``, each entry holds the bf16 bits of
+    ``e4m3(byte) * 2 ** (scale - 127)``, i.e. exactly what decoding a packed KV
+    row and applying its block scale produces. Baking the scale into the table
+    turns the per-element dequant into one gather with no exponent arithmetic.
+    """
+    lut = _SCALED_E4M3FN_BF16_LUT_CACHE.get(device)
+    if lut is None:
+        byte = torch.arange(256, dtype=torch.int32)
+        fp8 = byte.to(torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+        exponent = torch.exp2(torch.arange(256, dtype=torch.float32) - 127.0)
+        lut = (
+            (exponent[:, None] * fp8[None, :])
+            .to(torch.bfloat16)
+            .view(torch.int16)
+            .contiguous()
+            .to(device)
+        )
+        _SCALED_E4M3FN_BF16_LUT_CACHE[device] = lut
+    return lut
+
+
 @triton.jit
 def _decode_fp8_lut(u, USE_FNUZ: tl.constexpr, lut_ptr):
     """FNUZ-aware byte decode; pre-SM89 CUDA reads ``lut_ptr``.

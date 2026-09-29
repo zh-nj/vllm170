@@ -90,7 +90,10 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import (
+    PREFILL_WORKSPACE_LANE,
+    init_workspace_manager,
+)
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -100,12 +103,17 @@ logger = init_logger(__name__)
 
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
-    spec_config = vllm_config.speculative_config
-    return (
-        2
-        if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
-        else 1
-    )
+    """Workspace owners a model may select: target, draft, eager prefill.
+
+    ``PREFILL_WORKSPACE_LANE`` holds eager-only work whose buffer grows with the
+    batch (the DSV4 sparse-MLA prefill gather). It needs its own owner because
+    growing a lane reallocates that lane's buffer, while the target/draft lanes
+    are the ones captured CUDA graphs point into. Slots are allocated lazily, so
+    declaring the lane costs nothing for a model that never selects it — which is
+    why the count does not depend on the runner: the model selects lanes, not the
+    runner, and a missing lane raises at selection time.
+    """
+    return PREFILL_WORKSPACE_LANE + 1
 
 
 def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:

@@ -3,11 +3,12 @@
 
 import inspect
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import accumulate
 from math import prod
+from typing import TypeVar, cast
 
 import torch
 
@@ -25,11 +26,21 @@ def _compute_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 
 # Constants
 _MB = 1024**2
+T = TypeVar("T")
+
 _GiB = 1024**3
 
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+
+# Independent workspace owner for eager-only work whose buffer grows with the
+# batch it serves. Growth reallocates the owner's buffer, so it must not be a
+# lane an already-captured CUDA graph points into: a graph records the raw
+# address, holds no reference to the tensor, and would keep writing the old
+# allocation after the manager released it. Lanes 0 and 1 (target and DSpark
+# draft) do get captured, so the DSV4 sparse-MLA prefill gather runs here.
+PREFILL_WORKSPACE_LANE = 2
 
 
 @contextmanager
@@ -66,7 +77,12 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [None] * (
             self._num_ubatches * self._num_lanes
         )
-        self._locked: bool = False
+        # Fixed-shape resources keyed by owner and name, created once per slot.
+        self._persistent_resources: list[dict[Hashable, object]] = [
+            {} for _ in range(self._num_ubatches * self._num_lanes)
+        ]
+        # Lanes whose growth is forbidden; empty means every lane may grow.
+        self._locked_lanes: set[int] = set()
 
     @staticmethod
     def _workspace_size_bytes(workspace: torch.Tensor | None) -> int:
@@ -75,16 +91,23 @@ class WorkspaceManager:
             return 0
         return workspace.numel() * workspace.element_size()
 
-    def lock(self) -> None:
+    def lock(self, lanes: Iterable[int] | None = None) -> None:
         """Lock the workspace to prevent further growth.
 
         After locking, any attempt to allocate a larger workspace will raise
         an assertion error. This ensures workspace size is fixed during execution.
+        ``lanes`` restricts the lock to owners whose sizing really is a contract
+        (a captured CUDA graph's lane, or an admission-controlled lane whose
+        capacity was reserved at warmup); ``None`` locks every lane.
         """
-        self._locked = True
+        if lanes is None:
+            self._locked_lanes = set(range(self._num_lanes))
+        else:
+            self._locked_lanes.update(lanes)
         if envs.VLLM_DEBUG_WORKSPACE:
             logger.info(
-                "[WORKSPACE DEBUG] Workspace locked. Current sizes: %s",
+                "[WORKSPACE DEBUG] Workspace locked for lanes %s. Current sizes: %s",
+                sorted(self._locked_lanes),
                 [
                     self._workspace_size_bytes(ws) / _MB
                     for ws in self._current_workspaces
@@ -92,16 +115,20 @@ class WorkspaceManager:
                 ],
             )
 
-    def unlock(self) -> None:
+    def unlock(self, lanes: Iterable[int] | None = None) -> None:
         """Unlock the workspace to allow growth.
 
         This is used during elastic EP scaling when the workspace size
         needs to grow due to changes in the number of experts.
         """
-        self._locked = False
+        if lanes is None:
+            self._locked_lanes.clear()
+        else:
+            self._locked_lanes.difference_update(lanes)
         if envs.VLLM_DEBUG_WORKSPACE:
             logger.info(
-                "[WORKSPACE DEBUG] Workspace unlocked. Current sizes: %s",
+                "[WORKSPACE DEBUG] Workspace unlocked for lanes %s. Current sizes: %s",
+                "all" if lanes is None else sorted(lanes),
                 [
                     self._workspace_size_bytes(ws) / _MB
                     for ws in self._current_workspaces
@@ -109,9 +136,67 @@ class WorkspaceManager:
                 ],
             )
 
-    def is_locked(self) -> bool:
-        """Check if workspace is locked."""
-        return self._locked
+    def is_locked(self, lane: int | None = None) -> bool:
+        """Whether growth is forbidden for ``lane`` (or for any lane)."""
+        if lane is None:
+            return bool(self._locked_lanes)
+        return lane in self._locked_lanes
+
+    def _get_workspace_id(self) -> int:
+        """Slot index of the current ``(ubatch, lane)`` owner."""
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        return dbo_current_ubatch_id() * self._num_lanes + lane
+
+    def get_persistent_resource(self, key: Hashable, factory: Callable[[], T]) -> T:
+        """Return the resource cached for ``key`` in the current ubatch and lane.
+
+        The first request calls ``factory`` and stores its result for the lifetime
+        of this manager. Later requests return the same object without calling the
+        factory again. Each ubatch/lane pair has a separate cache. Once the
+        manager is locked, requesting a key missing from that cache raises an
+        AssertionError.
+
+        Keys must identify the resource type and configuration. Callers must not
+        resize or replace tensor storage held by a cached resource. Uses of the
+        same resource must not overlap; include the CUDA stream in the key when
+        streams can execute concurrently.
+        """
+        lane = _workspace_lane.get()
+        resources = self._persistent_resources[self._get_workspace_id()]
+        if key not in resources:
+            if lane in self._locked_lanes:
+                raise AssertionError(
+                    f"Workspace is locked but {key!r} was not allocated during "
+                    "warmup for the current ubatch and lane."
+                )
+            resources[key] = factory()
+        return cast(T, resources[key])
+
+    def get_persistent(
+        self,
+        key: Hashable,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        zero_init: bool = False,
+    ) -> torch.Tensor:
+        """Get a fixed-shape tensor, optionally zeroed on first allocation only."""
+        factory = torch.zeros if zero_init else torch.empty
+        workspace = self.get_persistent_resource(
+            (torch.Tensor, key),
+            lambda: factory(shape, dtype=dtype, device=self._device),
+        )
+        if workspace.shape != shape or workspace.dtype != dtype:
+            raise ValueError(
+                f"Persistent workspace {key!r} has shape={workspace.shape}, "
+                f"dtype={workspace.dtype}; requested shape={shape}, dtype={dtype}."
+            )
+        return workspace
 
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
@@ -184,7 +269,7 @@ class WorkspaceManager:
                     )
                 return "unknown"
 
-            if self._locked:
+            if lane in self._locked_lanes:
                 raise AssertionError(
                     f"Workspace is locked but allocation from '{get_caller_info()}' "
                     f"requires {required_bytes / _MB:.2f} MB, current size is "
@@ -271,7 +356,7 @@ def init_workspace_manager(
     _manager = WorkspaceManager(device, num_ubatches, num_lanes)
 
 
-def lock_workspace() -> None:
+def lock_workspace(lanes: Iterable[int] | None = None) -> None:
     """Lock the workspace to prevent further growth.
 
     After calling this function, any attempt to allocate a workspace larger
@@ -290,10 +375,10 @@ def lock_workspace() -> None:
 
         # Now all get_workspace calls must fit in pre-allocated size
     """
-    current_workspace_manager().lock()
+    current_workspace_manager().lock(lanes)
 
 
-def unlock_workspace() -> None:
+def unlock_workspace(lanes: Iterable[int] | None = None) -> None:
     """Unlock the workspace to allow growth.
 
     This is used during elastic EP scaling when the workspace size
@@ -301,7 +386,7 @@ def unlock_workspace() -> None:
     After scaling operations complete, lock_workspace() should be
     called again to prevent unexpected allocations.
     """
-    current_workspace_manager().unlock()
+    current_workspace_manager().unlock(lanes)
 
 
 def reset_workspace_manager() -> None:

@@ -5,6 +5,11 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    SPARSE_DIRECT_KV_REQ_STRIDE,
+    SPARSE_DIRECT_KV_SWA_TAG_BASE,
+    SPARSE_DIRECT_KV_TAG_BASE,
+)
 
 
 @triton.jit
@@ -19,6 +24,10 @@ def _combine_kernel(
     row_stride,
     M,
     N,
+    direct_tag_base,
+    direct_req_stride,
+    direct_swa_tag_base,
+    DIRECT_KV: tl.constexpr,
     NUM_REQS: tl.constexpr,
     BLOCK_REQS: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -55,9 +64,38 @@ def _combine_kernel(
         mask=columns < topk_len,
         other=-1,
     ).to(tl.int32)
-    base = M.to(tl.int64) * request
-    topk = tl.where((topk >= 0) & (topk < N), topk + base, -1)
-    swa = base + N + columns - topk_len + position - swa_len + 1 - seq_len + gather_len
+    if DIRECT_KV:
+        # Compressed positions are tagged for the attention kernel, which reads
+        # them from the paged cache itself; the sliding window stays 0-based in
+        # the gathered buffer, which is now the only gathered region.
+        topk = tl.where(
+            (topk >= 0) & (topk < N),
+            topk + direct_tag_base + request * direct_req_stride,
+            -1,
+        )
+        swa = (
+            direct_swa_tag_base
+            + request * direct_req_stride
+            + columns
+            - topk_len
+            + position
+            - swa_len
+            + 1
+        )
+    else:
+        base = M.to(tl.int64) * request
+        topk = tl.where((topk >= 0) & (topk < N), topk + base, -1)
+        swa = (
+            base
+            + N
+            + columns
+            - topk_len
+            + position
+            - swa_len
+            + 1
+            - seq_len
+            + gather_len
+        )
     value = tl.where(
         columns < topk_len,
         topk,
@@ -81,8 +119,15 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    direct_kv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct the dense top-k/SWA rows, including padding, in one launch."""
+    """Construct the dense top-k/SWA rows, including padding, in one launch.
+
+    ``direct_kv`` tags the compressed entries with ``tag_base + request *
+    req_stride + position`` so the attention kernel can read them from the paged
+    cache instead of a gathered buffer; only the sliding window is gathered then,
+    which is what keeps the workspace from growing with the context length.
+    """
     num_tokens = topk_indices.shape[0]
     combined_width = triton.cdiv(topk + window_size, 128) * 128
     indices = torch.empty(
@@ -106,6 +151,10 @@ def combine_topk_swa_indices(
         combined_width,
         M,
         N,
+        SPARSE_DIRECT_KV_TAG_BASE,
+        SPARSE_DIRECT_KV_REQ_STRIDE,
+        SPARSE_DIRECT_KV_SWA_TAG_BASE,
+        DIRECT_KV=direct_kv,
         NUM_REQS=num_reqs,
         BLOCK_REQS=triton.next_power_of_2(num_reqs),
         TOP_K=logical_topk,

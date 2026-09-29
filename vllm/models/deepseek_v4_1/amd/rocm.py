@@ -29,6 +29,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.rocm import _ON_GFX950
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
@@ -37,14 +38,126 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    SPARSE_DIRECT_KV_REQ_STRIDE,
+    SPARSE_DIRECT_KV_SWA_TAG_BASE,
+    SPARSE_DIRECT_KV_TAG_BASE,
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_reduce_partials,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    PREFILL_WORKSPACE_LANE,
+    current_workspace_manager,
+    use_workspace_lane,
+)
 
 logger = init_logger(__name__)
+
+# Prefill workspace admission counters, per worker process: how often a step was
+# sent to the direct paged-cache reader and how often a batch was chunked down to
+# fit the fixed capacity. Logged on the first occurrence and then periodically so
+# an operator can see the workspace contract being exercised.
+_ADMISSION_COUNTS = {"direct": 0, "chunked": 0}
+_ADMISSION_LOG_EVERY = 64
+
+# The prefill gather asks for its worst case one scheduler chunk at a time, so a
+# long prompt grows the lane's buffer once per chunk (each growth reallocates and
+# empties the allocator cache). Rounding the gathered width up to this many
+# columns turns that into one growth per few chunks -- a 262144-token prefill
+# went from 262 growths to 33 -- at the cost of at most this many columns of
+# slack per row (512 * 2 bytes each). M is both the tensor width and the row
+# stride the combined indices use, so the rounded value must be the one passed
+# to both.
+_PREFILL_WORKSPACE_COLUMN_STEP = 8192
+
+
+def _prefill_gather_width(
+    context_rows: int, window_size: int, max_num_batched_tokens: int
+) -> int:
+    """Rounded workspace width for one prefill gather row."""
+    return round_up(
+        context_rows + window_size + max_num_batched_tokens,
+        _PREFILL_WORKSPACE_COLUMN_STEP,
+    )
+
+
+def _prefill_split_k_partials(
+    manager, capacity: int, num_passes: int, n_heads: int, comb_dim: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fixed-shape ``(m, l, acc)`` partials for split-K prefill.
+
+    Both the warmup and the serving path go through here, so a lane locked after
+    capture can never meet a key the warmup did not create. The buffers are sized
+    for the whole chunk budget once and sliced per chunk by the caller; they are
+    keyed per ``(ubatch, lane)`` and are not lane offsets, so they cannot overlap
+    the gathered rows.
+    """
+    shape = (capacity, num_passes, n_heads)
+    return (
+        manager.get_persistent("dsv41_split_k_m", shape, torch.float32),
+        manager.get_persistent("dsv41_split_k_l", shape, torch.float32),
+        manager.get_persistent("dsv41_split_k_acc", (*shape, comb_dim), torch.float32),
+    )
+
+
+def _prefill_gather_budget_bytes(
+    budget_tokens: int,
+    compress_ratio: int,
+    window_size: int,
+    max_num_batched_tokens: int,
+    head_dim: int,
+    element_bytes: int,
+) -> int:
+    """Bytes one gather row may occupy under a token-denominated budget.
+
+    The knob counts context tokens while a gather row holds *compressed* rows, so
+    the same division the warmup reservation applies has to be applied here; a
+    compressed layer would otherwise be admitted to a row wider than it reserved.
+    """
+    if budget_tokens <= 0:
+        return 0
+    context_rows = budget_tokens // max(1, compress_ratio)
+    return (
+        _prefill_gather_width(context_rows, window_size, max_num_batched_tokens)
+        * head_dim
+        * element_bytes
+    )
+
+
+def _prefill_gather_plan(
+    context_rows: int,
+    num_prefills: int,
+    window_size: int,
+    max_num_batched_tokens: int,
+    head_dim: int,
+    element_bytes: int,
+    budget_bytes: int,
+    max_rows: int,
+) -> tuple[int, bool]:
+    """Rows one prefill chunk may gather, and whether the gather is admitted.
+
+    A fixed budget turns the gather workspace into an admission-controlled
+    resource instead of a growable one: a batch whose context does not fit a
+    single row is served by the direct paged-cache reader, and a batch that fits
+    fewer than ``max_rows`` rows is split into correspondingly more chunks.
+    ``budget_bytes <= 0`` keeps the unbounded behaviour (grow on demand).
+
+    Returns:
+        ``(rows, admit_direct)``. ``rows`` is at least 1 and at most ``max_rows``.
+    """
+    if budget_bytes <= 0:
+        return min(max_rows, max(1, num_prefills)), False
+    row_bytes = (
+        _prefill_gather_width(context_rows, window_size, max_num_batched_tokens)
+        * head_dim
+        * element_bytes
+    )
+    if row_bytes > budget_bytes:
+        return 1, True
+    fits = max(1, budget_bytes // row_bytes)
+    return max(1, min(max_rows, max(1, num_prefills), fits)), False
 
 
 _SHAPE_PROBE_TRIGGER = "/tmp/dsv41_fastprefill_shapes_on"
@@ -226,6 +339,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    direct_kv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine compressed-attention and sliding-window indices with Torch.
 
@@ -273,9 +387,22 @@ def combine_topk_swa_indices(
     topk_mask = topk_offsets[None, :] < topk_lens[:, None]
     topk_values = topk_indices[:, :logical_topk_width].to(torch.int32)
     topk_valid = topk_mask & (topk_values >= 0) & (topk_values < N)
+    if direct_kv:
+        # Tagged compressed positions: the attention kernel rebuilds (request,
+        # compressed position) from the tag and reads the paged cache itself, so
+        # nothing has to be gathered for them and the sliding window turns into
+        # the only region of the workspace. That is what keeps the workspace from
+        # growing with the context length.
+        compressed_values = (
+            topk_values
+            + SPARSE_DIRECT_KV_TAG_BASE
+            + req_ids[:, None] * SPARSE_DIRECT_KV_REQ_STRIDE
+        )
+    else:
+        compressed_values = topk_values + (M * req_ids).to(torch.int32)[:, None]
     combined_indices[:, :logical_topk_width] = torch.where(
         topk_valid,
-        topk_values + (M * req_ids).to(torch.int32)[:, None],
+        compressed_values.to(torch.int32),
         -1,
     )
 
@@ -286,15 +413,28 @@ def combine_topk_swa_indices(
     swa_mask = swa_offsets[None, :] < swa_lens[:, None]
     swa_columns = topk_lens[:, None] + swa_offsets[None, :]
     gather_starts = seq_lens - gather_lens
-    swa_values = (
-        M * req_ids[:, None]
-        + N
-        + swa_offsets[None, :]
-        + positions[:, None]
-        - swa_lens[:, None]
-        + 1
-        - gather_starts[req_ids, None]
-    ).to(torch.int32)
+    if direct_kv:
+        # Sliding-window entries carry their logical token position in the SWA
+        # cache, so the kernel can address that cache directly too: neither source
+        # is gathered, and the workspace stops depending on the context length.
+        swa_values = (
+            SPARSE_DIRECT_KV_SWA_TAG_BASE
+            + req_ids[:, None] * SPARSE_DIRECT_KV_REQ_STRIDE
+            + swa_offsets[None, :]
+            + positions[:, None]
+            - swa_lens[:, None]
+            + 1
+        ).to(torch.int32)
+    else:
+        swa_values = (
+            M * req_ids[:, None]
+            + N
+            + swa_offsets[None, :]
+            + positions[:, None]
+            - swa_lens[:, None]
+            + 1
+            - gather_starts[req_ids, None]
+        ).to(torch.int32)
     rows = torch.arange(num_tokens, device=seq_lens.device)[:, None].expand_as(
         swa_columns
     )
@@ -625,6 +765,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         # so retain the ordinary MXFP8 linear kernel for post-load processing
         # instead of asking for the CUDA-only BMM kernel.
         self.wo_a.is_bmm = False
+        self._direct_kv_logged = False
         self._has_kv_transfer = vllm_config.kv_transfer_config is not None
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
@@ -810,20 +951,51 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             # gather workspace _forward_prefill would; the dequantize / topk
             # / sparse_fwd kernels are skipped this step.
             swa_only = self.compress_ratio == 0
+            # The reservation *is* the capacity admission control enforces, so the
+            # profiler accounts for exactly what serving may ever gather.
+            reserved = self._prefill_workspace_tokens()
             if swa_only:
                 N = 0
+            elif reserved > 0:
+                N = min(reserved, self.max_model_len) // max(1, self.compress_ratio)
             else:
-                # A dummy run has no batch, so this reservation only feeds the
-                # memory profiler; _forward_prefill sizes the buffer from the
-                # real batch and grows it if a longer prompt arrives.
-                reserved = envs.VLLM_DSV41_PREFILL_WORKSPACE_TOKENS
-                if reserved <= 0 or reserved > self.max_model_len:
-                    reserved = self.max_model_len
-                N = reserved // max(1, self.compress_ratio)
-            M = N + self.window_size + self.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+                N = (
+                    self.max_model_len + self.compress_ratio - 1
+                ) // self.compress_ratio
+            M = _prefill_gather_width(N, self.window_size, self.max_num_batched_tokens)
+            # One row, not the per-chunk cap: a single long prompt is the shape
+            # this reservation is for, and a prefill batch that needs more rows
+            # grows the lane later. Growth is safe here because the lane is
+            # reserved for eager-only work (see PREFILL_WORKSPACE_LANE); the
+            # cost is that the memory profiler sees one row's worth of this
+            # buffer, so KV sizing that relies on the profiler should leave the
+            # rest of the cap as headroom (or pin KV bytes, as this deployment
+            # does).
+            with use_workspace_lane(PREFILL_WORKSPACE_LANE):
+                workspace_manager = current_workspace_manager()
+                workspace_manager.get_simultaneous(
+                    ((1, M, q.shape[-1]), torch.bfloat16),
+                )
+                # Admission control can switch any prefill over to the direct
+                # reader, so its stub belongs to the warmup set: a lock taken
+                # after capture must not meet a key warmup never created.
+                workspace_manager.get_persistent(
+                    "dsv41_direct_kv_stub",
+                    (1, 1, q.shape[-1]),
+                    torch.bfloat16,
+                    zero_init=True,
+                )
+                if envs.VLLM_DSV41_PREFILL_SPLIT_K and not swa_only:
+                    # Split-K partials are created here, not on the first real
+                    # request: the lane may be locked after capture, and its
+                    # capacity reservation must account for them.
+                    _prefill_split_k_partials(
+                        workspace_manager,
+                        max(1, self.max_num_batched_tokens),
+                        2,
+                        self.n_heads,
+                        self.nope_head_dim + self.rope_head_dim,
+                    )
             output.zero_()
             return
 
@@ -928,6 +1100,26 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             ),
         )
 
+    def _prefill_workspace_tokens(self) -> int:
+        """Context tokens one gather row may cover; 0 disables the fixed budget."""
+        reserved = envs.VLLM_DSV41_PREFILL_WORKSPACE_TOKENS
+        return 0 if reserved < 0 else min(reserved, self.max_model_len)
+
+    def _prefill_workspace_budget_bytes(self) -> int:
+        """Byte budget for the prefill gather lane; 0 means unbounded.
+
+        Token-denominated, so operators keep sizing it in context tokens; the
+        compressed-row division matches the warmup reservation.
+        """
+        return _prefill_gather_budget_bytes(
+            self._prefill_workspace_tokens(),
+            self.compress_ratio,
+            self.window_size,
+            self.max_num_batched_tokens,
+            self.head_dim,
+            2,
+        )
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -975,48 +1167,147 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             top_k = 0
             N = 0
 
-        M = N + self.window_size + self.max_num_batched_tokens
-        num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (
-            self.PREFILL_CHUNK_SIZE
+        # Direct KV reads keep the compressed context out of the workspace: the
+        # attention kernel reads those positions from the paged fp8 cache itself,
+        # so only the sliding-window rows are gathered and the workspace width no
+        # longer follows the context length. They cost ~18% prefill throughput, so
+        # the default is to gather, and "auto" only switches a request over once
+        # its gathered workspace would be large.
+        # N counts compressed rows, so compare in context tokens.
+        direct_mode = envs.VLLM_DSV41_PREFILL_DIRECT_KV
+        use_direct_kv = not swa_only and (
+            direct_mode == 1
+            or (
+                direct_mode == 2
+                and N * self.compress_ratio
+                > envs.VLLM_DSV41_PREFILL_DIRECT_KV_THRESHOLD_TOKENS
+            )
         )
+        if use_direct_kv and not self._direct_kv_logged:
+            self._direct_kv_logged = True
+            logger.info_once(
+                "DeepSeek V4.1 prefill reads compressed KV from the paged cache "
+                "(mode %d, %d context tokens).",
+                direct_mode,
+                N,
+            )
+        # One row per prefill request in this batch, bounded by the fixed budget:
+        # a context that does not fit a single row is admitted to the direct
+        # paged-cache reader instead of growing the buffer, and a batch that fits
+        # fewer rows is split into more chunks. The combined indices address rows
+        # as ``M * req_id``, so fewer rows change nothing else.
+        rows, admit_direct = _prefill_gather_plan(
+            N,
+            num_prefills,
+            self.window_size,
+            self.max_num_batched_tokens,
+            self.head_dim,
+            2,
+            self._prefill_workspace_budget_bytes(),
+            self.PREFILL_CHUNK_SIZE,
+        )
+        if admit_direct and not use_direct_kv and current_platform.is_fp8_fnuz():
+            # The direct reader unpacks OCP fp8 rows; a FNUZ cache cannot use it.
+            # Keep gathering (the budget is advisory there) rather than entering a
+            # path the kernel refuses.
+            logger.info_once(
+                "DeepSeek V4.1 prefill workspace budget (%d tokens) is below one "
+                "context row, but this platform's fp8 caches are FNUZ, so the "
+                "gather lane is allowed to grow past the budget.",
+                self._prefill_workspace_tokens(),
+            )
+        elif admit_direct and not use_direct_kv:
+            use_direct_kv = True
+            _ADMISSION_COUNTS["direct"] += 1
+            if (
+                _ADMISSION_COUNTS["direct"] == 1
+                or _ADMISSION_COUNTS["direct"] % _ADMISSION_LOG_EVERY == 0
+            ):
+                logger.info(
+                    "DeepSeek V4.1 prefill workspace budget (%d tokens) is smaller "
+                    "than one %d-token context row; reading the paged cache "
+                    "directly (%d step(s) so far).",
+                    self._prefill_workspace_tokens(),
+                    N * self.compress_ratio,
+                    _ADMISSION_COUNTS["direct"],
+                )
+        elif not use_direct_kv and rows < min(self.PREFILL_CHUNK_SIZE, num_prefills):
+            _ADMISSION_COUNTS["chunked"] += 1
+            if _ADMISSION_COUNTS["chunked"] % _ADMISSION_LOG_EVERY == 1:
+                logger.info(
+                    "DeepSeek V4.1 prefill workspace budget (%d tokens) fits %d of "
+                    "%d concurrent prefill rows; the batch is split into more "
+                    "chunks (%d time(s) so far).",
+                    self._prefill_workspace_tokens(),
+                    rows,
+                    num_prefills,
+                    _ADMISSION_COUNTS["chunked"],
+                )
 
-        workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        if use_direct_kv:
+            assert attn_metadata is not None and compressed_k_cache is not None
+            direct_block_table = attn_metadata.block_table[num_decodes:]
+            direct_block_size = attn_metadata.block_size // self.compress_ratio
+            direct_swa_block_table = swa_metadata.block_table[num_decodes:]
+
+        M = _prefill_gather_width(
+            0 if use_direct_kv else N, self.window_size, self.max_num_batched_tokens
+        )
+        num_chunks = (num_prefills + rows - 1) // rows
+        if use_direct_kv:
+            # Nothing is gathered, so the prefill lane is not touched at all and
+            # the workspace stops depending on the context length. The kernel
+            # never dereferences this stub: every valid index is tagged.
+            with use_workspace_lane(PREFILL_WORKSPACE_LANE):
+                kv = current_workspace_manager().get_persistent(
+                    "dsv41_direct_kv_stub",
+                    (1, 1, q.shape[-1]),
+                    torch.bfloat16,
+                    zero_init=True,
+                )
+        else:
+            workspace_manager = current_workspace_manager()
+            with use_workspace_lane(PREFILL_WORKSPACE_LANE):
+                kv = workspace_manager.get_simultaneous(
+                    ((rows, M, q.shape[-1]), torch.bfloat16),
+                )[0]
         for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_start = chunk_idx * rows
+            chunk_end = min(chunk_start + rows, num_prefills)
             chunk_size = chunk_end - chunk_start
-            if not swa_only:
-                assert attn_metadata is not None
-                assert compressed_k_cache is not None
-                block_table = attn_metadata.block_table[num_decodes:]
-                # compressed_k_cache is OCP on every platform (Triton encoder).
-                with optional_phase_profile_stage("sparse_mla.gather_compressed", q):
+            if not use_direct_kv:
+                if not swa_only:
+                    assert attn_metadata is not None
+                    assert compressed_k_cache is not None
+                    block_table = attn_metadata.block_table[num_decodes:]
+                    # compressed_k_cache is OCP on every platform (Triton encoder).
+                    with optional_phase_profile_stage(
+                        "sparse_mla.gather_compressed", q
+                    ):
+                        dequantize_and_gather_k_cache(
+                            kv[:chunk_size],
+                            compressed_k_cache,
+                            seq_lens=seq_lens[chunk_start:chunk_end]
+                            // self.compress_ratio,
+                            gather_lens=None,
+                            block_table=block_table[chunk_start:chunk_end],
+                            block_size=attn_metadata.block_size // self.compress_ratio,
+                            offset=0,
+                            use_fnuz=False,
+                        )
+
+                swa_block_table = swa_metadata.block_table[num_decodes:]
+                with optional_phase_profile_stage("sparse_mla.gather_swa", q):
                     dequantize_and_gather_k_cache(
                         kv[:chunk_size],
-                        compressed_k_cache,
-                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                        gather_lens=None,
-                        block_table=block_table[chunk_start:chunk_end],
-                        block_size=attn_metadata.block_size // self.compress_ratio,
-                        offset=0,
-                        use_fnuz=False,
+                        swa_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end],
+                        gather_lens=gather_lens[chunk_start:chunk_end],
+                        block_table=swa_block_table[chunk_start:chunk_end],
+                        block_size=swa_metadata.block_size,
+                        offset=N,
+                        use_fnuz=current_platform.is_fp8_fnuz(),
                     )
-
-            swa_block_table = swa_metadata.block_table[num_decodes:]
-            with optional_phase_profile_stage("sparse_mla.gather_swa", q):
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    swa_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end],
-                    gather_lens=gather_lens[chunk_start:chunk_end],
-                    block_table=swa_block_table[chunk_start:chunk_end],
-                    block_size=swa_metadata.block_size,
-                    offset=N,
-                    use_fnuz=current_platform.is_fp8_fnuz(),
-                )
 
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
@@ -1025,56 +1316,128 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            with optional_phase_profile_stage("sparse_mla.combine_indices", q):
-                combined_indices, combined_lens = self._combine_prefill_indices(
-                    topk_indices[query_start:query_end],
-                    query_start_loc[
-                        num_decodes + chunk_start : num_decodes + chunk_end + 1
-                    ],
-                    seq_lens[chunk_start:chunk_end],
-                    gather_lens[chunk_start:chunk_end],
-                    self.window_size,
-                    self.compress_ratio,
-                    top_k,
-                    M,
-                    N,
-                )
-            if row_probe.active():
-                # The support domain this chunk attends to, per query row, plus
-                # the context width the gather buffer was sized for. Those are
-                # the two quantities every sparse-MLA launch sizes itself from.
-                chunk_positions = positions[query_start:query_end]
-                if combined_indices.shape[0] == chunk_positions.numel():
+            # Split-K walks the support in passes and reduces the raw
+            # (m, l, acc) states afterwards, which bounds the gathered rows; the
+            # compressed support and the sliding window are independent regions,
+            # so they become one pass each.
+            split_k = (
+                bool(envs.VLLM_DSV41_PREFILL_SPLIT_K)
+                and not use_direct_kv
+                and not swa_only
+                and top_k > 0
+            )
+            passes: tuple[tuple[int, int], ...] = (
+                ((0, top_k), (self.window_size, 0))
+                if split_k
+                else ((self.window_size, top_k),)
+            )
+            part_m = part_l = part_acc = None
+            if split_k:
+                num_chunk_queries = query_end - query_start
+                # Persistent, fixed-shape resources: one allocation for the whole
+                # manager lifetime, sliced per chunk. They are keyed per
+                # (ubatch, lane) and never handed out as lane offsets, so they
+                # cannot overlap the gathered rows the way a second
+                # get_simultaneous call in the same lane would.
+                with use_workspace_lane(PREFILL_WORKSPACE_LANE):
+                    part_m, part_l, part_acc = _prefill_split_k_partials(
+                        current_workspace_manager(),
+                        max(1, self.max_num_batched_tokens),
+                        len(passes),
+                        self.n_heads,
+                        self.nope_head_dim + self.rope_head_dim,
+                    )
+                part_m = part_m[:num_chunk_queries]
+                part_l = part_l[:num_chunk_queries]
+                part_acc = part_acc[:num_chunk_queries]
+            combined_indices = combined_lens = None
+            for split_id, (pass_window, pass_topk) in enumerate(passes):
+                if split_k or split_id == 0:
+                    with optional_phase_profile_stage("sparse_mla.combine_indices", q):
+                        combined_indices, combined_lens = self._combine_prefill_indices(
+                            topk_indices[query_start:query_end],
+                            query_start_loc[
+                                num_decodes + chunk_start : num_decodes + chunk_end + 1
+                            ],
+                            seq_lens[chunk_start:chunk_end],
+                            gather_lens[chunk_start:chunk_end],
+                            pass_window,
+                            self.compress_ratio,
+                            pass_topk,
+                            M,
+                            N,
+                            direct_kv=use_direct_kv,
+                        )
+                assert combined_indices is not None and combined_lens is not None
+                if row_probe.active():
+                    # The support domain this chunk attends to, per query row, plus
+                    # the context width the gather buffer was sized for. Those are
+                    # the two quantities every sparse-MLA launch sizes itself from.
+                    chunk_positions = positions[query_start:query_end]
+                    if combined_indices.shape[0] == chunk_positions.numel():
+                        row_probe.capture(
+                            f"{self.prefix}.prefill.support_indices",
+                            combined_indices,
+                            chunk_positions,
+                        )
+                        row_probe.capture(
+                            f"{self.prefix}.prefill.support_lens",
+                            combined_lens,
+                            chunk_positions,
+                        )
                     row_probe.capture(
-                        f"{self.prefix}.prefill.support_indices",
-                        combined_indices,
+                        f"{self.prefix}.prefill.context_rows",
+                        torch.full(
+                            (chunk_positions.numel(), 1),
+                            float(N),
+                            dtype=torch.float32,
+                            device=q.device,
+                        ),
                         chunk_positions,
                     )
-                    row_probe.capture(
-                        f"{self.prefix}.prefill.support_lens",
-                        combined_lens,
-                        chunk_positions,
+                with optional_phase_profile_stage("sparse_mla.prefill", q):
+                    rocm_sparse_attn_prefill(
+                        q=q[query_start:query_end],
+                        kv=kv.view(-1, 1, q.shape[-1]),
+                        indices=combined_indices,
+                        topk_length=combined_lens,
+                        scale=self.scale,
+                        head_dim=self.head_dim,
+                        nope_head_dim=self.nope_head_dim,
+                        rope_head_dim=self.rope_head_dim,
+                        attn_sink=None if split_k else self.attn_sink,
+                        output=output[query_start:query_end],
+                        partial_out=(
+                            (part_m, part_l, part_acc, split_id) if split_k else None
+                        ),
+                        direct_kv=(
+                            (
+                                compressed_k_cache,
+                                direct_block_table[chunk_start:chunk_end],
+                                seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                                direct_block_size,
+                                SPARSE_DIRECT_KV_TAG_BASE,
+                                SPARSE_DIRECT_KV_REQ_STRIDE,
+                                (
+                                    swa_k_cache,
+                                    direct_swa_block_table[chunk_start:chunk_end],
+                                    seq_lens[chunk_start:chunk_end],
+                                    swa_metadata.block_size,
+                                    SPARSE_DIRECT_KV_SWA_TAG_BASE,
+                                ),
+                            )
+                            if use_direct_kv
+                            else None
+                        ),
                     )
-                row_probe.capture(
-                    f"{self.prefix}.prefill.context_rows",
-                    torch.full(
-                        (chunk_positions.numel(), 1),
-                        float(N),
-                        dtype=torch.float32,
-                        device=q.device,
-                    ),
-                    chunk_positions,
-                )
-            with optional_phase_profile_stage("sparse_mla.prefill", q):
-                rocm_sparse_attn_prefill(
-                    q=q[query_start:query_end],
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices,
-                    topk_length=combined_lens,
-                    scale=self.scale,
-                    head_dim=self.head_dim,
-                    nope_head_dim=self.nope_head_dim,
-                    rope_head_dim=self.rope_head_dim,
-                    attn_sink=self.attn_sink,
-                    output=output[query_start:query_end],
-                )
+            if split_k:
+                with optional_phase_profile_stage("sparse_mla.reduce_splits", q):
+                    rocm_sparse_attn_reduce_partials(
+                        part_m,
+                        part_l,
+                        part_acc,
+                        self.attn_sink,
+                        output[query_start:query_end],
+                        self.n_heads,
+                        self.nope_head_dim + self.rope_head_dim,
+                    )

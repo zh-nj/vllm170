@@ -26,6 +26,7 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.fp8_sm80 import (
     _decode_fp8_lut,
     get_e4m3fn_bf16_lut,
+    get_scaled_e4m3fn_bf16_lut,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -1539,6 +1540,120 @@ def _sparse_kv_row_offset(slot, stride):
     return slot.to(tl.int64) * stride
 
 
+# Paged KV-cache token layout written by ``quantize_and_insert_k_cache``: 448
+# fp8 values followed by 64 bf16 rope values (576 bytes of data per token), with
+# one UE8M0 byte-scale per 64-wide quant block (7 used, 1 padding) in a separate
+# per-token area after the block's token data.
+_SPARSE_CACHE_FP8_DIM = tl.constexpr(448)
+_SPARSE_CACHE_QUANT_BLOCK = tl.constexpr(64)
+_SPARSE_CACHE_QUANT_BLOCKS = tl.constexpr(7)
+_SPARSE_CACHE_ROPE_DIM = tl.constexpr(64)
+_SPARSE_CACHE_SCALE_DIM = tl.constexpr(8)
+_SPARSE_CACHE_TOKEN_BYTES = tl.constexpr(448 + 64 * 2)
+
+# A direct KV index encodes ``tag_base + request * req_stride + position`` so one
+# int32 array can address both the paged cache (tagged) and the gathered
+# sliding-window rows (untagged). req_stride is the largest context the model
+# allows and tag_base sits far above any request*stride+position.
+# Direct paged-cache reads take the compressed source plus the sliding-window
+# source: (cache, block table, lens, block size, tag base[, request stride]).
+SparseDirectKvSource = tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]
+SparseDirectKv = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    int,
+    SparseDirectKvSource,
+]
+
+SPARSE_DIRECT_KV_TAG_BASE = 1 << 27
+SPARSE_DIRECT_KV_SWA_TAG_BASE = 1 << 28
+SPARSE_DIRECT_KV_REQ_STRIDE = 1 << 20
+
+
+@triton.jit
+def _sparse_direct_kv_tile(
+    slot,
+    taken,
+    cache_ptr,
+    cache_bt_ptr,
+    cache_lens_ptr,
+    cache_block_size,
+    cache_block_stride,
+    cache_max_blocks,
+    tag_base,
+    req_stride,
+    dim_offsets,
+    scaled_lut_ptr,
+    FP8_DIM: tl.constexpr,
+    TOKEN_BYTES: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    N_QUANT_BLOCKS: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    DECODE_PROBE: tl.constexpr,
+):
+    """Assemble one [BLOCK_K, BLOCK_D] bf16 tile straight from the paged cache.
+
+    ``slot`` carries ``tag_base + request * req_stride + position`` for entries to
+    read from the cache; the position is a compressed-context position, so the
+    paged address is ``position // cache_block_size`` through the request's block
+    table. Layout and dequant follow ``dequantize_and_gather_k_cache``: 448 fp8
+    values scaled by one UE8M0 byte per 64-wide quant block, then 64 bf16 rope
+    values stored verbatim. Decoding through the bf16 lookup table (instead of an
+    fp32 decode) keeps the tile in bf16, which is what lets BLOCK_K stay wide
+    enough for the KV loads to run at the bandwidth the gathered path reaches.
+    """
+    rel = slot - tag_base
+    req = rel // req_stride
+    pos = rel - req * req_stride
+    n_blocks = pos // cache_block_size
+    in_block = pos - n_blocks * cache_block_size
+
+    length = tl.load(cache_lens_ptr + req, mask=taken, other=0)
+    ok = taken & (pos >= 0) & (pos < length)
+    physical = tl.load(
+        cache_bt_ptr + req * cache_max_blocks + n_blocks, mask=ok, other=0
+    )
+    block_ptr = cache_ptr + physical.to(tl.int64) * cache_block_stride
+    row = block_ptr + in_block * TOKEN_BYTES
+    # Scales live after the block's whole token-data area, one 8-byte group per
+    # token, so they are addressed from the block and not from the token row.
+    scale_row = block_ptr + cache_block_size * TOKEN_BYTES + in_block * SCALE_DIM
+
+    fp8_mask = dim_offsets < FP8_DIM
+    quantized = tl.load(
+        row[:, None] + dim_offsets[None, :],
+        mask=ok[:, None] & fp8_mask[None, :],
+        other=0,
+    )
+    # One gathered byte per element: segment `d // QUANT_BLOCK` of the token holds
+    # that dimension's UE8M0 scale (2 ** (stored - 127)); byte 7 is padding and is
+    # never read because the fp8 dimensions stop before it.
+    scale_bytes = tl.load(
+        scale_row[:, None] + (dim_offsets // QUANT_BLOCK)[None, :],
+        mask=ok[:, None] & fp8_mask[None, :],
+        other=127,
+    )
+    # Dequantize with one gather per element: the table is indexed by
+    # `byte | scale << 8` and already holds the scaled value, so no per-element
+    # exponent arithmetic is needed.
+    index = quantized.to(tl.int32) | (scale_bytes.to(tl.int32) << 8)
+    if DECODE_PROBE:
+        values = index.to(tl.bfloat16)
+    else:
+        values = tl.load(scaled_lut_ptr + index).to(tl.bfloat16, bitcast=True)
+
+    rope = tl.load(
+        (row + FP8_DIM).to(tl.pointer_type(tl.bfloat16))[:, None]
+        + (dim_offsets - FP8_DIM)[None, :],
+        mask=ok[:, None] & ~fp8_mask[None, :],
+        other=0,
+    )
+    return tl.where(fp8_mask[None, :], values, rope)
+
+
 @triton.jit
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
@@ -1561,6 +1676,34 @@ def _sparse_attn_prefill_ragged_kernel(
     head_dim,
     num_kv,
     scale,
+    cache_ptr,
+    cache_bt_ptr,
+    cache_lens_ptr,
+    cache_block_size,
+    cache_block_stride,
+    cache_max_blocks,
+    direct_tag_base,
+    direct_req_stride,
+    swa_cache_ptr,
+    swa_bt_ptr,
+    swa_lens_ptr,
+    swa_block_size,
+    swa_block_stride,
+    swa_max_blocks,
+    direct_swa_tag_base,
+    scaled_lut_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    split_id,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    DIRECT_KV: tl.constexpr,
+    DECODE_PROBE: tl.constexpr,
+    STORE_PARTIAL: tl.constexpr,
     KV_IS_FP8: tl.constexpr,
     HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -1606,20 +1749,51 @@ def _sparse_attn_prefill_ragged_kernel(
     for k_start in tl.range(0, kv_len, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        valid = in_range & (slot >= 0) & (slot < num_kv)
-        safe_slot = tl.where(valid, slot, 0)
-
-        kv = tl.load(
-            kv_ptr
-            + _sparse_kv_row_offset(safe_slot[:, None], kv_stride_n)
-            + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
-        if KV_IS_FP8:
-            kv = (_decode_fp8_lut(kv, False, fp8_lut_ptr) * tl.load(kv_scale_ptr)).to(
-                q.dtype
+        if DIRECT_KV:
+            # Every entry is tagged with the cache it belongs to, so compressed
+            # positions and sliding-window positions are both read straight from
+            # their paged cache: nothing is gathered and the prefill workspace
+            # holds nothing that grows with the context. One unpack path serves
+            # both sources, which is what keeps the tile wide enough to run the
+            # cache loads at full bandwidth.
+            is_swa = slot >= direct_swa_tag_base
+            tagged = slot >= direct_tag_base
+            valid = in_range & (slot >= 0) & tagged
+            kv = _sparse_direct_kv_tile(
+                slot,
+                valid,
+                tl.where(is_swa, swa_cache_ptr, cache_ptr),
+                tl.where(is_swa, swa_bt_ptr, cache_bt_ptr),
+                tl.where(is_swa, swa_lens_ptr, cache_lens_ptr),
+                tl.where(is_swa, swa_block_size, cache_block_size),
+                tl.where(is_swa, swa_block_stride, cache_block_stride),
+                tl.where(is_swa, swa_max_blocks, cache_max_blocks),
+                tl.where(is_swa, direct_swa_tag_base, direct_tag_base),
+                direct_req_stride,
+                dim_offsets,
+                scaled_lut_ptr,
+                FP8_DIM=_SPARSE_CACHE_FP8_DIM,
+                TOKEN_BYTES=_SPARSE_CACHE_TOKEN_BYTES,
+                QUANT_BLOCK=_SPARSE_CACHE_QUANT_BLOCK,
+                N_QUANT_BLOCKS=_SPARSE_CACHE_QUANT_BLOCKS,
+                SCALE_DIM=_SPARSE_CACHE_SCALE_DIM,
+                DECODE_PROBE=DECODE_PROBE,
             )
+        else:
+            valid = in_range & (slot >= 0) & (slot < num_kv)
+            safe_slot = tl.where(valid, slot, 0)
+
+            kv = tl.load(
+                kv_ptr
+                + _sparse_kv_row_offset(safe_slot[:, None], kv_stride_n)
+                + dim_offsets[None, :] * kv_stride_d,
+                mask=valid[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            if KV_IS_FP8:
+                kv = (
+                    _decode_fp8_lut(kv, False, fp8_lut_ptr) * tl.load(kv_scale_ptr)
+                ).to(q.dtype)
 
         next_k_pos = k_start + BLOCK_K + k_offsets
         slot = tl.load(
@@ -1640,7 +1814,24 @@ def _sparse_attn_prefill_ragged_kernel(
         m_i = m_new
         l_i = l_new
 
-    if HAS_ATTN_SINK:
+    if STORE_PARTIAL:
+        # Split-K: hand this block's raw online-softmax state to the reduce
+        # kernel, which applies the attention sink and normalizes once.
+        pm_base = query_idx * pm_stride0 + split_id * pm_stride_s + head_offsets
+        tl.store(part_m_ptr + pm_base, m_i, mask=head_mask)
+        tl.store(part_l_ptr + pm_base, l_i, mask=head_mask)
+        acc_base = (
+            part_acc_ptr
+            + query_idx * pa_stride0
+            + split_id * pa_stride_s
+            + head_offsets[:, None] * pa_stride_h
+        )
+        tl.store(
+            acc_base + dim_offsets[None, :],
+            acc,
+            mask=head_mask[:, None] & dim_mask[None, :],
+        )
+    elif HAS_ATTN_SINK:
         sink = tl.load(
             attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
         ).to(tl.float32)
@@ -1653,18 +1844,25 @@ def _sparse_attn_prefill_ragged_kernel(
             (acc * alpha[:, None]) / denom[:, None],
             0.0,
         )
+        tl.store(
+            out_ptr
+            + query_idx * out_stride_t
+            + head_offsets[:, None] * out_stride_h
+            + dim_offsets[None, :] * out_stride_d,
+            out,
+            mask=head_mask[:, None] & dim_mask[None, :],
+        )
     else:
         denom = tl.maximum(l_i, 1.0e-30)
         out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
-
-    tl.store(
-        out_ptr
-        + query_idx * out_stride_t
-        + head_offsets[:, None] * out_stride_h
-        + dim_offsets[None, :] * out_stride_d,
-        out,
-        mask=head_mask[:, None] & dim_mask[None, :],
-    )
+        tl.store(
+            out_ptr
+            + query_idx * out_stride_t
+            + head_offsets[:, None] * out_stride_h
+            + dim_offsets[None, :] * out_stride_d,
+            out,
+            mask=head_mask[:, None] & dim_mask[None, :],
+        )
 
 
 @triton.jit
@@ -2771,6 +2969,8 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     rope_head_dim: int,
     output: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    direct_kv: SparseDirectKv | None = None,
+    partial_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
     *,
     block_h: int | None = None,
     block_k: int | None = None,
@@ -2788,10 +2988,21 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         assert kv_scale is not None, "FP8 sparse MLA requires a KV cache scale"
         kv = kv.view(torch.uint8)
         fp8_lut = get_e4m3fn_bf16_lut(q.device)
+    elif direct_kv is not None:
+        # The direct reader decodes packed rows itself, through the same table.
+        fp8_lut = get_e4m3fn_bf16_lut(q.device)
     else:
         fp8_lut = torch.empty(1, dtype=torch.bfloat16, device=q.device)
         if kv_scale is None:
             kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    # The direct reader dequantizes with a table that already has the block scale
+    # baked in; the probe mode skips it (wrong values, same read shape).
+    scaled_lut = (
+        get_scaled_e4m3fn_bf16_lut(q.device)
+        if direct_kv is not None and not envs.VLLM_DSV41_PREFILL_DIRECT_DECODE_PROBE
+        else q
+    )
 
     indices = _as_int32_contiguous_1d(indices)
     indptr = _as_int32_contiguous_1d(indptr)
@@ -2890,6 +3101,56 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         )
         assert output.dtype == torch.bfloat16 and output.device == q.device
         assert output.stride(-1) == 1
+    if direct_kv is None:
+        direct_cache, direct_bt, direct_lens = kv, indices, indptr
+        direct_block_size = direct_block_stride = direct_max_blocks = 1
+        direct_tag_base = direct_req_stride = 1
+        direct_swa_cache, direct_swa_bt, direct_swa_lens = kv, indices, indptr
+        direct_swa_block_size = direct_swa_block_stride = direct_swa_max_blocks = 1
+        direct_swa_tag_base = 1
+    else:
+        # The direct reader unpacks the packed row itself and its fp8 decode is
+        # the OCP one, so it cannot serve a platform whose caches are FNUZ.
+        assert not kv_is_fp8, "direct KV reads never take an fp8 kv argument"
+        assert not current_platform.is_fp8_fnuz(), (
+            "direct KV reads support OCP fp8 caches only"
+        )
+        (
+            direct_cache,
+            direct_bt,
+            direct_lens,
+            direct_block_size,
+            direct_tag_base,
+            direct_req_stride,
+            direct_swa,
+        ) = direct_kv
+        direct_block_stride = direct_cache.stride(0)
+        direct_max_blocks = direct_bt.shape[1]
+        (
+            direct_swa_cache,
+            direct_swa_bt,
+            direct_swa_lens,
+            direct_swa_block_size,
+            direct_swa_tag_base,
+        ) = direct_swa
+        direct_swa_block_stride = direct_swa_cache.stride(0)
+        direct_swa_max_blocks = direct_swa_bt.shape[1]
+        # The assembled tile and the masked sliding-window tile both live in
+        # shared memory, so the direct read runs without software pipelining and
+        # with a narrower KV tile than the gathered path.
+        num_stages = envs.VLLM_DSV41_PREFILL_DIRECT_STAGES
+        block_k = min(block_k, envs.VLLM_DSV41_PREFILL_DIRECT_BLOCK_K)
+
+    if partial_out is None:
+        part_m = part_l = part_acc = output
+        split_id = 0
+        pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 1
+    else:
+        part_m, part_l, part_acc, split_id = partial_out
+        pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
+        pa_stride0, pa_stride_s = part_acc.stride(0), part_acc.stride(1)
+        pa_stride_h = part_acc.stride(2)
+
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -2911,6 +3172,34 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         head_dim,
         kv.shape[0],
         float(scale),
+        direct_cache,
+        direct_bt,
+        direct_lens,
+        direct_block_size,
+        direct_block_stride,
+        direct_max_blocks,
+        direct_tag_base,
+        direct_req_stride,
+        direct_swa_cache,
+        direct_swa_bt,
+        direct_swa_lens,
+        direct_swa_block_size,
+        direct_swa_block_stride,
+        direct_swa_max_blocks,
+        direct_swa_tag_base,
+        scaled_lut,
+        part_m,
+        part_l,
+        part_acc,
+        split_id,
+        pm_stride0,
+        pm_stride_s,
+        pa_stride0,
+        pa_stride_s,
+        pa_stride_h,
+        DIRECT_KV=direct_kv is not None,
+        STORE_PARTIAL=partial_out is not None,
+        DECODE_PROBE=bool(envs.VLLM_DSV41_PREFILL_DIRECT_DECODE_PROBE),
         KV_IS_FP8=kv_is_fp8,
         HAS_ATTN_SINK=has_attn_sink,
         BLOCK_H=block_h,
@@ -2933,6 +3222,8 @@ def _rocm_sparse_attn_prefill_triton(
     topk_length: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    direct_kv: SparseDirectKv | None = None,
+    partial_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
     block_h: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
@@ -2943,7 +3234,10 @@ def _rocm_sparse_attn_prefill_triton(
         topk_length
         if topk_length is not None
         else (indices >= 0).sum(dim=-1, dtype=torch.int32),
-        num_rows=kv.shape[0],
+        # Tagged direct-KV entries carry request/position rather than a row of the
+        # gathered buffer, so the row-range clamp must not run: the kernel checks
+        # each entry against the thing it actually addresses.
+        num_rows=-1 if direct_kv is not None else kv.shape[0],
     )
     return _rocm_sparse_attn_prefill_ragged_triton(
         q=q,
@@ -2956,6 +3250,8 @@ def _rocm_sparse_attn_prefill_triton(
         rope_head_dim=rope_head_dim,
         output=output,
         kv_scale=kv_scale,
+        direct_kv=direct_kv,
+        partial_out=partial_out,
         block_h=block_h,
         block_k=block_k,
         num_warps=num_warps,
@@ -3512,6 +3808,58 @@ def _rocm_sparse_attn_decode_triton(
     )
 
 
+def rocm_sparse_attn_reduce_partials(
+    part_m: torch.Tensor,
+    part_l: torch.Tensor,
+    part_acc: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+    num_heads: int,
+    comb_dim: int,
+    adaptive_splits: bool = True,
+) -> None:
+    """Combine per-split ``(m, l, acc)`` states into the attention output.
+
+    Split-K prefill stores raw online-softmax state per support region instead of
+    a normalized row; this applies the attention sink, re-weights every split by
+    its own running max and normalizes once. Splits a query never touched carry
+    ``m == -inf`` and are dropped when ``adaptive_splits`` is set.
+    """
+    num_splits = part_m.shape[1]
+    assert part_m.shape[:2] == part_l.shape[:2] == part_acc.shape[:2], (
+        f"partial shapes disagree: {part_m.shape}, {part_l.shape}, {part_acc.shape}"
+    )
+    reduce_block_h = 2 if output.shape[0] >= 8 else 1
+    if attn_sink is None:
+        attn_sink = torch.empty(1, dtype=torch.float32, device=output.device)
+    else:
+        attn_sink = attn_sink.contiguous()
+    _sparse_attn_decode_reduce_kernel[
+        (output.shape[0], triton.cdiv(num_heads, reduce_block_h))
+    ](
+        part_m,
+        part_l,
+        part_acc,
+        attn_sink,
+        output,
+        output.stride(0),
+        output.stride(1),
+        part_m.stride(0),
+        part_m.stride(1),
+        part_acc.stride(0),
+        part_acc.stride(1),
+        part_acc.stride(2),
+        num_heads,
+        HAS_ATTN_SINK=attn_sink.numel() > 1,
+        ADAPTIVE_SPLITS=adaptive_splits,
+        COMB_DIM=comb_dim,
+        BLOCK_H=reduce_block_h,
+        NUM_SPLITS=num_splits,
+        SPLITS_PAD=triton.next_power_of_2(num_splits),
+        num_warps=4,
+    )
+
+
 def rocm_sparse_attn_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -3526,6 +3874,8 @@ def rocm_sparse_attn_prefill(
     ragged_indices: torch.Tensor | None = None,
     ragged_indptr: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    direct_kv: SparseDirectKv | None = None,
+    partial_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
     block_h: int | None = None,
     block_k: int | None = None,
     num_warps: int | None = None,
@@ -3555,6 +3905,8 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             output=caller_output,
             kv_scale=kv_scale,
+            direct_kv=direct_kv,
+            partial_out=partial_out,
             block_h=block_h,
             block_k=block_k,
             num_warps=num_warps,
@@ -3574,6 +3926,8 @@ def rocm_sparse_attn_prefill(
             topk_length=topk_length,
             output=caller_output,
             kv_scale=kv_scale,
+            direct_kv=direct_kv,
+            partial_out=partial_out,
             block_h=block_h,
             block_k=block_k,
             num_warps=num_warps,

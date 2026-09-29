@@ -237,7 +237,10 @@ from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import (
+    PREFILL_WORKSPACE_LANE,
+    lock_workspace,
+)
 
 from .utils import (
     AttentionGroup,
@@ -7055,9 +7058,11 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
-        # Lock workspace to prevent resizing during execution.
-        # Max workspace sizes should have been captured during warmup/profiling.
-        lock_workspace()
+        # Lock the graph-owned lanes to prevent resizing during execution; max
+        # workspace sizes there should have been captured during warmup/profiling.
+        # The eager-only lanes above them keep growing: their owners are not
+        # referenced by a captured graph (see PREFILL_WORKSPACE_LANE).
+        lock_workspace(lanes=range(PREFILL_WORKSPACE_LANE))
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

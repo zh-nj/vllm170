@@ -174,7 +174,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
-from vllm.v1.worker.workspace import use_workspace_lane
+from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
@@ -955,6 +955,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        # skip_attn is load-bearing, not just an optimisation: attention metadata
+        # needs block tables, and those only exist once the KV cache has been
+        # sized from this very profiling run. Attention-side workspaces therefore
+        # have to reserve themselves explicitly in their own dummy path (as the
+        # DSV4 prefill gather and the sparse indexer do); see report A.14.
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -1052,6 +1057,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        # A buffer a captured CUDA graph points into must not be relocated, so a
+        # lane may only be locked once its sizing is a contract: the
+        # admission-controlled prefill lane reserves its capacity at warmup, and
+        # the graph lanes may be locked once every batch-dependent workspace in
+        # them has a warmup reserve. VLLM_WORKSPACE_LOCK_LANES selects the set;
+        # leaving it empty keeps every lane growable, as before.
+        lock_lanes = envs.VLLM_WORKSPACE_LOCK_LANES.strip()
+        if lock_lanes:
+            lock_workspace(
+                lanes=tuple(int(lane) for lane in lock_lanes.split(",") if lane)
+            )
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:

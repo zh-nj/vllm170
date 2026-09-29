@@ -88,6 +88,13 @@ if TYPE_CHECKING:
     VLLM_INDEXER_PREFILL_STREAMING_MAX_ROWS: int = 512
     VLLM_INDEXER_PREFILL_DEEP_SELECT_TOPK: bool = False
     VLLM_DSV41_PREFILL_WORKSPACE_TOKENS: int = 0
+    VLLM_DSV41_PREFILL_DIRECT_KV: int = 0
+    VLLM_DSV41_PREFILL_DIRECT_KV_THRESHOLD_TOKENS: int = 131072
+    VLLM_DSV41_PREFILL_DIRECT_BLOCK_K: int = 32
+    VLLM_DSV41_PREFILL_DIRECT_STAGES: int = 1
+    VLLM_DSV41_PREFILL_DIRECT_DECODE_PROBE: int = 0
+    VLLM_DSV41_PREFILL_SPLIT_K: int = 0
+    VLLM_WORKSPACE_LOCK_LANES: str = ""
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
     VLLM_DEEPSEEK_V4_DSPARK_EXACT_TOPK: bool = True
     VLLM_DEEPSEEK_V4_DSPARK_TOPK_AUDIT: bool = False
@@ -1249,6 +1256,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # batch metadata exists (warmup/profiling). 0 keeps the max_model_len bound.
     "VLLM_DSV41_PREFILL_WORKSPACE_TOKENS": lambda: int(
         os.getenv("VLLM_DSV41_PREFILL_WORKSPACE_TOKENS", "0")
+    ),
+    # Read the compressed KV for sparse prefill straight from the paged fp8
+    # cache instead of gathering it into a bf16 workspace first. The gather is
+    # what makes the prefill workspace scale with the context length; reading the
+    # cache in-kernel leaves only the sliding-window rows to gather, so the
+    # workspace stops depending on how long the prompt is.
+    # 0 = always gather (fastest, workspace grows with the context), 1 = always
+    # read the paged cache directly (~8 MB workspace, ~18% slower prefill),
+    # 2 = do that only once the gathered workspace would exceed
+    # VLLM_DSV41_PREFILL_DIRECT_KV_THRESHOLD_TOKENS context tokens.
+    "VLLM_DSV41_PREFILL_DIRECT_KV": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_DIRECT_KV", "0")
+    ),
+    "VLLM_DSV41_PREFILL_DIRECT_KV_THRESHOLD_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_DIRECT_KV_THRESHOLD_TOKENS", "131072")
+    ),
+    # KV tokens per tile and software-pipeline depth for the direct prefill
+    # reader. Both are bounded by shared memory: the assembled tile and the
+    # masked sliding-window tile live there, so wider tiles fit fewer stages.
+    "VLLM_DSV41_PREFILL_DIRECT_BLOCK_K": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_DIRECT_BLOCK_K", "32")
+    ),
+    "VLLM_DSV41_PREFILL_DIRECT_STAGES": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_DIRECT_STAGES", "1")
+    ),
+    # Lanes the workspace manager locks after CUDA graph capture, e.g. "2" to
+    # enforce the admission-controlled prefill capacity, or "0,1" to freeze the
+    # graph-owned lanes once their workspaces are reserved at warmup. Empty keeps
+    # every lane growable.
+    "VLLM_WORKSPACE_LOCK_LANES": lambda: os.getenv("VLLM_WORKSPACE_LOCK_LANES", ""),
+    # Split-K prefill: 0 = one pass over the whole support (default), otherwise
+    # the compressed support is walked in passes of this many context tokens and
+    # the per-pass (m, l, acc) states are combined by the reduce kernel.
+    "VLLM_DSV41_PREFILL_SPLIT_K": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_SPLIT_K", "0")
+    ),
+    # Diagnostic: skip the packed-row decode (values are wrong, traffic is the
+    # same shape) to separate decode cost from cache-read cost.
+    "VLLM_DSV41_PREFILL_DIRECT_DECODE_PROBE": lambda: int(
+        os.getenv("VLLM_DSV41_PREFILL_DIRECT_DECODE_PROBE", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

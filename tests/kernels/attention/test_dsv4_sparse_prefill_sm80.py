@@ -966,3 +966,259 @@ def test_direct_c128_ragged_matches_dense_pack() -> None:
     torch.testing.assert_close(direct_indices[:nnz], reference_indices[:nnz])
     assert direct_indices.data_ptr() == direct_indices_buffer.data_ptr()
     assert direct_indptr.data_ptr() == direct_indptr_buffer.data_ptr()
+
+
+@torch.inference_mode()
+def test_sparse_prefill_direct_kv_matches_gathered() -> None:
+    """Paged-cache KV reads must match the gathered rows, window included.
+
+    The direct reader tags every support entry with the cache it belongs to
+    (compressed context or sliding window) and unpacks the packed row in-kernel,
+    so nothing is gathered. Values have to match the gathered path because both
+    run the same UE8M0 dequant.
+    """
+    from vllm.models.deepseek_v4.common.ops import quantize_and_insert_k_cache
+    from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        SPARSE_DIRECT_KV_REQ_STRIDE,
+        SPARSE_DIRECT_KV_SWA_TAG_BASE,
+        SPARSE_DIRECT_KV_TAG_BASE,
+        rocm_sparse_attn_prefill,
+    )
+
+    torch.manual_seed(11)
+    head_dim, nope_dim, rope_dim = 512, 448, 64
+    block_size, num_blocks = 64, 4
+    num_tokens = block_size * num_blocks
+    num_queries, num_heads = 5, 4
+    swa_len = 32
+
+    q = (
+        torch.randn(
+            num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        * 0.125
+    )
+
+    def make_cache(seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        values = torch.randn(
+            num_tokens, head_dim, dtype=torch.bfloat16, device="cuda", generator=gen
+        )
+        cache = torch.zeros(
+            num_blocks, block_size, 584, dtype=torch.uint8, device="cuda"
+        )
+        slots = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+        quantize_and_insert_k_cache(values, cache, slots, block_size)
+        return cache
+
+    compressed_cache = make_cache(11)
+    swa_cache = make_cache(23)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device="cuda")[None, :]
+    lens = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    swa_lens = torch.tensor([swa_len], dtype=torch.int32, device="cuda")
+
+    # Reference layout: [compressed rows | sliding-window rows] gathered to bf16.
+    gathered = torch.zeros(
+        1, num_tokens + swa_len, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    dequantize_and_gather_k_cache(
+        gathered[:, :num_tokens],
+        compressed_cache,
+        lens,
+        None,
+        block_table,
+        block_size,
+        0,
+        use_fnuz=False,
+    )
+    dequantize_and_gather_k_cache(
+        gathered[:, num_tokens:],
+        swa_cache,
+        swa_lens,
+        None,
+        block_table,
+        block_size,
+        0,
+        use_fnuz=False,
+    )
+    kv_rows = gathered.transpose(0, 1).contiguous()
+
+    compressed_positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    swa_positions = torch.arange(swa_len, dtype=torch.int32, device="cuda")
+    dense = torch.cat(
+        [
+            compressed_positions.repeat(num_queries, 1),
+            (num_tokens + swa_positions).repeat(num_queries, 1),
+        ],
+        dim=1,
+    )
+    tagged = torch.cat(
+        [
+            (compressed_positions + SPARSE_DIRECT_KV_TAG_BASE).repeat(num_queries, 1),
+            (swa_positions + SPARSE_DIRECT_KV_SWA_TAG_BASE).repeat(num_queries, 1),
+        ],
+        dim=1,
+    )
+    widths = torch.full(
+        (num_queries,), dense.shape[1], dtype=torch.int32, device="cuda"
+    )
+
+    def run(
+        indices: torch.Tensor,
+        kv: torch.Tensor,
+        topk_length: torch.Tensor,
+        direct: bool,
+    ) -> torch.Tensor:
+        output = torch.empty(
+            num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        direct_kv = None
+        if direct:
+            direct_kv = (
+                compressed_cache,
+                block_table,
+                lens,
+                block_size,
+                SPARSE_DIRECT_KV_TAG_BASE,
+                SPARSE_DIRECT_KV_REQ_STRIDE,
+                (
+                    swa_cache,
+                    block_table,
+                    swa_lens,
+                    block_size,
+                    SPARSE_DIRECT_KV_SWA_TAG_BASE,
+                ),
+            )
+        rocm_sparse_attn_prefill(
+            q=q,
+            kv=kv,
+            indices=indices,
+            topk_length=topk_length,
+            scale=head_dim**-0.5,
+            head_dim=head_dim,
+            nope_head_dim=nope_dim,
+            rope_head_dim=rope_dim,
+            attn_sink=None,
+            output=output,
+            direct_kv=direct_kv,
+        )
+        return output
+
+    # A single-key support normalizes to that key's value, so this isolates the
+    # packed-row addressing and dequant, for both sources. It has to be exact.
+    one = torch.ones((num_queries,), dtype=torch.int32, device="cuda")
+    for position in (0, 1, block_size - 1, block_size, num_tokens - 1):
+        idx = torch.full((num_queries, 1), position, dtype=torch.int32, device="cuda")
+        want = run(idx, kv_rows, one, direct=False)
+        got = run(idx + SPARSE_DIRECT_KV_TAG_BASE, kv_rows, one, direct=True)
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+    for position in (0, 7, swa_len - 1):
+        idx = torch.full(
+            (num_queries, 1), num_tokens + position, dtype=torch.int32, device="cuda"
+        )
+        want = run(idx, kv_rows, one, direct=False)
+        got = run(
+            torch.full(
+                (num_queries, 1),
+                position + SPARSE_DIRECT_KV_SWA_TAG_BASE,
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            kv_rows,
+            one,
+            direct=True,
+        )
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+
+    # With the whole support the two paths still agree, up to the online-softmax
+    # reassociation a different KV tile width implies.
+    expected = run(dense, kv_rows, widths, direct=False)
+    actual = run(tagged, kv_rows, widths, direct=True)
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    assert torch.isfinite(actual).all()
+
+
+@torch.inference_mode()
+def test_split_k_partials_reduce_to_the_single_pass_output() -> None:
+    """Split-K prefill: per-split (m, l, acc) must reduce to the one-pass result.
+
+    The split path exists so a prefill can walk its support in bounded blocks
+    (bounded gather workspace); it is only usable if combining the raw partial
+    states reproduces the single-pass output, including the attention sink.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_sparse_attn_prefill,
+        rocm_sparse_attn_reduce_partials,
+    )
+
+    torch.manual_seed(5)
+    head_dim, nope_dim, rope_dim = 512, 448, 64
+    num_queries, num_heads, num_kv = 6, 4, 192
+    scale = head_dim**-0.5
+
+    q = (
+        torch.randn(
+            num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        * 0.125
+    )
+    kv = torch.randn(num_kv, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+    kv_arg = kv.unsqueeze(1).contiguous()
+    sink = torch.randn(num_heads, dtype=torch.float32, device="cuda")
+
+    # Every query attends to the whole context, so each split is dense.
+    indices = torch.arange(num_kv, dtype=torch.int32, device="cuda")[None, :].repeat(
+        num_queries, 1
+    )
+    lengths = torch.full((num_queries,), num_kv, dtype=torch.int32, device="cuda")
+
+    def run(indices_arg, partial_out=None, attn_sink=None):
+        out = torch.empty(
+            num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        rocm_sparse_attn_prefill(
+            q=q,
+            kv=kv_arg,
+            indices=indices_arg,
+            topk_length=lengths,
+            scale=scale,
+            head_dim=head_dim,
+            nope_head_dim=nope_dim,
+            rope_head_dim=rope_dim,
+            attn_sink=attn_sink,
+            output=out,
+            partial_out=partial_out,
+        )
+        return out
+
+    expected = run(indices, attn_sink=sink)
+
+    # Two overlapping-in-coverage splits, plus the sink applied only by the reduce.
+    splits = (slice(0, 96), slice(96, num_kv))
+    part_m = torch.empty(
+        num_queries, len(splits), num_heads, dtype=torch.float32, device="cuda"
+    )
+    part_l = torch.empty_like(part_m)
+    part_acc = torch.empty(
+        num_queries,
+        len(splits),
+        num_heads,
+        head_dim,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    for split_id, span in enumerate(splits):
+        split_indices = torch.full_like(indices, -1)
+        split_indices[:, : span.stop - span.start] = indices[:, span]
+        run(
+            split_indices,
+            partial_out=(part_m, part_l, part_acc, split_id),
+        )
+
+    actual = torch.empty_like(expected)
+    rocm_sparse_attn_reduce_partials(
+        part_m, part_l, part_acc, sink, actual, num_heads, head_dim
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    assert torch.isfinite(actual).all()
