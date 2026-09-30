@@ -925,8 +925,14 @@ def interleaved_ab(
     warmup: int,
     graph_calls: int,
     samples: int,
+    calls_per_repeat: int = 1,
 ) -> dict[str, Any]:
     """Alternate baseline/candidate as A/B/B/A and keep every round.
+
+    ``call`` performs ``calls_per_repeat`` kernel invocations, which is what a
+    rotating-expert sequence needs: the graph holds ``graph_calls`` replays of
+    the whole rotation, and every sample is divided by
+    ``graph_calls * calls_per_repeat``.
 
     Returns per-round p50/p90 plus the baseline self-comparison that decides
     whether a difference is measurable at all.
@@ -951,8 +957,9 @@ def interleaved_ab(
                     time_graph(
                         baseline_call,
                         warmup=0,
-                        graph_calls=graph_calls,
+                        repeats=graph_calls,
                         samples=samples,
+                        calls_per_repeat=calls_per_repeat,
                         graph=baseline_graph,
                     )
                 )
@@ -961,8 +968,9 @@ def interleaved_ab(
                     time_graph(
                         candidate_call,
                         warmup=0,
-                        graph_calls=graph_calls,
+                        repeats=graph_calls,
                         samples=samples,
+                        calls_per_repeat=calls_per_repeat,
                         graph=candidate_graph,
                     )
                 )
