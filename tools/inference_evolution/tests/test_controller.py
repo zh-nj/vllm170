@@ -12,6 +12,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,15 @@ def request(name, candidate, baseline=None):
         "hypothesis": "fixture",
         "checkpoint": "resume here",
         "observation_seconds": 0,
+        "lifeguard": {
+            "startup_timeout": 0.05,
+            "recovery_timeout": 0.2,
+            "rollback_release": baseline,
+            "probe_timeout": 0.01,
+            "failure_threshold": 1,
+            "stable_restarts": 1,
+            "restart_policy": "restore_stable_then_block",
+        },
     }
 
 
@@ -147,6 +157,7 @@ def test_adoption_failure_restores_original_without_marking_it_sealed(
         store.root / "adoption.json",
         {
             "stage": "starting_capsule" if interrupted else "prepared",
+            "lifeguard": request("a", "capsule")["lifeguard"],
             "release": "capsule",
             "processes": [{"pid": 1}],
             "original": {
@@ -181,6 +192,7 @@ def test_adoption_commits_only_after_generation_and_checks(
         store.root / "adoption.json",
         {
             "stage": "prepared",
+            "lifeguard": request("a", "capsule")["lifeguard"],
             "release": "capsule",
             "processes": [{"pid": 1}],
         },
@@ -244,6 +256,228 @@ def test_duplicate_submission_is_idempotent_but_changed_content_is_rejected(setu
     changed["hypothesis"] = "different"
     with pytest.raises(ValueError, match="already used"):
         store.submit(changed)
+
+
+def test_restart_request_requires_explicit_lifeguard_parameters(setup):
+    store, controller, backend = setup
+    release(store, "candidate")
+    req = request("guarded", "candidate")
+    req.pop("lifeguard")
+    with pytest.raises(ValueError, match="Invalid request fields"):
+        store.submit(req)
+
+
+def test_manual_rollback_requires_a_matching_stable_release(setup):
+    store, controller, backend = setup
+    baseline(store, controller)
+    request_data = {
+        "id": "manual-rollback",
+        "kind": "rollback",
+        "reason": "manual validation",
+        "lifeguard": dict(request("x", "candidate", "other")["lifeguard"]),
+    }
+    store.submit(request_data)
+    controller.tick()
+    result = evolution.read(store.root / "experiments/manual-rollback/result.json")
+    assert result["status"] == "rejected"
+    assert controller.state["stable"] == "stable"
+    assert backend.running("server")
+
+
+def test_lifeguard_parameters_are_persisted_before_candidate_switch(setup):
+    store, controller, backend = setup
+    release(store, "candidate")
+    req = request("guarded", "candidate")
+    store.submit(req)
+    stop = backend.stop
+
+    def check_before_stop(slot):
+        if slot == "server":
+            state = evolution.read(store.root / "state.json")
+            assert state["lifeguard"] == req["lifeguard"]
+            assert state["phase"] == "switching"
+        stop(slot)
+
+    backend.stop = check_before_stop
+    controller.execute(req)
+    state = evolution.read(store.root / "state.json")
+    assert state["lifeguard"] == req["lifeguard"]
+
+
+@pytest.fixture
+def lifecycle(monkeypatch):
+    monkeypatch.setitem(sys.modules, "controller", evolution)
+    spec = importlib.util.spec_from_file_location(
+        "lifecycle", SOURCE.with_name("lifecycle.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_lifecycle_stop_preserves_server_and_disables_autostart(
+    setup, lifecycle, monkeypatch
+):
+    store, controller, backend = setup
+    baseline(store, controller)
+    evolution.atomic(
+        store.root / "installation.json",
+        {"unit": "fixture.service", "package": "/fixture"},
+    )
+    monkeypatch.setattr(lifecycle, "Controller", lambda root: controller)
+    calls = []
+
+    def output(argv, **kwargs):
+        if "ExecStart" in argv:
+            return f"/fixture/controller.py --root {store.root} run"
+        if "ActiveState" in argv:
+            return "active"
+        return "ActiveState=inactive\nSubState=dead\n"
+
+    monkeypatch.setattr(lifecycle.subprocess, "check_output", output)
+    monkeypatch.setattr(
+        lifecycle.subprocess, "run", lambda argv, **kw: calls.append(argv)
+    )
+    result = lifecycle.run(store.root, "stop")
+    assert result["ActiveState"] == "inactive"
+    assert calls == [
+        ["systemctl", "--user", "disable", "fixture.service"],
+        ["systemctl", "--user", "stop", "fixture.service"],
+    ]
+    assert backend.running("server")
+    assert evolution.read(store.root / "control.json")["paused"]
+    assert (
+        evolution.read(store.root / "outbox/accept.json")["status"] == "origin_session"
+    )
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_lifecycle_refuses_unsettled_work(setup, lifecycle, pending):
+    store, controller, backend = setup
+    if pending:
+        release(store, "candidate")
+        store.submit(request("queued", "candidate"))
+    else:
+        controller.save(active="in-flight", phase="building")
+    with pytest.raises(RuntimeError):
+        lifecycle.settled(store.root, controller.state, backend)
+
+
+def test_lifecycle_start_without_parameters_has_no_side_effects(setup, lifecycle):
+    store, controller, backend = setup
+    with pytest.raises(ValueError, match="Lifeguard parameters"):
+        lifecycle.run(store.root, "start")
+    assert not backend.starts
+    assert not (store.root / "installation.json").exists()
+
+
+def test_lifecycle_waits_for_health_poll_without_interrupting_it(setup, lifecycle):
+    store, controller, backend = setup
+    acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def health_poll():
+        with evolution.lock(store.root / ".transition.lock"):
+            acquired.set()
+            release_lock.wait(timeout=2)
+
+    worker = threading.Thread(target=health_poll)
+    worker.start()
+    try:
+        assert acquired.wait(timeout=2)
+        with (
+            pytest.raises(RuntimeError, match="Supervisor busy"),
+            lifecycle.transition_lock(store.root, timeout=0),
+        ):
+            pytest.fail("The in-flight transaction must keep its lock")
+        timer = threading.Timer(0.05, release_lock.set)
+        timer.start()
+        with lifecycle.transition_lock(store.root):
+            assert release_lock.is_set()
+        timer.join()
+    finally:
+        release_lock.set()
+        worker.join(timeout=2)
+
+
+def test_expired_mission_restores_candidate_and_rejects_queued_work(setup):
+    store, controller, backend = setup
+    baseline(store, controller)
+    release(store, "candidate")
+    run(store, controller, request("candidate-run", "candidate", "stable"))
+    release(store, "queued")
+    store.submit(request("queued-run", "queued", "stable"))
+    evolution.atomic(store.root / "control.json", {"paused": False, "expires_at": 1})
+    controller.run()
+    assert controller.state["current"] == "stable"
+    assert backend.running("server")
+    assert evolution.read(store.root / "control.json")["paused"]
+    assert (
+        evolution.read(store.root / "experiments/queued-run/result.json")["status"]
+        == "rejected"
+    )
+
+
+def test_missing_restart_parameters_never_stops_a_running_server(setup):
+    store, controller, backend = setup
+    baseline(store, controller)
+    controller.save(lifeguard=None, restart_count=100)
+    controller.probe = lambda _: False
+    starts = len(backend.starts)
+    controller.tick()
+    assert controller.state["phase"] == "blocked"
+    assert backend.running("server")
+    assert len(backend.starts) == starts
+
+
+def test_mission_expiry_during_build_keeps_stable_server(setup):
+    store, controller, backend = setup
+    baseline(store, controller)
+    release(store, "candidate", build=[["/bin/true"]])
+    starts = len(backend.starts)
+
+    def expire_after_build(*args):
+        evolution.atomic(
+            store.root / "control.json", {"paused": False, "expires_at": 1}
+        )
+
+    controller.job = expire_after_build
+    result = run(store, controller, request("expires-in-build", "candidate", "stable"))
+    assert result["status"] == "build_failed"
+    assert controller.state["current"] == "stable"
+    assert len(backend.starts) == starts
+    assert backend.running("server")
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_wait_reads_result_or_times_out_without_resubmission(setup, complete):
+    store, controller, backend = setup
+    release(store, "candidate")
+    req = request("awaited", "candidate")
+    store.submit(req)
+    if complete:
+        controller.execute(req)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SOURCE),
+            "--root",
+            str(store.root),
+            "wait",
+            "awaited",
+            "--timeout",
+            "0.01",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == (0 if complete else 1)
+    if complete:
+        assert json.loads(result.stdout)["request_hash"] == evolution.digest(req)
+    else:
+        assert "do not resubmit" in result.stderr
+    assert [p.stem for p in (store.root / "requests").glob("*.json")] == ["awaited"]
 
 
 def test_controller_restart_restores_instead_of_replaying_candidate(setup):

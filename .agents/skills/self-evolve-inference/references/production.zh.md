@@ -48,10 +48,14 @@ completion/chat 输出。使用新的 release ID 创建快照：
 停止空载 supervisor 不会停止原 GPU 服务。随后准备接管日志：
 
 ```bash
-systemctl --user stop "$EVOLUTION_UNIT"
+"$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/lifecycle.py" --root "$EVOLUTION_ROOT" stop
 "$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/adopt.py" --root "$EVOLUTION_ROOT" \
-  prepare --release NEW_RELEASE_ID --pid ACTUAL_API_PID
+  prepare --release NEW_RELEASE_ID --pid ACTUAL_API_PID --lifeguard "$LIFEGUARD_JSON"
 ```
+
+`LIFEGUARD_JSON` 是接管前写好的完整参数文件，字段见 [请求约束](supervisor.md)；
+首次接管 `rollback_release=null`，恢复目标是日志捕获的原命令，必须明确填写
+启动和恢复时间上限。
 
 `prepare` 要求空实例、无历史队列、PID 确实拥有目标监听端口、真实 token 探活
 成功且封存完整。它记录原进程的 PID、启动时间、boot ID、子进程和原始 argv/env。
@@ -74,7 +78,8 @@ systemd-run --user --unit=inference-evolution-adopt-dsv41f \
 不杀终端 cgroup，不杀整个进程组。
 
 随后由 supervisor 的独立 `server` unit 启动快照。模型列表、真实 token、
-release 声明的检查和 60 秒观察均通过，再验证封存并写入 stable，启动 watchdog。
+release 声明的检查和 60 秒观察均通过，再验证封存并写入 stable。接管脚本
+到此退出，不会自行启动 watchdog；后续实验由 skill 通过 lifecycle helper 启动。
 首次接管接受的是原生产配置的运行基线，不代表性能提高。
 
 ## 失败与中断
@@ -112,7 +117,8 @@ CPU 接管验证必须使用新的独立实例；分别安装两个空实例后�
 
 supervisor 更新需发布新的外部版本目录，保留旧包和配置备份；只在 idle、无活动
 实验及 DSH 写入时停止 controller，切换 unit、resume argv 和 skill overlay 到
-同一包版本，daemon-reload 后启动。不要覆盖正在运行的版本目录。
+同一包版本，daemon-reload 后保持停机。下一次明确启用技能时再通过 lifecycle
+helper 启动。不要覆盖正在运行的版本目录。
 `installation.json` 是定位入口，不要把旧版本号写死在日常脚本里。
 
 本机 `loginctl show-user z -p Linger` 为 yes，可在退出桌面后维持用户服务。
@@ -127,7 +133,8 @@ adoption 和实际进程引用，不能只按目录年龄删除。当前未提�
 工作分支：`evolution/dsv41f`；合并基线：`8c285117f5`。
 原 main 已保留为 `backup/main-before-evolution-20260929`。
 生产状态根：`/mnt/data/state/inference-evolution-dsv41f`。
-生产接管已完成（2026-09-29 Asia/Shanghai）：`adoption.json` 为 `adopted`，release 为 `dsv41f-baseline-20260929-r2`；`state.json` 为 `phase=idle`、`stable=current`，supervisor unit 已 active。
+历史验收（2026-09-29 Asia/Shanghai）：`adoption.json` 为 `adopted`，release 为 `dsv41f-baseline-20260929-r2`；`state.json` 为 `phase=idle`、`stable=current`，supervisor unit 当时 active。该记录不是当前运行状态；之后用户要求关闭
+维生程序和生产服务。当前状态应重新读取 unit、端口归属和 state，不能据此自动重启。
 
 验收证据：`/mnt/data/state/inference-evolution-dsv41f/production-acceptance.json` 和仓库 `artifacts/inference-evolution-production-20260929/production-acceptance.json`。真实 completion/chat 输出与接管前相同，5 个 GPU worker UUID 与原服务相同，快照 worker 未映射旧工作区库；启动耗时约 6 分钟，包含权重、Engram 和 CUDA Graph 初始化。
 

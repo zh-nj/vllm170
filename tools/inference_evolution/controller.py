@@ -83,6 +83,39 @@ def bounded(value, name, minimum=0.01, maximum=86400):
     return value
 
 
+def validate_lifeguard(value):
+    required = {
+        "startup_timeout",
+        "recovery_timeout",
+        "rollback_release",
+        "probe_timeout",
+        "failure_threshold",
+        "stable_restarts",
+        "restart_policy",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(f"Lifeguard parameters must be {sorted(required)}")
+    for key in ("startup_timeout", "recovery_timeout", "probe_timeout"):
+        bounded(
+            value[key],
+            f"lifeguard {key}",
+            maximum=60 if key == "probe_timeout" else 86400,
+        )
+    for key in ("failure_threshold", "stable_restarts"):
+        if type(value[key]) is not int:
+            raise ValueError(f"lifeguard {key} must be an integer")
+        bounded(
+            value[key],
+            f"lifeguard {key}",
+            minimum=0 if key == "stable_restarts" else 1,
+            maximum=100,
+        )
+    if value["rollback_release"] is not None:
+        identifier(value["rollback_release"])
+    if value["restart_policy"] != "restore_stable_then_block":
+        raise ValueError("Unsupported lifeguard restart policy")
+
+
 class Systemd:
     """Own only transient units carrying this state directory's description."""
 
@@ -354,7 +387,7 @@ class Store:
             atomic(path, spec)
         return name
 
-    def submit(self, request):
+    def validate_request(self, request):
         kind = request.get("kind")
         required = {
             "id",
@@ -368,7 +401,9 @@ class Store:
         if kind == "promote":
             required = {"id", "kind", "experiment", "decision"}
         elif kind == "rollback":
-            required = {"id", "kind", "reason"}
+            required = {"id", "kind", "reason", "lifeguard"}
+        elif kind == "experiment":
+            required.add("lifeguard")
         if (
             kind not in {"experiment", "promote", "rollback"}
             or set(request) != required
@@ -383,6 +418,7 @@ class Store:
             for key in ("hypothesis", "checkpoint"):
                 if not isinstance(request[key], str) or not request[key].strip():
                     raise ValueError(f"Missing {key}")
+            validate_lifeguard(request["lifeguard"])
         elif kind == "promote":
             identifier(request["experiment"])
             if (
@@ -390,8 +426,19 @@ class Store:
                 or not request["decision"].strip()
             ):
                 raise ValueError("Promotion requires a recorded decision")
-        elif not isinstance(request["reason"], str) or not request["reason"].strip():
-            raise ValueError("Rollback requires a reason")
+        elif kind == "rollback":
+            if not isinstance(request["reason"], str) or not request["reason"].strip():
+                raise ValueError("Rollback requires a reason")
+            validate_lifeguard(request["lifeguard"])
+        if (
+            kind == "experiment"
+            and request["lifeguard"]["rollback_release"] != request["baseline"]
+        ):
+            raise ValueError("Lifeguard rollback release must match the baseline")
+        return name
+
+    def submit(self, request):
+        name = self.validate_request(request)
         with lock(self.root / ".submit.lock"):
             path = self.root / "requests" / f"{name}.json"
             if path.exists():
@@ -418,7 +465,24 @@ class Controller:
         self.store.event("state", **changes)
 
     def paused(self):
-        return read(self.root / "control.json")["paused"]
+        return read(self.root / "control.json")["paused"] or self.mission_expired()
+
+    def mission_expired(self):
+        deadline = read(self.root / "control.json").get("expires_at")
+        return deadline is not None and time.time() >= deadline
+
+    def apply_lifeguard(self, value, **transition):
+        validate_lifeguard(value)
+        if value["rollback_release"] != self.state["stable"]:
+            raise ValueError("Recovery release no longer matches stable")
+        self.save(lifeguard=dict(value), **transition)
+        self.failures = 0
+
+    def parameter(self, name):
+        guard = self.state.get("lifeguard")
+        if guard is not None and name in guard:
+            return guard[name]
+        return self.config.get(name)
 
     def probe(self, release):
         spec = self.store.release(release)["probe"]
@@ -426,7 +490,7 @@ class Controller:
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(
-                base + "/v1/models", timeout=self.config["probe_timeout"]
+                base + "/v1/models", timeout=self.parameter("probe_timeout")
             ) as response:
                 models = json.load(response)
             if spec["model"] not in [item["id"] for item in models["data"]]:
@@ -443,7 +507,7 @@ class Controller:
                 ).encode(),
                 headers={"Content-Type": "application/json"},
             )
-            with opener.open(req, timeout=self.config["probe_timeout"]) as response:
+            with opener.open(req, timeout=self.parameter("probe_timeout")) as response:
                 body = json.load(response)
             return (
                 bool(body["choices"])
@@ -514,6 +578,10 @@ class Controller:
             self.backend.stop("job")
 
     def start_release(self, release, log, restoring=False):
+        guard = self.state.get("lifeguard")
+        validate_lifeguard(guard)
+        if restoring and release != guard["rollback_release"]:
+            raise RuntimeError("Recovery target is not authorized by lifeguard")
         self.seal(release, verify=True)
         spec = self.store.release(release)
         # All stop/start side effects have a durable phase before reaching here.
@@ -530,7 +598,8 @@ class Controller:
         if occupied:
             raise RuntimeError("Endpoint is already served by an unowned process")
         self.backend.start("server", spec["argv"], spec["cwd"], spec["env"], log)
-        deadline = time.monotonic() + spec["startup_timeout"]
+        startup_timeout = guard["recovery_timeout" if restoring else "startup_timeout"]
+        deadline = time.monotonic() + startup_timeout
         while time.monotonic() < deadline:
             if not restoring and self.paused():
                 raise RuntimeError("Experiment paused")
@@ -560,6 +629,15 @@ class Controller:
 
     def rollback(self, reason):
         self.capture(reason)
+        guard = self.state.get("lifeguard")
+        try:
+            validate_lifeguard(guard)
+            if guard["rollback_release"] != self.state["stable"]:
+                raise ValueError("Recovery release no longer matches stable")
+        except ValueError as error:
+            self.capture(str(error))
+            self.save(phase="blocked")
+            return False
         self.save(phase="restoring")
         self.cancel_resume()
         self.backend.stop("job")
@@ -589,6 +667,7 @@ class Controller:
             "request_hash": digest(request),
             "current": self.state["current"],
             "stable": self.state["stable"],
+            "lifeguard": self.state.get("lifeguard"),
             "finished_at": time.time(),
         }
         atomic(folder / "result.json", result)
@@ -610,11 +689,11 @@ class Controller:
                 atomic(path, item)
 
     def execute(self, request):
-        name = request["id"]
+        name = self.store.validate_request(request)
         folder = self.root / "experiments" / name
         folder.mkdir(exist_ok=True)
         if request["kind"] == "rollback":
-            self.save(active=name)
+            self.apply_lifeguard(request["lifeguard"], active=name, phase="restoring")
             ok = self.rollback(request["reason"])
             self.finish(request, "rolled_back" if ok else "blocked")
             return
@@ -643,6 +722,9 @@ class Controller:
                 phase="idle",
                 restart_count=0,
                 promotion_id=name,
+                lifeguard=dict(
+                    self.state["lifeguard"], rollback_release=source["candidate"]
+                ),
             )
             self.finish(request, "ready")
             return
@@ -690,7 +772,9 @@ class Controller:
             self.seal(candidate)
             if self.state["stable"]:
                 self.seal(self.state["stable"], verify=True)
-            self.save(phase="switching")
+            if self.paused():
+                raise RuntimeError("Experiment paused or mission deadline reached")
+            self.apply_lifeguard(request["lifeguard"], phase="switching")
             switched = True
             self.start_release(candidate, folder / "server.log")
             self.save(phase="checking")
@@ -762,6 +846,7 @@ class Controller:
         resume = self.config.get("resume")
         if (
             not resume
+            or read(self.root / "control.json").get("origin_session", False)
             or self.paused()
             or not self.state["current"]
             or self.state["phase"] not in {"idle", "ready"}
@@ -847,26 +932,36 @@ class Controller:
             return
         current = self.state["current"]
         if current:
+            try:
+                validate_lifeguard(self.state.get("lifeguard"))
+                if self.state["lifeguard"]["rollback_release"] != self.state["stable"]:
+                    raise ValueError("Recovery release no longer matches stable")
+            except ValueError as error:
+                self.capture(str(error))
+                self.save(phase="blocked")
+                return
             healthy = self.backend.running("server") and self.probe(current)
             self.failures = 0 if healthy else self.failures + 1
-            if self.failures >= self.config["failure_threshold"]:
+            if self.failures >= self.parameter("failure_threshold"):
                 if current == self.state["stable"]:
-                    if self.state["restart_count"] >= self.config["stable_restarts"]:
+                    if self.state["restart_count"] >= self.parameter("stable_restarts"):
                         self.capture("Stable restart budget exhausted")
                         self.cancel_resume()
                         self.backend.stop("server")
                         self.save(current=None, phase="blocked")
                         return
                     self.save(restart_count=self.state["restart_count"] + 1)
-                failed = current
-                ok = self.rollback("Runtime health failure")
+                guard = self.state["lifeguard"]
                 name = "runtime-" + str(time.time_ns())
                 request = {
                     "id": name,
                     "kind": "rollback",
-                    "reason": f"Runtime health failure: {failed}",
+                    "reason": f"Runtime health failure: {current}",
+                    "lifeguard": dict(guard),
                 }
                 self.store.submit(request)
+                self.save(active=name, phase="restoring")
+                ok = self.rollback(request["reason"])
                 self.finish(
                     request, "rolled_back" if ok else "blocked", request["reason"]
                 )
@@ -890,11 +985,50 @@ class Controller:
                 return
         self.resume_one()
 
+    def expire_mission(self):
+        if (
+            self.state["current"] != self.state["stable"]
+            and self.state["phase"] == "ready"
+        ):
+            request = {
+                "id": "expiry-" + str(time.time_ns()),
+                "kind": "rollback",
+                "reason": "Mission deadline reached with an unpromoted candidate",
+                "lifeguard": dict(self.state["lifeguard"]),
+            }
+            self.store.submit(request)
+            self.execute(request)
+        self.cancel_resume()
+        with lock(self.root / ".submit.lock"):
+            for path in (self.root / "requests").glob("*.json"):
+                if not (self.root / "experiments" / path.stem / "result.json").exists():
+                    self.finish(read(path), "rejected", "Mission deadline reached")
+            control = read(self.root / "control.json")
+            atomic(self.root / "control.json", dict(control, paused=True))
+        self.store.event("lifeguard_expired", server_preserved=True)
+
     def run(self, once=False):
+        if not once and not read(self.root / "control.json").get("expires_at"):
+            raise RuntimeError(
+                "Start through lifecycle.py with a finite mission budget"
+            )
         with lock(self.root / ".daemon.lock"):
-            self.recover()
             while True:
-                self.tick()
+                try:
+                    with lock(self.root / ".transition.lock"):
+                        self.recover()
+                    break
+                except BlockingIOError:
+                    time.sleep(self.config["poll_seconds"])
+            while True:
+                try:
+                    with lock(self.root / ".transition.lock"):
+                        if self.mission_expired():
+                            self.expire_mission()
+                            return
+                        self.tick()
+                except BlockingIOError:
+                    pass  # The lifecycle helper is stopping this idle daemon.
                 if once:
                     return
                 time.sleep(self.config["poll_seconds"])
@@ -908,6 +1042,9 @@ def main():
     init.add_argument("--config", type=Path)
     for name in ("register", "submit"):
         sub.add_parser(name).add_argument("file", type=Path)
+    waiter = sub.add_parser("wait")
+    waiter.add_argument("id")
+    waiter.add_argument("--timeout", type=float, required=True)
     run = sub.add_parser("run")
     run.add_argument("--once", action="store_true")
     sub.add_parser("status")
@@ -933,6 +1070,21 @@ def main():
         output = {"release": store.register(read(args.file))}
     elif args.action == "submit":
         output = store.submit(read(args.file))
+    elif args.action == "wait":
+        name = identifier(args.id)
+        bounded(args.timeout, "wait timeout")
+        store_request = read(store.root / "requests" / f"{name}.json")
+        deadline = time.monotonic() + args.timeout
+        path = store.root / "experiments" / name / "result.json"
+        while not path.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Wait budget exceeded; request is still durable, do not resubmit"
+                )
+            time.sleep(1)
+        output = read(path)
+        if output["request_hash"] != digest(store_request):
+            raise RuntimeError("Result does not match submitted request")
     elif args.action == "status":
         output = {
             "state": read(store.root / "state.json"),
@@ -946,7 +1098,8 @@ def main():
             print("".join(deque(stream, maxlen=max(1, args.lines))), end="")
         return
     elif args.action in {"pause", "continue"}:
-        output = {"paused": args.action == "pause"}
+        output = read(store.root / "control.json")
+        output["paused"] = args.action == "pause"
         atomic(store.root / "control.json", output)
     else:
         Controller(store.root).run(args.once)

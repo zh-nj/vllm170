@@ -17,7 +17,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from controller import Controller, atomic, lock, read
+from controller import Controller, atomic, lock, read, validate_lifeguard
 
 
 def pidfd_call(number, *args):
@@ -114,7 +114,10 @@ def stop_original(items, timeout=120):
         time.sleep(0.2)
 
 
-def prepare(controller, release, pid):
+def prepare(controller, release, pid, lifeguard):
+    validate_lifeguard(lifeguard)
+    if lifeguard["rollback_release"] is not None:
+        raise ValueError("Initial adoption uses the captured original command fallback")
     root = controller.root
     fd = pidfd_open(os.getpid())
     os.close(fd)
@@ -147,6 +150,7 @@ def prepare(controller, release, pid):
         raise RuntimeError("Original process changed while capturing")
     journal = {
         "stage": "prepared",
+        "lifeguard": lifeguard,
         "release": release,
         "processes": processes,
         "original": {
@@ -170,10 +174,7 @@ def fallback(controller, journal):
     controller.backend.start(
         "server", spec["argv"], spec["cwd"], spec["env"], root / "adoption-fallback.log"
     )
-    deadline = (
-        time.monotonic()
-        + controller.store.release(journal["release"])["startup_timeout"]
-    )
+    deadline = time.monotonic() + journal["lifeguard"]["recovery_timeout"]
     while time.monotonic() < deadline:
         if not controller.backend.running("server"):
             break
@@ -201,6 +202,7 @@ def run(controller, observation=60):
         elif journal["stage"] in {"fallback_running", "blocked"}:
             return
         else:
+            controller.apply_lifeguard(journal["lifeguard"])
             try:
                 if journal["stage"] != "prepared":
                     raise RuntimeError("Interrupted adoption; restore original command")
@@ -232,6 +234,7 @@ def run(controller, observation=60):
                     phase="idle",
                     active=None,
                     restart_count=0,
+                    lifeguard=dict(journal["lifeguard"], rollback_release=release),
                 )
                 journal.update(stage="adopted", finished_at=time.time())
                 atomic(root / "adoption.json", journal)
@@ -252,8 +255,6 @@ def run(controller, observation=60):
                         current=None, stable=None, active=None, phase="blocked"
                     )
                     raise
-    installation = read(root / "installation.json")
-    subprocess.run(["systemctl", "--user", "start", installation["unit"]], check=True)
 
 
 if __name__ == "__main__":
@@ -263,11 +264,12 @@ if __name__ == "__main__":
     prep = sub.add_parser("prepare")
     prep.add_argument("--release", required=True)
     prep.add_argument("--pid", required=True, type=int)
+    prep.add_argument("--lifeguard", required=True, type=Path)
     sub.add_parser("run")
     args = parser.parse_args()
     controller = Controller(args.root)
     if args.action == "prepare":
         with lock(controller.root / ".daemon.lock"):
-            prepare(controller, args.release, args.pid)
+            prepare(controller, args.release, args.pid, read(args.lifeguard))
     else:
         run(controller)

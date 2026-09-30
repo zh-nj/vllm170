@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from controller import Controller, Store, atomic, read
+from lifecycle import run as lifecycle
 
 
 def wait_for(predicate, timeout=60):
@@ -69,6 +70,15 @@ def experiment(name, candidate, baseline="good", observation=0):
             "Read result then update notes."
         ),
         "observation_seconds": observation,
+        "lifeguard": {
+            "startup_timeout": 3,
+            "recovery_timeout": 5,
+            "rollback_release": baseline,
+            "probe_timeout": 0.2,
+            "failure_threshold": 2,
+            "stable_restarts": 1,
+            "restart_policy": "restore_stable_then_block",
+        },
     }
 
 
@@ -117,7 +127,12 @@ def verify_adoption(root, fail=False):
         )
         controller.seal("capsule")
         wait_for(lambda: controller.probe("capsule"))
-        prepare_adoption(controller, "capsule", original.pid)
+        prepare_adoption(
+            controller,
+            "capsule",
+            original.pid,
+            experiment("adopt", "capsule", None)["lifeguard"],
+        )
         run_adoption(controller, observation=0.5)
         journal = read(root / "adoption.json")
         assert journal["stage"] == ("fallback_running" if fail else "adopted"), journal
@@ -158,7 +173,9 @@ def main():
     config = {k: v for k, v in original.items() if k != "resume"}
     config.update(poll_seconds=0.1, probe_timeout=0.2, failure_threshold=2)
     atomic(root / "config.json", config)
-    subprocess.run(["systemctl", "--user", "restart", unit], check=True)
+    lifecycle(
+        root, "start", experiment("bootstrap", "good", None)["lifeguard"], ttl=300
+    )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -209,16 +226,41 @@ def main():
         )
         submit(req, "rolled_back")
         assert read(root / "state.json")["current"] == "good"
-        # Leave one untouched candidate for an actual DSH submission test.
+        lifecycle(root, "stop")
+        assert Controller(root).probe("good"), (
+            "Stopping the lifeguard stopped its server"
+        )
+        assert (
+            subprocess.check_output(
+                ["systemctl", "--user", "show", unit, "-p", "ActiveState", "--value"],
+                text=True,
+            ).strip()
+            == "inactive"
+        )
+        report["cases"].append({"id": "lifecycle-stop", "status": "server-preserved"})
+        lifecycle(root, "start", experiment("next", "good")["lifeguard"], ttl=1)
+        wait_for(
+            lambda: subprocess.check_output(
+                ["systemctl", "--user", "show", unit, "-p", "ActiveState", "--value"],
+                text=True,
+            ).strip()
+            == "inactive"
+        )
+        assert Controller(root).probe("good"), (
+            "Mission expiry stopped the stable server"
+        )
+        report["cases"].append({"id": "mission-expiry", "status": "server-preserved"})
+        # Leave an unused manifest for a later explicitly authorized DSH test.
         prepare(store, python, port, "dsh-failure", mode="fail")
         report.update(status="passed", port=port, finished_at=time.time())
         atomic(root / "verification.json", report)
     finally:
-        # Restoration is explicit. DSH can now receive only the latest pending
-        # event; old notifications are retained as superseded, not replayed.
-        original["poll_seconds"] = 2
+        # Stop every CPU fixture owned by this verification, including on failure.
+        subprocess.run(["systemctl", "--user", "stop", unit], check=True)
+        backend = Controller(root).backend
+        for slot in ("job", "resume", "server"):
+            backend.stop(slot)
         atomic(root / "config.json", original)
-        subprocess.run(["systemctl", "--user", "restart", unit], check=True)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

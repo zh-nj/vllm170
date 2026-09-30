@@ -1,7 +1,7 @@
 interface:
   display_name: "Self evolve inference"
   short_description: "Safely evolve a local inference service"
-  default_prompt: "Use $self-evolve-inference to run one bounded local inference optimization experiment."
+  default_prompt: "Use $self-evolve-inference in a DSH mission to solve one dsv41f inference optimization problem; continue only when the user explicitly requests ongoing optimization."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

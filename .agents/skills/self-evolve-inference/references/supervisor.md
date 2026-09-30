@@ -13,8 +13,18 @@ From the source checkout:
 ```sh
 tools/inference_evolution/setup-supervisor.sh \
   --root /mnt/data/state/inference-evolution-validation \
-  --instance validation --dsh /mnt/data/apps/deepseek-harness --start
+  --instance validation --dsh /mnt/data/apps/deepseek-harness
 ```
+
+Installation writes the unit but does not start or enable it. A DSH mission
+starts the temporary lifeguard with `lifecycle.py start` and stops it with the
+same helper after the mission reaches a safe boundary. Start requires
+`--lifeguard FILE`; `--ttl SECONDS` sets a finite mission deadline (default 3600,
+maximum 86400). Expiry cancels new work, resolves recovery, and exits normally.
+Use the remaining authorized mission budget; do not silently renew it. See
+[the mission workflow](mission.zh.md) for complete commands. Ordinary
+optimization requests do not activate this skill: explicit user invocation is
+required; implicit invocation is disabled in `agents/openai.yaml`.
 
 Read `installation.json` under that state directory for `python`, `package`,
 `unit` and `version`. Commands use those absolute paths:
@@ -88,9 +98,25 @@ that deployment.
   "candidate": "candidate-0042",
   "hypothesis": "Reduce the measured decode data transfer cost",
   "checkpoint": "Evidence, workload, expected improvement and next action",
-  "observation_seconds": 60
+  "observation_seconds": 60,
+  "lifeguard": {
+    "startup_timeout": 900,
+    "recovery_timeout": 900,
+    "rollback_release": "release-0017",
+    "probe_timeout": 20,
+    "failure_threshold": 3,
+    "stable_restarts": 1,
+    "restart_policy": "restore_stable_then_block"
+  }
 }
 ```
+
+Every experiment and manual rollback request must include explicit lifeguard
+parameters. They are persisted before a service switch and govern startup,
+health failure recovery and the stable restart budget; omitted or invalid
+parameters are rejected. Runtime-generated rollback requests copy the active
+lifeguard parameters. Promotion does not restart the service and does not need
+this field.
 
 Use `baseline: null` only to bootstrap an empty instance. Bootstrap failure has
 no rollback target and becomes `blocked`. Every subsequent experiment must name
@@ -98,7 +124,7 @@ the current stable release and use the same probe identity. Only one unpromoted
 candidate may be active. Every ID is immutable; identical resubmission is safe.
 
 Promotion: `{"id":"promote-0042","kind":"promote","experiment":"exp-0042","decision":"Correctness and performance evidence with acceptance rationale"}`.
-Rollback: `{"id":"rollback-0042","kind":"rollback","reason":"Measured regression"}`}.
+Rollback: `{"id":"rollback-0042","kind":"rollback","reason":"Measured regression","lifeguard":{...}}`.
 Rollback restores the current stable capsule; `previous_stable` is retained for
 manual diagnosis, not automatically selected. `ready` means gates passed and
 candidate is serving, not automatic promotion. `rolled_back`, `build_failed`,
@@ -135,7 +161,6 @@ recovery; the supervisor does not reboot the host or reset GPUs.
 The second command requires a fresh installed instance, exercises actual
 systemd services on a random loopback port, and retains `verification.json` and
 all logs. It tests build/start/check failures, false token health, job timeout,
-observation crash and controller SIGKILL recovery. It leaves a CPU baseline
-running and an unused `dsh-failure` candidate for DSH submission testing. Pause
-then stop the supervisor and its hashed `server` unit after verification; do not
-delete state while its service still runs.
+observation crash and controller SIGKILL recovery, then verifies lifecycle stop
+and mission expiry preserve the stable server. Finally it stops all CPU fixture
+units; manifests and evidence remain. It never leaves a supervisor running.

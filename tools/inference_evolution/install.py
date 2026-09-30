@@ -21,7 +21,6 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--instance", default="dsv41f")
     parser.add_argument("--dsh", type=Path)
-    parser.add_argument("--start", action="store_true")
     args = parser.parse_args()
     identifier(args.instance)
     root = args.root.expanduser().resolve()
@@ -51,6 +50,7 @@ def main():
             "adopt.py",
             "snapshot.py",
             "smoke.py",
+            "lifecycle.py",
         )
     ]
     skill = repo / ".agents/skills/self-evolve-inference"
@@ -156,8 +156,6 @@ def main():
         },
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    if args.start:
-        subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
     print(json.dumps({"unit": unit, "root": str(root), "package": str(package)}))
 
 

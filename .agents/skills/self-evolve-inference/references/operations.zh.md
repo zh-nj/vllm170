@@ -46,10 +46,12 @@ skill 目录保持短小，运行代码在 `tools/inference_evolution`：
 └── references/
     ├── supervisor.md                # 英文字段约束、安装和验证参考
     ├── operations.zh.md             # 本中文操作手册
-    └── production.zh.md              # 生产接管、失败恢复和实机验证
+    ├── mission.zh.md                # 明确启用、任务预算、生命周期和报告
+    └── production.zh.md             # 生产接管、失败恢复和实机验证
 
 tools/inference_evolution/
 ├── controller.py                    # Store、Systemd、Controller 和 CLI
+├── lifecycle.py                     # skill 启停、事务互斥、有限任务期限
 ├── dsh_bridge.py                    # 调用 headless DSH、记录 session/receipt
 ├── dsh.patch.yml                    # 本地 dsv41f 路由和 notes-only overlay 模板
 ├── install.py                       # 复制 pinned package、建 uv 环境和 user unit
@@ -70,7 +72,7 @@ tools/inference_evolution/
 - `Controller.start_release` 重新校验 seal、停止自己拥有的 server、检查端口归属、启动并执行真实 token probe。
 - `Controller.execute` 实现 build → seal → switch → check → observe → ready；候选失败进入回滚。
 - `Controller.rollback/recover/tick` 实现恢复、运行期健康门、稳定版重启预算、blocked 和 outbox 派送。
-- controller CLI 只有 `init`、`register`、`submit`、`run`、`status`、`logs`、`pause`、`continue`。首次接管使用独立的 `adopt.py`，见 [生产接管说明](production.zh.md)。
+- controller CLI 只有 `init`、`register`、`submit`、`wait`、`run`、`status`、`logs`、`pause`、`continue`。首次接管使用独立的 `adopt.py`，见 [生产接管说明](production.zh.md)。
 
 ## 3. 外部安装目录和状态目录
 
@@ -83,6 +85,7 @@ tools/inference_evolution/
     ├── controller.py
     ├── dsh_bridge.py
     ├── dsh.patch.yml
+    ├── lifecycle.py
     ├── adopt.py
     ├── snapshot.py
     ├── smoke.py
@@ -99,9 +102,9 @@ tools/inference_evolution/
 ```text
 <root>/
 ├── installation.json       # root、pinned python、package、unit、version
-├── config.json             # poll/probe/failure/restart/resume 配置
-├── control.json            # {"paused": false}；pause 只停新工作和 resume
-├── state.json              # stable/current/phase/active/previous_stable 等
+├── config.json             # poll/resume 配置和历史探活默认值
+├── control.json            # paused、origin_session、expires_at（任务期限）
+├── state.json              # stable/current/phase/active、当前 lifeguard 等
 ├── events.jsonl            # fsync 的状态和事件时间线
 ├── recovery.log            # 稳定版恢复 server 的输出
 ├── adoption.json           # 首次接管阶段和原命令环境；私有，不共享全文
@@ -201,9 +204,11 @@ tools/inference_evolution/
 tools/inference_evolution/setup-supervisor.sh \
   --root /mnt/data/state/inference-evolution-validation \
   --instance validation \
-  --dsh /mnt/data/apps/deepseek-harness \
-  --start
+  --dsh /mnt/data/apps/deepseek-harness
 ```
+
+安装只写入 unit，不启动也不 enable。DSH 任务开始时由 skill 用
+`lifecycle.py start` 启动临时 CPU lifeguard，任务结束后用同一 helper stop。
 
 安装器拒绝非空 root、已有 unit 和 checkout 内的 prefix/root，以避免覆盖旧状态。生产 root 目前的安装记录必须通过 `installation.json` 定位，不要猜测 package 版本：
 
@@ -230,12 +235,15 @@ EVOLUTION_PYTHON=$($PINNED -c 'import json,sys; print(json.load(open(sys.argv[1]
 EVOLUTION_PACKAGE=$($PINNED -c 'import json,sys; print(json.load(open(sys.argv[1]))["package"])' "$INSTALLATION")
 ```
 
-按授权启动、暂停或恢复 unit：
+用户明确启用本技能后，按 [任务协议](mission.zh.md) 写好 `MISSION` 目录和本轮
+lifeguard 文件，再启动、暂停或恢复 unit：
 
 ```text
-systemctl --user start "$EVOLUTION_UNIT"
+"$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/lifecycle.py" \
+  --root "$ROOT" --lifeguard "$MISSION/lifeguard.json" --ttl 3600 start
 "$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/controller.py" --root "$ROOT" pause
 "$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/controller.py" --root "$ROOT" continue
+"$EVOLUTION_PYTHON" "$EVOLUTION_PACKAGE/lifecycle.py" --root "$ROOT" stop
 ```
 
 `pause` 不会停止 watchdog，也不会停止已拥有的 server unit；它阻止新的实验和恢复 turn，活动实验在下一个边界回滚。`continue` 不会清除 `blocked`。停止 supervisor unit 本身也不会停止它单独拥有的 server unit，停止生产服务前必须查看 `status` 中的归属并使用明确的 recovery 流程。
@@ -301,7 +309,16 @@ mkdir -p "$ROOT/releases/candidate-0042"
   "candidate": "candidate-0042",
   "hypothesis": "降低已测得的 decode 数据搬运成本",
   "checkpoint": "记录 workload、GPU/PP 配置、正确性门、性能门和回滚 release；结果只解释本次范围",
-  "observation_seconds": 120
+  "observation_seconds": 120,
+  "lifeguard": {
+    "startup_timeout": 900,
+    "recovery_timeout": 900,
+    "rollback_release": "release-0017",
+    "probe_timeout": 20,
+    "failure_threshold": 3,
+    "stable_restarts": 1,
+    "restart_policy": "restore_stable_then_block"
+  }
 }
 ```
 
@@ -331,7 +348,16 @@ promotion 成功后，`stable` 变为 candidate，旧 stable 写入 `previous_st
 {
   "id": "rollback-0042",
   "kind": "rollback",
-  "reason": "candidate 在观察窗口出现 token probe 失败，恢复已封存 stable"
+  "reason": "candidate 在观察窗口出现 token probe 失败，恢复已封存 stable",
+  "lifeguard": {
+    "startup_timeout": 900,
+    "recovery_timeout": 900,
+    "rollback_release": "release-0017",
+    "probe_timeout": 20,
+    "failure_threshold": 3,
+    "stable_restarts": 1,
+    "restart_policy": "restore_stable_then_block"
+  }
 }
 ```
 
@@ -374,7 +400,26 @@ journalctl --user -u "$EVOLUTION_UNIT" -f
 
 `outbox/<id>.json` 为 `uncertain` 时，DSH 进程可能已经接受请求但本地进程在 receipt 写完前退出。不要重放同一 prompt，也不要提交第二个实验。读取对应 result、state、current note 和 receipt；让同一个已保存 session 的 notes-only recovery turn 解释结果。旧 pending 通知可被标记为 `superseded`，原始 result 永远保留。
 
-### 7.4 pause、重启和运行期故障
+### 7.4 DSH 任务与 lifeguard 生命周期
+
+DSH 用户会话是优化任务负责人。默认 bounded 任务在 solved、infeasible-for-now、
+预算耗尽、门禁失败或 blocked 后停止；只有用户明确要求持续自动优化时才进入
+continuous 模式。任务目录、报告模板和续接规则见 `references/mission.zh.md`。
+
+用户明确启用自进化技能后，skill 在首次受管实验前用 `lifecycle.py start`
+和 `--lifeguard FILE --ttl SECONDS` 启动 CPU supervisor；任务结束
+且 `state.active=null`、`phase` 为 `idle` 或 `blocked` 后用同一脚本 `stop`。stop
+只关闭 lifeguard，不停止 stable server。任何实验切换、回滚、恢复或 build job 活动
+时 helper 都拒绝 stop。continuous 模式在迭代之间保持 supervisor，直到用户停止或
+任务 stop 条件触发。
+
+每个 experiment 和人工 rollback request 都必须携带 `lifeguard`：
+`startup_timeout`、`recovery_timeout`、`rollback_release`、`probe_timeout`、
+`failure_threshold`、`stable_restarts` 和 `restart_policy`。controller 在服务
+切换前将其 fsync 到 `state.json`，运行期自动 rollback 复制当前参数；没有明确
+参数的重启决定会被拒绝。promotion 不重启服务，不需要该字段。
+
+### 7.5 pause、重启和运行期故障
 
 pause 仍让健康 watchdog 运行；正在执行的实验会在边界看到 pause 并回滚。controller 重启时先读取 durable phase：健康稳定版上的 build 中断会标为 `build_failed`，切换或恢复阶段中断会尝试恢复已封存 stable，不会重新执行未知 build 或假定 check 已通过。运行期 probe 连续失败时会先使用有限的 stable restart budget；预算耗尽则停止 server 并进入 blocked。
 
