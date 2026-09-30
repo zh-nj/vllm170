@@ -235,16 +235,30 @@ class CEDMetadata:
             positions=suffix["positions"],
             is_prefilling=torch.tensor([r.is_prefilling for r in active]),
         )
+        prefill_bounds = [
+            (index, request.replay_count if request.use_ced else int(seq_cpu[index]))
+            for index, request in enumerate(active)
+            if request.is_prefilling
+        ]
         for metadata in step.replay_metadata.values():
             if (
                 isinstance(metadata, DeepseekSparseSWAMetadata)
                 and metadata.prefill_gather_lens is not None
             ):
-                bounds = [
-                    r.replay_count if r.use_ced else int(seq_cpu[i])
-                    for i, r in enumerate(active)
-                    if r.is_prefilling
-                ]
+                # `prefill_gather_lens` is sized by the attention's own split,
+                # which sends a chunked-prefill tail to the decode side unless
+                # `dsv41_strict_prefill_tail` is set. The batch is ordered
+                # decode -> short_extend -> long_extend -> prefill, so the rows
+                # that split counts as prefill are the tail of the prefilling
+                # run: slice there and the two lengths agree under either
+                # setting instead of tripping torch.minimum.
+                rows = metadata.prefill_gather_lens.shape[0]
+                assert rows <= len(prefill_bounds), (
+                    f"CED replay built {rows} prefill rows from "
+                    f"{len(prefill_bounds)} prefilling requests"
+                )
+                start = len(prefill_bounds) - rows
+                bounds = [bound for _, bound in prefill_bounds[start:]]
                 metadata.prefill_gather_lens = torch.minimum(
                     metadata.prefill_gather_lens,
                     metadata.prefill_gather_lens.new_tensor(bounds),

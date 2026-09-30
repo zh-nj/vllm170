@@ -11,6 +11,7 @@ import torch
 from vllm.models.deepseek_v4_1.ced import CEDMetadata, SuffixBuffer
 from vllm.models.deepseek_v4_1.pp_kv import SharedKVTransferPlan
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
 
 @pytest.mark.parametrize("chunks", [[1024] * 32, [128, 2], [31, 31, 31, 31, 9], [17]])
@@ -834,3 +835,99 @@ def test_ced_replay_metadata_keeps_source_keys_in_independent_builders(monkeypat
     assert replay_group.builder is not group.builder
     assert captured[0]["num_tokens"] == 128
     assert positions.numel() == 256
+
+
+# sparse_swa.py sizes its split by 1 + 2 * num_speculative_tokens a DSpark
+# draft config reports, so a replay of at most this many rows is classified as
+# a short extend rather than a prefill.
+DECODE_THRESHOLD = 11
+
+
+def _prepare_mixed_ced_batch(monkeypatch, rows):
+    """Run `CEDMetadata.prepare` over mixed decode/prefill rows.
+
+    `rows` are (request_id, computed_prefill_tokens, row_count, prefill_len,
+    is_prefilling). The builder mock sizes `prefill_gather_lens` from the real
+    `split_decodes_and_prefills`, which is what separates this from a crash.
+    """
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128))
+    )
+    state = CEDMetadata(config, torch.device("cpu"))
+    state.groups = []
+
+    def build(**kwargs):
+        common = SimpleNamespace(
+            max_query_len=kwargs["max_query_len"],
+            num_reqs=kwargs["num_reqs"],
+            num_actual_tokens=kwargs["num_tokens"],
+            query_start_loc_cpu=kwargs["query_start_loc_cpu"],
+            is_prefilling=kwargs["is_prefilling"],
+        )
+        num_prefills = split_decodes_and_prefills(
+            common,
+            decode_threshold=DECODE_THRESHOLD,
+            treat_short_extends_as_decodes=True,
+        )[1]
+        return {
+            "decoder.swa": DeepseekSparseSWAMetadata(
+                block_table=torch.zeros(1, 8, dtype=torch.int32),
+                slot_mapping=torch.zeros(
+                    sum(row[2] for row in rows), dtype=torch.int32
+                ),
+                block_size=32,
+                num_prefills=num_prefills,
+                prefill_gather_lens=torch.zeros(num_prefills, dtype=torch.int32),
+            )
+        }
+
+    monkeypatch.setattr("vllm.models.deepseek_v4_1.ced.build_attn_metadata", build)
+    positions = torch.cat(
+        [torch.arange(start, start + count) for _, start, count, _, _ in rows]
+    )
+    counts = [row[2] for row in rows]
+    computed = torch.tensor([row[1] for row in rows])
+    batch = SimpleNamespace(
+        has_prefill=True,
+        num_reqs=len(rows),
+        is_prefilling_np=np.array([row[4] for row in rows]),
+        num_computed_prefill_tokens_np=np.array([row[1] for row in rows]),
+        prefill_len_np=np.array([row[3] for row in rows]),
+        query_start_loc_np=torch.tensor([0, *torch.tensor(counts).cumsum(0).tolist()]),
+        num_tokens=sum(counts),
+        req_ids=[row[0] for row in rows],
+        positions=positions,
+        input_ids=positions + 100,
+        seq_lens=computed + torch.tensor(counts),
+        seq_lens_cpu_upper_bound=computed + torch.tensor(counts),
+    )
+    return state.prepare(batch, (), positions[None, :], [], None)
+
+
+def test_ced_short_extend_does_not_desync_replay_bounds(monkeypatch):
+    """A short extend beside two longer prefills must not abort the engine."""
+    rows = [
+        ("decode", 40, 1, 41, False),
+        ("short", 0, 3, 3, True),
+        ("long1", 0, 128, 128, True),
+        ("long2", 0, 100, 100, True),
+    ]
+    step = _prepare_mixed_ced_batch(monkeypatch, rows)
+    # the split counts two prefills out of three prefilling rows, so bounds
+    # must have been sliced to the same two rows
+    gather = step.replay_metadata["decoder.swa"].prefill_gather_lens
+    assert gather.numel() == 2, gather
+
+
+def test_ced_short_extend_does_not_broadcast_replay_bounds(monkeypatch):
+    """One long prefill beside a short extend must not silently broadcast."""
+    rows = [
+        ("decode", 40, 1, 41, False),
+        ("short", 0, 3, 3, True),
+        ("long", 0, 128, 128, True),
+    ]
+    step = _prepare_mixed_ced_batch(monkeypatch, rows)
+    # torch.minimum([1], [2]) would return two rows and apply the short
+    # extend's bound to the long prefill instead of raising
+    gather = step.replay_metadata["decoder.swa"].prefill_gather_lens
+    assert gather.numel() == 1, gather
