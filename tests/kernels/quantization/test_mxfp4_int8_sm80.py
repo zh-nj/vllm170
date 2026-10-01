@@ -4,6 +4,7 @@
 import importlib
 import json
 import subprocess
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1671,14 +1672,16 @@ def test_harness_nonunit_scales_reject_incorrect_epilogues(
 
 
 @_NEEDS_SM80
+@pytest.mark.parametrize("initial_clamp", [None, 10.0])
 def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
-    tilelang_offline_modules, monkeypatch
+    tilelang_offline_modules, monkeypatch, initial_clamp
 ):
     """Compare the real quantize/GEMM/activation/reduce path and shape fallback."""
     if torch.cuda.get_device_capability() != (8, 0):
         pytest.skip("the frozen candidate targets SM80 only")
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm.model_executor.layers.fused_moe.experts import (
+        dsv41_sm80_activation,
         dsv41_sm80_tilelang,
         mxfp4_int8_sm80,
     )
@@ -1693,6 +1696,7 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
         "activation_situ_linear_beta",
     ):
         setattr(moe, key, None)
+    moe.swiglu_limit = initial_clamp
     device = torch.device("cuda")
     w13 = bench.build_packed_weights(384, "w13", device, seed=911)
     w2 = bench.build_packed_weights(384, "w2", device, seed=912)
@@ -1714,15 +1718,23 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
     candidate = Mxfp4Int8Sm80Experts(moe, quant)
     candidate.process_weights_after_loading(layer)
     assert candidate._tilelang_decode_gemms is not None
+    assert candidate._tilelang_m6_w2 is not None
+    assert candidate._tilelang_activation_quant is not None
     config.additional_config["dsv41_sm80_moe_tilelang"] = False
     baseline = Mxfp4Int8Sm80Experts(moe, quant)
     baseline.process_weights_after_loading(layer)
     assert baseline._tilelang_decode_gemms is None
+    assert baseline._tilelang_m6_w2 is None
+    assert baseline._tilelang_activation_quant is None
 
     def no_compilation(*args, **kwargs):
         pytest.fail("forward/capture must never compile or tune")
 
     monkeypatch.setattr(dsv41_sm80_tilelang, "compile_decode_gemms", no_compilation)
+    monkeypatch.setattr(dsv41_sm80_tilelang, "compile_m6_w2", no_compilation)
+    monkeypatch.setattr(
+        dsv41_sm80_activation, "compile_activation_quant", no_compilation
+    )
     launches = []
 
     def tracked(index, kernel):
@@ -1735,8 +1747,26 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
     candidate._tilelang_decode_gemms = tuple(
         tracked(i, kernel) for i, kernel in enumerate(candidate._tilelang_decode_gemms)
     )
+    candidate._tilelang_activation_quant = tracked(
+        2, candidate._tilelang_activation_quant
+    )
+    candidate._tilelang_m6_w2 = tracked(3, candidate._tilelang_m6_w2)
     generator = torch.Generator(device=device).manual_seed(913)
-    for tokens, topk in ((1, 6), (2, 6), (1, 3)):
+    for tokens, topk, clamp in (
+        (1, 6, initial_clamp),
+        (2, 6, initial_clamp),
+        (6, 6, initial_clamp),
+        (7, 6, initial_clamp),
+        (22, 6, initial_clamp),
+        (1, 3, initial_clamp),
+        (6, 6, 0.01),
+    ):
+        candidate.activation_config = replace(
+            candidate.activation_config, clamp_limit=clamp
+        )
+        baseline.activation_config = replace(
+            baseline.activation_config, clamp_limit=clamp
+        )
         hidden = torch.randn(
             (tokens, 5120), device=device, dtype=torch.bfloat16, generator=generator
         )
@@ -1786,7 +1816,14 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
         launches.clear()
         base_call()
         cand_call()
-        assert launches == ([0, 1] if (tokens, topk) == (1, 6) else [])
+        expected_launches = [0, 2, 1] if tokens == 1 and topk == 6 else []
+        if tokens in (2, 6) and topk == 6 and clamp == initial_clamp:
+            expected_launches = [2]
+        if tokens == 7 and topk == 6 and clamp == initial_clamp:
+            expected_launches = [2]
+        if tokens == 6 and topk == 6:
+            expected_launches.append(3)
+        assert launches == expected_launches
         assert bench.first_mismatch(output, expected)["bitwise_exact"]
         assert bench.first_mismatch(slots, expected_slots)["bitwise_exact"]
 
@@ -1801,6 +1838,9 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
                 )
             )
             ids.add_(37).remainder_(384)
+            if tokens == 6 and topk == 6:
+                # A captured hot route must also overwrite all spread-route slots.
+                ids.copy_(torch.arange(36, device=device).view(6, 6) + 37)
             base_call()
             output.fill_(float("nan"))
             slots.fill_(float("nan"))
@@ -1808,6 +1848,15 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
             torch.accelerator.synchronize()
             assert bench.first_mismatch(output, expected)["bitwise_exact"]
             assert bench.first_mismatch(slots, expected_slots)["bitwise_exact"]
+
+        if tokens == 6 and topk == 6:
+            monkeypatch.setattr(mxfp4_int8_sm80, "_DECODE_BLOCK_N", 64)
+            launches.clear()
+            base_call()
+            cand_call()
+            assert 3 not in launches
+            assert bench.first_mismatch(output, expected)["bitwise_exact"]
+            monkeypatch.setattr(mxfp4_int8_sm80, "_DECODE_BLOCK_N", 128)
 
 
 @pytest.mark.parametrize("requested,minor", [(False, 0), (True, 6)])
@@ -1841,3 +1890,193 @@ def test_dsv41_tilelang_load_gate_does_not_import_for_ineligible_device(
     )
     experts.process_weights_after_loading(layer)
     assert experts._tilelang_decode_gemms is None
+    assert experts._tilelang_m6_w2 is None
+    assert experts._tilelang_activation_quant is None
+
+
+@pytest.mark.parametrize("source", ["moe", "quant"])
+def test_dsv41_tilelang_load_preserves_clamped_activation(monkeypatch, source):
+    """Both clamp sources retain activation while the GEMMs can remain enabled."""
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm.model_executor.layers.fused_moe.experts import (
+        dsv41_sm80_activation,
+        dsv41_sm80_tilelang,
+    )
+    from vllm.model_executor.layers.fused_moe.experts import (
+        mxfp4_int8_sm80 as impl,
+    )
+
+    config, moe = _tilelang_gate_inputs(switch=True)
+    for key in (
+        "swiglu_limit",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+    ):
+        setattr(moe, key, None)
+    if source == "moe":
+        moe.swiglu_limit = 7.0
+    quant = FusedMoEQuantConfig.make(
+        gemm1_clamp_limit=7.0 if source == "quant" else None
+    )
+    monkeypatch.setattr(impl, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(impl.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        impl.current_platform,
+        "get_device_capability",
+        lambda device_id: SimpleNamespace(major=8, minor=0),
+    )
+    monkeypatch.setattr(
+        dsv41_sm80_tilelang, "prepare_decode_gemms", lambda *args: ("w13", "w2")
+    )
+    monkeypatch.setattr(dsv41_sm80_tilelang, "prepare_m6_w2", lambda *args: "m6_w2")
+
+    def unexpected_prepare(device):
+        pytest.fail("a clamped layer must not compile or warm the fused activation")
+
+    monkeypatch.setattr(
+        dsv41_sm80_activation, "prepare_activation_quant", unexpected_prepare
+    )
+    experts = Mxfp4Int8Sm80Experts(moe, quant)
+    layer = SimpleNamespace(
+        w13_mxfp4_int8_shift2=torch.empty(1), w2_mxfp4_int8_shift2=torch.empty(1)
+    )
+    experts.process_weights_after_loading(layer)
+    assert experts.activation_config.clamp_limit == 7.0
+    assert experts._tilelang_decode_gemms == ("w13", "w2")
+    assert experts._tilelang_m6_w2 == "m6_w2"
+    assert experts._tilelang_activation_quant is None
+
+
+@pytest.fixture(
+    scope="module", params=[(False, None), (True, None), (False, 10.0), (True, 10.0)]
+)
+def tilelang_swiglu_int8(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("the SwiGLU candidate targets SM80")
+    impl = importlib.import_module(
+        "benchmarks.kernels.deepseek_v41_moe_tilelang_activation"
+    )
+    fast_math, clamp_limit = request.param
+    kernel = impl.tilelang.compile(
+        impl.build_swiglu_int8(
+            threads=256, fast_math=fast_math, clamp_limit=clamp_limit
+        ),
+        pass_configs=impl.PASS_CONFIGS,
+    )
+    return kernel, clamp_limit
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+@pytest.mark.parametrize("clamp_limit", [None, 10.0])
+def test_tilelang_swiglu_math_matches_every_finite_bf16_gate(fast_math, clamp_limit):
+    """Certify the BF16 SiLU round before later quantization can hide a drift."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("the SwiGLU candidate targets SM80")
+    impl = importlib.import_module(
+        "benchmarks.kernels.deepseek_v41_moe_tilelang_activation"
+    )
+    assert (
+        impl.certify_swiglu_math(fast_math=fast_math, clamp_limit=clamp_limit)[
+            "bitwise_mismatches"
+        ]
+        == 0
+    )
+
+
+def _cuda_swiglu_int8_reference(x, clamp_limit=None):
+    middle = torch.empty((x.shape[0], 2304), device=x.device, dtype=torch.bfloat16)
+    if clamp_limit is None:
+        torch.ops._C.silu_and_mul(middle, x)
+    else:
+        torch.ops._C.silu_and_mul_with_clamp(middle, x, clamp_limit, 1.0, 0.0)
+    return quantize_per_token_int8(middle)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 18, 36, 40, 128])
+@pytest.mark.parametrize("pattern", ["random", "small", "large", "rne", "zero"])
+def test_tilelang_swiglu_int8_matches_materialized_rounding(
+    tilelang_swiglu_int8, rows, pattern
+):
+    """The fused path must reproduce both CUDA BF16 rounds and INT8 q/scale."""
+    kernel, clamp_limit = tilelang_swiglu_int8
+    generator = torch.Generator(device="cuda").manual_seed(541 + rows)
+    x = torch.randn(
+        (rows, 4608), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    if pattern == "small":
+        x.mul_(2**-8)
+    elif pattern == "large":
+        x.mul_(2**8)
+    elif pattern == "zero":
+        x[:, :2304].zero_()
+        x[::2, :2304].fill_(-0.0)
+    elif pattern == "rne":
+        # BF16 SiLU(8) rounds to 8; a power-of-two scale preserves exact ties.
+        x[:, :2304].fill_(8)
+        unit_scale = 1.0 if clamp_limit is None else 0.5
+        levels = torch.tensor(
+            [0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5], device="cuda"
+        ).repeat(330)[:2304]
+        x[:, 2304:].copy_((levels * unit_scale / 8).bfloat16())
+        x[:, -1] = 127 * unit_scale / 8
+    expected_q, expected_s = _cuda_swiglu_int8_reference(x, clamp_limit)
+    q = torch.full_like(expected_q, -128)
+    scale = torch.full_like(expected_s, float("nan"))
+    kernel(x, q, scale)
+    torch.accelerator.synchronize()
+    assert torch.equal(q, expected_q)
+    assert torch.equal(scale.view(torch.int32), expected_s.view(torch.int32))
+
+
+def test_tilelang_swiglu_int8_finite_bf16_gate_codes(tilelang_swiglu_int8):
+    """Cover every finite BF16 gate code with several finite product magnitudes."""
+    kernel, clamp_limit = tilelang_swiglu_int8
+    bits = torch.arange(65536, device="cuda", dtype=torch.int32)
+    bits = bits[(bits & 0x7F80) != 0x7F80]
+    gates = bits.to(torch.int16).view(torch.bfloat16)
+    gates = gates.repeat(4)
+    ups = torch.tensor([1, -1, 0.333984375, -0.333984375], device="cuda")
+    ups = ups.repeat_interleave(bits.numel()).bfloat16()
+    rows = (gates.numel() + 2303) // 2304
+    x = torch.zeros((rows, 4608), device="cuda", dtype=torch.bfloat16)
+    x[:, :2304].copy_(
+        torch.nn.functional.pad(gates, (0, rows * 2304 - gates.numel())).view(
+            rows, 2304
+        )
+    )
+    x[:, 2304:].copy_(
+        torch.nn.functional.pad(ups, (0, rows * 2304 - ups.numel())).view(rows, 2304)
+    )
+    expected_q, expected_s = _cuda_swiglu_int8_reference(x, clamp_limit)
+    q, scale = torch.empty_like(expected_q), torch.empty_like(expected_s)
+    kernel(x, q, scale)
+    torch.accelerator.synchronize()
+    assert torch.equal(q, expected_q)
+    assert torch.equal(scale.view(torch.int32), expected_s.view(torch.int32))
+
+
+def test_tilelang_swiglu_int8_graph_tracks_changed_input(tilelang_swiglu_int8):
+    """Replay must read current input and overwrite all q/scale outputs."""
+    kernel, clamp_limit = tilelang_swiglu_int8
+    x = torch.zeros((6, 4608), device="cuda", dtype=torch.bfloat16)
+    q = torch.empty((6, 2304), device="cuda", dtype=torch.int8)
+    scale = torch.empty((6,), device="cuda", dtype=torch.float32)
+    kernel(x, q, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernel(x, q, scale)
+    generator = torch.Generator(device="cuda").manual_seed(547)
+    for magnitude in (0.0, 1.0, 8.0):
+        x.copy_(
+            torch.randn(x.shape, device="cuda", dtype=x.dtype, generator=generator)
+            * magnitude
+        )
+        expected_q, expected_s = _cuda_swiglu_int8_reference(x, clamp_limit)
+        q.fill_(-128)
+        scale.fill_(float("nan"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.equal(q, expected_q)
+        assert torch.equal(scale.view(torch.int32), expected_s.view(torch.int32))

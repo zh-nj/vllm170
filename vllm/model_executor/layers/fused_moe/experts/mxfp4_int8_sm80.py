@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental DSV4.1 MXFP4 -> INT8 modular MoE backend for SM80."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -44,6 +45,8 @@ _TARGET_TOPK = 6
 _DRAFT_TOPK = 3
 _DECODE_NUM_EXPERTS = 384
 _DECODE_BLOCK_M = 16
+_TILELANG_MAX_ROUTED_ROWS = 128
+_TILELANG_W2_TOKENS = 6
 _TILE_TABLE: tuple[tuple[int, int, int], ...] = (
     (1, 16, 128),
     (1024, 16, 128),
@@ -193,6 +196,9 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
             get_current_vllm_config_or_none(), moe_config
         )
         self._tilelang_decode_gemms = None
+        self._tilelang_m6_w2: Callable[..., None] | None = None
+        self._tilelang_activation_quant: Callable[..., None] | None = None
+        self._tilelang_activation_clamp: float | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.w13_shift2 = layer.w13_mxfp4_int8_shift2
@@ -201,6 +207,9 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
             make_mxfp4_int8_sm80_decode_metadata(self.w13_shift2.device)
         )
         self._tilelang_decode_gemms = None
+        self._tilelang_m6_w2 = None
+        self._tilelang_activation_quant = None
+        self._tilelang_activation_clamp = None
         if self._tilelang_requested and current_platform.is_cuda():
             capability = current_platform.get_device_capability(
                 self.w13_shift2.device.index
@@ -221,8 +230,28 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     self.decode_sorted_ids,
                     self.decode_num_post_pad,
                 )
+                self._tilelang_m6_w2 = dsv41_sm80_tilelang.prepare_m6_w2(
+                    layer, self.w2_scale
+                )
+                if self.activation_config.clamp_limit in (None, 10.0):
+                    from vllm.model_executor.layers.fused_moe.experts import (
+                        dsv41_sm80_activation,
+                    )
+
+                    self._tilelang_activation_quant = (
+                        dsv41_sm80_activation.prepare_activation_quant(
+                            self.w13_shift2.device, self.activation_config.clamp_limit
+                        )
+                    )
+                    self._tilelang_activation_clamp = self.activation_config.clamp_limit
+                    logger.info_once(
+                        "DSV41F SM80 TileLang SwiGLU+INT8 A2 enabled for "
+                        "top-k6, E=384, SILU clamp=%s, routed rows <= 128.",
+                        self._tilelang_activation_clamp,
+                    )
                 logger.info_once(
-                    "DSV41F SM80 TileLang PRMT enabled for M=1, E=384, top-k6; "
+                    "DSV41F SM80 TileLang PRMT enabled for M=1 GEMMs and "
+                    "M=6 W2/BN128, E=384, top-k6; "
                     "other shapes use CUTLASS."
                 )
 
@@ -427,14 +456,46 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     block_n,
                     False,
                 )
-        with optional_phase_profile_stage("moe.mxfp4_sm80.activation", gate_up):
-            self.activation(activation, intermediate, gate_up)
-
-        with optional_phase_profile_stage("moe.mxfp4_sm80.w2_quant", intermediate):
-            a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
+        activation_quant = self._tilelang_activation_quant
+        if (
+            activation_quant is not None
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == self._tilelang_activation_clamp
+            and topk == _TARGET_TOPK
+            and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
+            and 0 < num_routed <= _TILELANG_MAX_ROUTED_ROWS
+        ):
+            # INT8 rows and FP32 scales share the unused BF16 activation region.
+            # The scale offset is aligned because I=2304 is divisible by four.
+            q_numel = num_routed * _INTERMEDIATE_SIZE
+            a2_q = (
+                intermediate.view(torch.int8)
+                .flatten()[:q_numel]
+                .view(num_routed, _INTERMEDIATE_SIZE)
+            )
+            a2_token_scale = intermediate.view(torch.float32).flatten()[
+                q_numel // 4 : q_numel // 4 + num_routed
+            ]
+            with optional_phase_profile_stage(
+                "moe.mxfp4_sm80.activation_w2_quant", gate_up
+            ):
+                activation_quant(gate_up, a2_q, a2_token_scale)
+        else:
+            with optional_phase_profile_stage("moe.mxfp4_sm80.activation", gate_up):
+                self.activation(activation, intermediate, gate_up)
+            with optional_phase_profile_stage("moe.mxfp4_sm80.w2_quant", intermediate):
+                a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
         with optional_phase_profile_stage("moe.mxfp4_sm80.w2_gemm", intermediate):
-            if decode_gemms is not None:
-                decode_gemms[1](
+            w2_gemm = decode_gemms[1] if decode_gemms is not None else None
+            if (
+                m == _TILELANG_W2_TOKENS
+                and topk == _TARGET_TOPK
+                and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
+                and (block_m, block_n) == (_DECODE_BLOCK_M, 128)
+            ):
+                w2_gemm = self._tilelang_m6_w2
+            if w2_gemm is not None:
+                w2_gemm(
                     a2_q,
                     a2_token_scale,
                     w2,

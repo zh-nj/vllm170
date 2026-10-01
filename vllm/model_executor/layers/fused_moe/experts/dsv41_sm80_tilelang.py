@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Frozen M=1, E=384, top-k6 PRMT grouped GEMMs for DSV41F on SM80.
+"""Frozen M=1 GEMMs and M=6 W2 PRMT for DSV41F E384/top-k6 on SM80.
 
 Imported only after the model/backend/device opt-in gate. No runtime search or
 benchmark dependencies; callers own all tensors and routing metadata.
@@ -19,6 +19,10 @@ from vllm.model_executor.layers.fused_moe.experts.mxfp4_int8_sm80 import (
     _HIDDEN_SIZE,
     _INTERMEDIATE_SIZE,
     _TARGET_TOPK,
+    _TILELANG_W2_TOKENS,
+)
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
 )
 from vllm.tilelang_utils import T, tilelang
 
@@ -43,6 +47,12 @@ __device__ __forceinline__ uint64_t dsv41_decode_x2(uint32_t q4_pair, uint32_t s
   uint32_t lo = dsv41_decode_x1(q4_pair, shift);
   uint32_t hi = dsv41_decode_x1(q4_pair >> 16, shift);
   return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+"""
+
+_PACKED_WORD_LOAD_SOURCE = r"""
+__device__ __forceinline__ uint32_t dsv41_load_u32(const uint8_t* data) {
+  return *reinterpret_cast<const uint32_t*>(data);
 }
 """
 
@@ -91,20 +101,30 @@ def _packed_shapes(n: int, k: int, num_experts: int):
     )
 
 
-def _build_decode_gemm(source_rows_are_slots: bool):
+def _build_decode_gemm(
+    source_rows_are_slots: bool, *, tokens: int = 1, block_n: int = 64
+):
+    if (tokens, block_n) != (1, 64) and not (
+        source_rows_are_slots and (tokens, block_n) == (_TILELANG_W2_TOKENS, 128)
+    ):
+        raise ValueError("only M1/BN64 and M6 W2/BN128 are supported")
     num_experts, topk = _DECODE_NUM_EXPERTS, _TARGET_TOPK
-    slots = _TARGET_TOPK
+    slots = tokens * topk
     n, k = (
         (_HIDDEN_SIZE, _INTERMEDIATE_SIZE)
         if source_rows_are_slots
         else (2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE)
     )
-    m_in = slots if source_rows_are_slots else 1
+    m_in = slots if source_rows_are_slots else tokens
     block_m = _DECODE_BLOCK_M
     max_m, max_m_tiles = slots * block_m, slots
-    block_n, block_k = 64, 128
+    block_k = 128
     threads = 128
     num_stages = 3 if source_rows_are_slots else 2
+    use_word_load = source_rows_are_slots and tokens == _TILELANG_W2_TOKENS
+    decode_source = _PRMT_DECODE_SOURCE
+    if use_word_load:
+        decode_source += _PACKED_WORD_LOAD_SOURCE
     k_blocks = _k_blocks(k)
     shift_stride = _shift_stride(k)
     n_groups8 = n // _N_GROUP
@@ -125,7 +145,7 @@ def _build_decode_gemm(source_rows_are_slots: bool):
         routed_out: T.Tensor((slots, n), "bfloat16"),
     ):
         with T.Kernel(T.ceildiv(n, block_n), max_m_tiles, threads=threads) as (bx, by):
-            T.import_source(_PRMT_DECODE_SOURCE)
+            T.import_source(decode_source)
             m0 = by * block_m
             if m0 < num_post_pad[0]:
                 expert = expert_ids[by]
@@ -185,12 +205,29 @@ def _build_decode_gemm(source_rows_are_slots: bool):
                             & 3,
                         )
                         base = channel_in_group * 16 + t * 4
-                        word = (
-                            T.Cast("uint32", p_s[kb_rel, n_group, base + 0])
-                            | (T.Cast("uint32", p_s[kb_rel, n_group, base + 1]) << 8)
-                            | (T.Cast("uint32", p_s[kb_rel, n_group, base + 2]) << 16)
-                            | (T.Cast("uint32", p_s[kb_rel, nn // 8, base + 3]) << 24)
-                        )
+                        if use_word_load:
+                            # Shared rows and base are aligned to four bytes.
+                            word = T.call_extern(
+                                "uint32",
+                                "dsv41_load_u32",
+                                T.address_of(p_s[kb_rel, n_group, base]),
+                            )
+                        else:
+                            word = (
+                                T.Cast("uint32", p_s[kb_rel, n_group, base + 0])
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, n_group, base + 1])
+                                    << 8
+                                )
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, n_group, base + 2])
+                                    << 16
+                                )
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, nn // 8, base + 3])
+                                    << 24
+                                )
+                            )
                         decoded = T.call_extern(
                             "uint64", "dsv41_decode_x2", word, shift
                         )
@@ -224,6 +261,44 @@ def compile_decode_gemms(device_index: int):
             tilelang.compile(_build_decode_gemm(slots), pass_configs=PASS_CONFIGS)
             for slots in (False, True)
         )
+
+
+@cache
+def compile_m6_w2(device_index: int):
+    """Compile the frozen q5 W2 variant once per worker, before Graph capture."""
+    with torch.accelerator.device_index(device_index):
+        return tilelang.compile(
+            _build_decode_gemm(True, tokens=_TILELANG_W2_TOKENS, block_n=128),
+            pass_configs=PASS_CONFIGS,
+        )
+
+
+def prepare_m6_w2(layer, w2_scale):
+    """Warm M6 W2 after prepare_decode_gemms validates the packed weights."""
+    device = layer.w2_weight.device
+    slots = _TILELANG_W2_TOKENS * _TARGET_TOPK
+    ids = torch.arange(slots, dtype=torch.int32, device=device).view(
+        _TILELANG_W2_TOKENS, _TARGET_TOPK
+    )
+    sorted_ids, expert_ids, num_post_pad = moe_align_block_size(
+        ids, _DECODE_BLOCK_M, _DECODE_NUM_EXPERTS
+    )
+    kernel = compile_m6_w2(device.index)
+    a = torch.zeros((slots, _INTERMEDIATE_SIZE), dtype=torch.int8, device=device)
+    a_scale = torch.ones(slots, dtype=torch.float32, device=device)
+    output = torch.empty((slots, _HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    kernel(
+        a,
+        a_scale,
+        layer.w2_weight,
+        layer.w2_mxfp4_int8_shift2,
+        w2_scale,
+        sorted_ids,
+        expert_ids,
+        num_post_pad,
+        output,
+    )
+    return kernel
 
 
 def prepare_decode_gemms(layer, w13_scale, w2_scale, sorted_ids, num_post_pad):
