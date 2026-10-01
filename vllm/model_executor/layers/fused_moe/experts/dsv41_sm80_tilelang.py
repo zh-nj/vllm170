@@ -46,7 +46,8 @@ def _build_decode_gemm(source_rows_are_slots: bool):
     m_in = slots if source_rows_are_slots else 1
     max_m, max_m_tiles = 96, 6
     block_m, block_n, block_k = 16, 64, 128
-    threads = 64 if source_rows_are_slots else 128
+    threads = 128
+    num_stages = 3 if source_rows_are_slots else 2
     k_blocks = k // 32
     shift_stride = (k_blocks + 3) // 4
     n_groups8 = n // 8
@@ -96,11 +97,11 @@ def _build_decode_gemm(source_rows_are_slots: bool):
                     )
 
                 T.clear(c_i)
-                # All three shared copies use the validated double buffer.
+                # Keep all three shared copies ahead of their consumers.
                 for ko in T.Pipelined(
                     k_iters,
                     order=[0, 1, 2, 3, 4],
-                    stage=[0, 0, 0, 1, 1],
+                    stage=[0, 0, 0, num_stages - 1, num_stages - 1],
                 ):
                     for i, kk in T.Parallel(block_m, block_k):
                         a_s[i, kk] = T.if_then_else(
@@ -112,7 +113,7 @@ def _build_decode_gemm(source_rows_are_slots: bool):
                     T.copy(b_shift2[expert, (ko * kb_tile) // 4, ng0, 0], sh_s)
                     # Decode four packed bytes with the CUDA PRMT helper.
                     # The output bytes span two separate 16-column K regions.
-                    for nn, kb_rel, t, j, nib in T.Parallel(block_n, kb_tile, 4, 4, 2):
+                    for nn, kb_rel, t in T.Parallel(block_n, kb_tile, 4):
                         shift = T.Cast(
                             "int32",
                             (
@@ -131,10 +132,12 @@ def _build_decode_gemm(source_rows_are_slots: bool):
                         decoded = T.call_extern(
                             "uint64", "dsv41_decode_x2", word, shift
                         )
-                        b_frag[
-                            nn,
-                            kb_rel * 32 + (j // 2) * 16 + t * 4 + (j % 2) * 2 + nib,
-                        ] = T.Cast("int8", (decoded >> (8 * (j * 2 + nib))) & 0xFF)
+                        # Keep byte extraction out of the vectorizer: 0.1.15
+                        # otherwise broadcasts each packed input into 8 lanes.
+                        for byte in T.unroll(8):
+                            b_frag[
+                                nn, kb_rel * 32 + (byte // 4) * 16 + t * 4 + byte % 4
+                            ] = T.Cast("int8", (decoded >> (8 * byte)) & 0xFF)
                     T.gemm(a_s, b_frag, c_i, transpose_B=True)
 
                 for i, j in T.Parallel(block_m, block_n):

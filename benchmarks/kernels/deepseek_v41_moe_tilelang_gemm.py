@@ -353,9 +353,7 @@ def build_kernel(
                     elif decode == "prmt":
                         # Decode four packed bytes with the CUDA PRMT helper.
                         # The output bytes span two separate 16-column K regions.
-                        for nn, kb_rel, t, j, nib in T.Parallel(
-                            block_n, kb_tile, 4, 4, 2
-                        ):
+                        for nn, kb_rel, t in T.Parallel(block_n, kb_tile, 4):
                             shift = T.Cast(
                                 "int32",
                                 (
@@ -383,10 +381,11 @@ def build_kernel(
                             decoded = T.call_extern(
                                 "uint64", "dsv41_decode_x2", word, shift
                             )
-                            b_frag[
-                                nn,
-                                kb_rel * 32 + (j // 2) * 16 + t * 4 + (j % 2) * 2 + nib,
-                            ] = T.Cast("int8", (decoded >> (8 * (j * 2 + nib))) & 0xFF)
+                            for byte in T.unroll(8):
+                                b_frag[
+                                    nn,
+                                    kb_rel * 32 + (byte // 4) * 16 + t * 4 + byte % 4,
+                                ] = T.Cast("int8", (decoded >> (8 * byte)) & 0xFF)
                     else:
                         # Deliberately wrong ablation; compiler simplification
                         # can change traffic and resources as well as decoding.
