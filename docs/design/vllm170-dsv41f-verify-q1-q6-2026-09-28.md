@@ -1,5 +1,11 @@
 # DSV4.1-Flash：target 验证的 q 扫描与代价模型（2026-09-28）
 
+> **2026-10-01 复核：保留本文的历史扫描数值，修正其因果解释。**
+> 33.87 ms 是 q≥2 回归线的 q=0 截距，9.92 ms 是外推差额，均不是直接测到的
+> 进入操作。2.42 ms/token 也不能直接换算成观测专家数。计时边界、逐 rank 分解、
+> FULL Graph indexer 尺寸和组件短测见
+> [截距分解复核](vllm170-dsv41f-verify-intercept-2026-10-01.md)。
+
 目标：把 **DSpark=5 的 6-token target 验证**与 **关闭 DSpark 的 1-token target 验证**放进同一套
 口径，比较模型计算量、attention/index/metadata、PP 通信与轮间等待，建立理论模型并指出实际差距。
 本轮**不改推理代码**（只补了一处测量归属，见 §5）。
