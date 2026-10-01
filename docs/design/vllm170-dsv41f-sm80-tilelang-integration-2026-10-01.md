@@ -1,5 +1,13 @@
 # DSV41F SM80 TileLang grouped GEMM 可选接入
 
+> 2026-10-01 后续接入：同一开关现也控制 SwiGLU+INT8 A2 融合，支持
+> SILU 的无 clamp 或 clamp=10、E384/top-k6、1 至 128 个 routed rows。
+> 它独立于下文 grouped GEMM 的 M=1 门禁，因此覆盖生产 q5 的 M=6、36 rows；
+> draft top-k3、更大批次和其他 clamp 继续走原 activation+quant。
+> 融合在权重加载时编译/预热，q/scale 复用 BF16 activation workspace 的不重叠视图。
+> 下文“激活不变”“未启用线上”描述的是最初 grouped GEMM 轮次，当前接入结果见
+> [生产接入报告](vllm170-tilekernels-swiglu-production-2026-10-01.md)。
+>
 > 2026-10-01 复测修订：本文的性能数字与冻结参数已过期，保留作原始记录。
 > 在 tilelang 0.1.15 + 当前代码（PRMT 解码循环整形、W2 改为 128 threads /
 > 3 stages、契约重构）下重测，专家段收益为 **fixed 1.20% / 1.25%、rotating
@@ -7,7 +15,7 @@
 > 8.05% / 7.85%。两点必须同时看：本轮的 CUTLASS 基线是 **171.3 µs**，而本文
 > 记录的是 **200.4 µs**；CUTLASS 路径与本轮改动无关，这个位移只能来自会话间
 > 机器状态（本文测量时生产 PP5 的五个进程仍在卡上），因此两轮的百分比不可
-> 直接相减比较。另：下文"冻结参数"中的 **W2 64 threads、双缓冲**已改为
+> 直接相减比较。下方原始记录中的 **W2 64 threads、双缓冲**已改为
 > 128 threads、3 stages。原始证据见 `artifacts/tilelang-015-remeasure-20261001/`。
 
 日期：2026-10-01。承接 [PRMT 离线实现与复测](vllm170-dsv41f-sm80-tilelang-prmt-optimization-2026-09-30.md)。
@@ -41,8 +49,8 @@ router、attention、A8 量化、激活或 reduce。
 
 运行时内核位于
 [vllm/model_executor/layers/fused_moe/experts/dsv41_sm80_tilelang.py](../../vllm/model_executor/layers/fused_moe/experts/dsv41_sm80_tilelang.py)，
-不依赖 benchmarks、参考实现或 autotuner。参数冻结为 BM16/BN64/BK128、双缓冲，
-W13 使用 128 threads，W2 使用 64 threads。
+不依赖 benchmarks、参考实现或 autotuner。参数冻结为 BM16/BN64/BK128；
+W13 使用 128 threads、2 stages，W2 使用 128 threads、3 stages。
 
 `process_weights_after_loading()` 在完成 packed 权重转换后检查形状、dtype、连续性和设备，
 再编译和预热两个 kernel。编译对象按 worker/device 缓存，不持有模型权重副本。
