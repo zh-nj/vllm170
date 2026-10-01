@@ -108,6 +108,8 @@ class DecodeCase:
         seed: int,
         block_size: int,
         paged_main_seq_len: int,
+        extra_block_size: int | None = None,
+        cache_rows: int = 4096,
     ) -> None:
         self.num_queries = num_queries
         self.main_len = main_len
@@ -116,7 +118,7 @@ class DecodeCase:
         self.block_size = block_size
         self.paged_main_seq_len = paged_main_seq_len
         rows = max(
-            4096,
+            cache_rows,
             num_queries * max(main_len, extra_len, 1),
             paged_main_seq_len,
         )
@@ -160,7 +162,7 @@ class DecodeCase:
             dtype=torch.int32,
             device="cuda",
         )
-        self.extra_cache = _make_cache(rows, generator, block_size)
+        self.extra_cache = _make_cache(rows, generator, extra_block_size or block_size)
         self.extra_indices = torch.arange(
             num_queries * extra_len,
             dtype=torch.int32,
@@ -213,9 +215,9 @@ class DecodeCase:
             self.main_cache.stride(0),
             self.extra_cache.stride(0),
             self.main_cache.shape[0] * self.block_size,
-            self.extra_cache.shape[0] * self.block_size,
+            self.extra_cache.shape[0] * self.extra_cache.shape[1],
             self.block_size,
-            self.block_size,
+            self.extra_cache.shape[1],
             HEAD_DIM**-0.5,
             HEADS,
             HAS_ATTN_SINK=True,
@@ -232,7 +234,7 @@ class DecodeCase:
 
     def partial(self, config: PartialConfig) -> None:
         block_h, block_k, num_warps = config
-        _sparse_attn_decode_partial_kernel[
+        self.partial_kernel = _sparse_attn_decode_partial_kernel[
             (
                 self.num_queries,
                 self.splits,
@@ -263,9 +265,9 @@ class DecodeCase:
             self.part_acc.stride(1),
             self.part_acc.stride(2),
             self.main_cache.shape[0] * self.block_size,
-            self.extra_cache.shape[0] * self.block_size,
+            self.extra_cache.shape[0] * self.extra_cache.shape[1],
             self.block_size,
-            self.block_size,
+            self.extra_cache.shape[1],
             self.main_len,
             HEAD_DIM**-0.5,
             HEADS,

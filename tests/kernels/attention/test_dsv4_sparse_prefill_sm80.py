@@ -515,10 +515,17 @@ def test_glm_sparse_prefill_tuning_matches_default(monkeypatch) -> None:
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_queries", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    "num_queries,main_block_size,extra_block_size",
+    [(q, 256, 256) for q in (1, 2, 4, 8)] + [(6, 128, 64), (6, 128, 128)],
+)
 @pytest.mark.parametrize("caller_output", [False, True])
 def test_sparse_decode_split_and_caller_output_match(
-    monkeypatch, num_queries: int, caller_output: bool
+    monkeypatch,
+    num_queries: int,
+    main_block_size: int,
+    extra_block_size: int,
+    caller_output: bool,
 ) -> None:
     from vllm.models.deepseek_v4.common.ops import quantize_and_insert_k_cache
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as sparse_mod
@@ -529,22 +536,25 @@ def test_sparse_decode_split_and_caller_output_match(
     from vllm.v1.worker import workspace
 
     num_heads, head_dim = 64, 512
-    block_size, main_len, extra_len = 256, 128, 64
+    main_len = 133 if num_queries == 6 else 128
+    extra_len = 512 if num_queries == 6 else 64
     num_rows = 1024
     torch.manual_seed(23)
     q = torch.randn(
         num_queries, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
     )
 
-    def make_cache() -> torch.Tensor:
-        cache = torch.zeros(4, block_size, 584, dtype=torch.uint8, device="cuda")
+    def make_cache(block_size: int) -> torch.Tensor:
+        cache = torch.zeros(
+            num_rows // block_size, block_size, 584, dtype=torch.uint8, device="cuda"
+        )
         values = torch.randn(num_rows, head_dim, dtype=torch.bfloat16, device="cuda")
         slots = torch.arange(num_rows, dtype=torch.int64, device="cuda")
         quantize_and_insert_k_cache(values, cache, slots, block_size)
         return cache
 
-    main_cache = make_cache()
-    extra_cache = make_cache()
+    main_cache = make_cache(main_block_size)
+    extra_cache = make_cache(extra_block_size)
     main_indices = torch.arange(
         num_queries * main_len, dtype=torch.int32, device="cuda"
     ).remainder_(num_rows)
@@ -586,7 +596,9 @@ def test_sparse_decode_split_and_caller_output_match(
     manager = workspace.WorkspaceManager(torch.device("cuda"))
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1")
-    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", "32")
+    monkeypatch.setenv(
+        "VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", "3" if num_queries == 6 else "32"
+    )
     monkeypatch.setenv(
         "VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", str(int(caller_output))
     )
@@ -632,6 +644,25 @@ def test_sparse_decode_split_and_caller_output_match(
     assert (caller_outputs[-1] is output) is caller_output
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(output).all()
+    if num_queries == 6:
+        # Compare the public output against the previous four-warp launch.
+        tuned = output.clone()
+        original_partial = sparse_mod._sparse_attn_decode_partial_kernel
+
+        class FourWarpPartial:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    kwargs["num_warps"] = 4
+                    return original_partial[grid](*args, **kwargs)
+
+                return launch
+
+        with monkeypatch.context() as reference_patch:
+            reference_patch.setattr(
+                sparse_mod, "_sparse_attn_decode_partial_kernel", FourWarpPartial()
+            )
+            candidate()
+        torch.testing.assert_close(output, tuned, atol=0, rtol=0)
     manager.lock()
 
     graph = torch.cuda.CUDAGraph()
