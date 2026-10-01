@@ -33,6 +33,7 @@ import os
 import platform
 import statistics
 import subprocess
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +41,7 @@ from typing import Any
 
 import torch
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 HIDDEN_SIZE = 5120
 INTERMEDIATE_SIZE = 2304
@@ -335,12 +336,15 @@ def stage_weight_bytes(
     unique = sorted({int(e) for e in experts})
     if not unique:
         return {"packed": 0, "shift2": 0, "channel_scale": 0, "total": 0}
-    index = torch.tensor(unique, dtype=torch.long, device=b_mxfp4.device)
-    packed = int(b_mxfp4.index_select(0, index).numel())
-    shift2 = int(b_shift2.index_select(0, index).numel())
-    scale = int(b_channel_scale.index_select(0, index).numel()) * (
-        b_channel_scale.element_size()
-    )
+
+    def logical_bytes(tensor: torch.Tensor) -> int:
+        if unique[0] < 0 or unique[-1] >= tensor.shape[0]:
+            raise ValueError("expert ID outside the weight tensor")
+        return len(unique) * math.prod(tensor.shape[1:]) * tensor.element_size()
+
+    packed = logical_bytes(b_mxfp4)
+    shift2 = logical_bytes(b_shift2)
+    scale = logical_bytes(b_channel_scale)
     return {
         "packed": packed,
         "shift2": shift2,
@@ -521,11 +525,10 @@ def reference_reduce(
     """Routing-weighted reduce over the top-k slots of each token.
 
     The kernel walks ``k`` ascending from ``0.0f`` in float32, so the reference
-    uses the same order. ``accumulate_dtype`` selects float32 (structural match,
-    the default) or float64 (rounding-free cross-check). The kernel contracts
-    ``acc + x * w`` into an FFMA; with float32 accumulation the two differ by at
-    most a final-ulp, which is why bitwise expectations are only claimed for
-    fixtures whose products and partial sums are exactly representable.
+    uses the same order. ``accumulate_dtype`` selects float32 (the default) or
+    float64 for a cross-check. The kernel uses FFMA; the reference separately
+    rounds multiplication and addition. Their difference needs a local bound
+    on the sum of absolute terms, especially when terms cancel.
     """
     topk = routing_weights.shape[1]
     if routed_out.shape[0] < routing_weights.shape[0] * topk:
@@ -558,8 +561,10 @@ def bf16_spacing(magnitude: torch.Tensor) -> torch.Tensor:
     return torch.pow(torch.tensor(2.0, dtype=torch.float64), exponent - 7)
 
 
-def reduce_term_scale(routed_out: torch.Tensor, routing_weights: torch.Tensor) -> float:
-    """``max_n sum_k |slot_value * weight|`` -- the reduce's own scale.
+def reduce_term_scale(
+    routed_out: torch.Tensor, routing_weights: torch.Tensor
+) -> torch.Tensor:
+    """Per-output ``sum_k |slot_value * weight|`` for a local error bound.
 
     This is the denominator that makes a reduce tolerance scale-free. It is
     computed from the reference operands, never from the result.
@@ -573,10 +578,10 @@ def reduce_term_scale(routed_out: torch.Tensor, routing_weights: torch.Tensor) -
     )
     for k in range(topk):
         slot = routed_out[k : tokens * topk : topk].to(torch.float64)
-        total = total + slot.abs() * routing_weights[:, k].to(torch.float64).unsqueeze(
-            1
-        )
-    return float(total.max().item())
+        total = total + slot.abs() * routing_weights[:, k].to(
+            torch.float64
+        ).abs().unsqueeze(1)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +636,8 @@ class Comparison:
     term_scale: float | None = None
     max_bf16_steps: float | None = None
     max_step_excess: float | None = None
+    local_step_excess_ratio: float | None = None
+    local_abs_ratio: float | None = None
 
     @property
     def max_step_excess_over_term_scale(self) -> float | None:
@@ -646,9 +653,13 @@ class Comparison:
         residual, divided by the term scale, is scale-free and stays meaningful
         when the top-k slots cancel and the result is near zero.
         """
+        if self.local_step_excess_ratio is not None:
+            return self.local_step_excess_ratio
         if self.max_step_excess is None:
             return None
-        if self.term_scale is None or self.term_scale <= 0.0:
+        if self.term_scale == 0.0:
+            return 0.0 if self.max_abs == 0.0 else math.inf
+        if self.term_scale is None or self.term_scale < 0.0:
             return None
         return self.max_step_excess / self.term_scale
 
@@ -661,7 +672,11 @@ class Comparison:
         still being the correctly rounded answer. Dividing by the term scale
         instead is what makes the bound scale-free.
         """
-        if self.term_scale is None or self.term_scale <= 0.0:
+        if self.local_abs_ratio is not None:
+            return self.local_abs_ratio
+        if self.term_scale == 0.0:
+            return 0.0 if self.max_abs == 0.0 else math.inf
+        if self.term_scale is None or self.term_scale < 0.0:
             return None
         return self.max_abs / self.term_scale
 
@@ -677,6 +692,9 @@ class Comparison:
             "worst_expert": self.worst_expert,
             "worst_expert_rel_l2": self.worst_expert_rel_l2,
             "term_scale": self.term_scale,
+            "term_scale_scope": "per-output"
+            if self.local_abs_ratio is not None
+            else "scalar",
             "max_abs_over_term_scale": self.max_abs_over_term_scale,
             "max_bf16_steps": self.max_bf16_steps,
             "max_step_excess": self.max_step_excess,
@@ -690,7 +708,7 @@ def compare(
     *,
     slot_experts: torch.Tensor | None = None,
     rows: int | None = None,
-    term_scale: float | None = None,
+    term_scale: torch.Tensor | float | None = None,
     measure_bf16_steps: bool = False,
 ) -> Comparison:
     """Full metric set. Non-finite values fail before any tolerance is applied."""
@@ -709,12 +727,34 @@ def compare(
     difference = (view_c.to(torch.float64) - view_r.to(torch.float64)).abs()
     max_bf16_steps = None
     max_step_excess = None
+    local_step_excess_ratio = None
+    local_abs_ratio = None
+    scale_max = term_scale
     if measure_bf16_steps and difference.numel():
         # Spacing is taken at the larger of the two, so one step is the gap
         # between adjacent bf16 values at that magnitude.
         spacing = bf16_spacing(torch.maximum(view_c.abs(), view_r.abs()))
         max_bf16_steps = float((difference / spacing).max().item())
         max_step_excess = float((difference - spacing).clamp_min(0.0).max().item())
+    if isinstance(term_scale, torch.Tensor):
+        scales = term_scale.to(device=difference.device, dtype=torch.float64)
+        if scales.shape != difference.shape:
+            raise ValueError("term scales must match every compared output")
+        if not torch.isfinite(scales).all() or (scales < 0).any():
+            raise ValueError("term scales must be finite and non-negative")
+
+        def local_ratio(error: torch.Tensor) -> float:
+            ratios = torch.where(
+                scales > 0,
+                error / scales,
+                torch.where(difference == 0, 0.0, math.inf),
+            )
+            return float(ratios.max().item()) if ratios.numel() else 0.0
+
+        scale_max = float(scales.max().item()) if scales.numel() else 0.0
+        local_abs_ratio = local_ratio(difference)
+        if measure_bf16_steps and difference.numel():
+            local_step_excess_ratio = local_ratio((difference - spacing).clamp_min(0))
     worst_expert = None
     worst_expert_rel_l2 = None
     if slot_experts is not None and view_c.shape[0]:
@@ -741,9 +781,11 @@ def compare(
         first_mismatch=first_mismatch(view_c, view_r),
         worst_expert=worst_expert,
         worst_expert_rel_l2=worst_expert_rel_l2,
-        term_scale=term_scale,
+        term_scale=scale_max,
         max_bf16_steps=max_bf16_steps,
         max_step_excess=max_step_excess,
+        local_step_excess_ratio=local_step_excess_ratio,
+        local_abs_ratio=local_abs_ratio,
     )
 
 
@@ -766,7 +808,12 @@ def classify(
         return "pass", None
     if threshold is None or not threshold.calibrated:
         return "uncalibrated", "threshold_not_calibrated"
-    if comparison.calc_diff > threshold.calc_diff:
+    # Near cancellation, a global relative metric can reject legitimate FP32
+    # rounding differences. Local operand-based bounds are authoritative.
+    if (
+        comparison.local_step_excess_ratio is None
+        and comparison.calc_diff > threshold.calc_diff
+    ):
         return "fail", "calc_diff_exceeded"
     residual = comparison.max_step_excess_over_term_scale
     if residual is None:
@@ -787,11 +834,10 @@ class Threshold:
         (|candidate - reference| - one_bf16_step) / term_scale
 
     i.e. the part of the mismatch that the single bf16 rounding cannot explain,
-    measured against the magnitude of the terms that produced it. For a fp32
-    accumulator with n terms the residual is at most ``n * 2**-24`` of the term
-    scale; ``2**-20`` leaves room for a handful of terms while still being a
-    million times tighter than a routing or weighting mistake, which moves the
-    result by order 1 of the term scale.
+    measured against the local magnitude of the terms that produced it.
+    Bounds for FMA versus separately rounded multiply/add must account for
+    both accumulation paths; the caller records the supported term count
+    and calibration or analytical evidence.
     """
 
     threshold_id: str
@@ -878,6 +924,7 @@ def time_graph(
     samples: int,
     calls_per_repeat: int = 1,
     graph=None,
+    validate_graph: Callable | None = None,
 ) -> Timing:
     """Event-bracketed CUDA-graph replay, normalised per kernel invocation.
 
@@ -899,6 +946,8 @@ def time_graph(
     calls_per_graph = repeats * calls_per_repeat
     if graph is None:
         graph = capture_graph(call, warmup=warmup, graph_calls=repeats)
+    if validate_graph is not None:
+        validate_graph(graph)
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
     for start, end in zip(starts, ends, strict=True):
@@ -910,6 +959,8 @@ def time_graph(
         start.elapsed_time(end) * 1000.0 / calls_per_graph
         for start, end in zip(starts, ends, strict=True)
     ]
+    if not all(math.isfinite(value) and value > 0 for value in per_call):
+        raise RuntimeError("non-positive or non-finite CUDA event timing")
     return Timing(
         samples_us=per_call,
         repeats=repeats,
@@ -926,6 +977,9 @@ def interleaved_ab(
     graph_calls: int,
     samples: int,
     calls_per_repeat: int = 1,
+    baseline_validator: Callable | None = None,
+    candidate_validator: Callable | None = None,
+    settle_ms: float = 0.0,
 ) -> dict[str, Any]:
     """Alternate baseline/candidate as A/B/B/A and keep every round.
 
@@ -939,12 +993,25 @@ def interleaved_ab(
     """
     if rounds < 3:
         raise ValueError("at least 3 independent rounds are required")
+    if not math.isfinite(settle_ms) or settle_ms < 0:
+        raise ValueError("settle_ms must be finite and non-negative")
     baseline_graph = capture_graph(
         baseline_call, warmup=warmup, graph_calls=graph_calls
     )
     candidate_graph = capture_graph(
         candidate_call, warmup=warmup, graph_calls=graph_calls
     )
+    if baseline_validator is not None:
+        baseline_validator(baseline_graph)
+    if candidate_validator is not None:
+        candidate_validator(candidate_graph)
+    # Stabilize GPU activity after compilation/reference work and graph capture.
+    # Synchronize each pair so host enqueue speed cannot create unbounded work.
+    settle_start = time.perf_counter()
+    while (time.perf_counter() - settle_start) * 1000 < settle_ms:
+        baseline_graph.replay()
+        candidate_graph.replay()
+        torch.accelerator.synchronize()
     baseline_rounds: list[Timing] = []
     candidate_rounds: list[Timing] = []
     for index in range(rounds):
@@ -990,6 +1057,10 @@ def interleaved_ab(
     )
     return {
         "rounds": rounds,
+        "settle_ms": settle_ms,
+        "baseline_samples_us": [t.samples_us for t in baseline_rounds],
+        "candidate_samples_us": [t.samples_us for t in candidate_rounds],
+        "calls_per_graph": graph_calls * calls_per_repeat,
         "baseline_p50_us": [round(v, 4) for v in baseline_p50],
         "baseline_p90_us": [round(v, 4) for v in baseline_p90],
         "candidate_p50_us": [round(v, 4) for v in candidate_p50],
@@ -1123,14 +1194,59 @@ def dirty_diff_hash(repo: Path | None = None) -> str | None:
     try:
         root = repo or Path(__file__).resolve().parents[2]
         out = subprocess.run(
-            ["git", "-C", str(root), "diff"],
+            ["git", "-C", str(root), "diff", "HEAD", "--binary"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return hashlib.sha256(out.stdout.encode()).hexdigest()[:16]
+        digest = hashlib.sha256(out.stdout.encode())
+        untracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            capture_output=True,
+            check=True,
+        )
+        for name in sorted(untracked.stdout.split(b"\0")):
+            if name:
+                digest.update(name)
+                digest.update(file_hash(root / os.fsdecode(name)).encode())
+        return digest.hexdigest()[:16]
     except Exception:
         return None
+
+
+def file_hash(path: Path | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tensor_hash(tensor: torch.Tensor) -> str:
+    """Content identity with bounded host staging, including BF16 inputs."""
+    digest = hashlib.sha256(f"{tensor.dtype}:{tuple(tensor.shape)}".encode())
+    flat = tensor.detach().reshape(-1)
+    chunk_elements = max(1, 8 * 1024 * 1024 // tensor.element_size())
+    for start in range(0, flat.numel(), chunk_elements):
+        chunk = flat[start : start + chunk_elements].contiguous().view(torch.uint8)
+        digest.update(chunk.cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def row_passed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("correctness_status") == "pass"
+        and row.get("measurement_status") in ("ok", "not_applicable")
+        and row.get("skip_or_failure_reason") is None
+    )
 
 
 def sanitize(value: Any) -> Any:
@@ -1197,30 +1313,39 @@ def write_summary(path: Path | str, rows: list[dict[str, Any]], **extra: Any) ->
     """Atomically write the run summary, keeping every failing case visible."""
     target = Path(path)
     statuses: dict[str, int] = {}
+    measurement_statuses: dict[str, int] = {}
     for row in rows:
         status = str(
             row.get("correctness_status") or row.get("measurement_status") or "unknown"
         )
         statuses[status] = statuses.get(status, 0) + 1
+        measurement = str(row.get("measurement_status", "unknown"))
+        measurement_statuses[measurement] = measurement_statuses.get(measurement, 0) + 1
     failures = [
         {
             "case_id": row.get("case_id"),
             "stage": row.get("stage"),
             "variant": row.get("variant"),
             "correctness_status": row.get("correctness_status"),
+            "measurement_status": row.get("measurement_status"),
             "skip_or_failure_reason": row.get("skip_or_failure_reason"),
         }
         for row in rows
-        if row.get("correctness_status") == "fail"
-        or row.get("skip_or_failure_reason") is not None
+        if not row_passed(row)
     ]
     summary = {
         "schema_version": SCHEMA_VERSION,
         "num_rows": len(rows),
         "status_counts": statuses,
+        "measurement_status_counts": measurement_statuses,
         "failures_and_skips": failures,
-        "all_passed": bool(rows) and not failures,
         **extra,
+        "all_passed": (
+            bool(rows)
+            and not failures
+            and extra.get("run_status") == "complete"
+            and not extra.get("failures")
+        ),
     }
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.parent.mkdir(parents=True, exist_ok=True)

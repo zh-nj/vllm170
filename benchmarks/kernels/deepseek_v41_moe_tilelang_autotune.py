@@ -21,6 +21,7 @@ letting the search continue in a poisoned context.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -46,8 +47,11 @@ from deepseek_v41_moe_tilelang_bench import (  # noqa: E402
     Case,
     build_case,
     candidate_call,
+    case_identity,
     first_mismatch,
+    graph_validator,
     production_call,
+    run_identity,
     select_production_tile,
 )
 from deepseek_v41_moe_tilelang_gemm import (  # noqa: E402
@@ -57,7 +61,7 @@ from deepseek_v41_moe_tilelang_gemm import (  # noqa: E402
 
 # ``raw`` is the deliberately wrong decode-free ablation: it exists so the
 # verification gate can be shown to reject a kernel instead of timing it.
-DECODE_MODES = ("mxfp4", "lut", "luta", "raw")
+DECODE_MODES = ("mxfp4", "lut", "luta", "prmt", "raw")
 
 
 def config_grid(
@@ -157,6 +161,7 @@ def measure_config(
         "config_fields": asdict(config),
         "verification_status": "not_run",
         "measurement_status": "not_run",
+        "promotable": False,
     }
     start = time.perf_counter()
     try:
@@ -168,6 +173,8 @@ def measure_config(
         if is_cuda_fatal(exc):
             record["cuda_fatal"] = True
         return record
+    record["generated_source_sha256"] = hashlib.sha256(gemm.source.encode()).hexdigest()
+    record["input_sha256"] = case_identity(case)
     record["compile_seconds"] = round(gemm.compile_seconds, 3)
     # A fresh output buffer per config keeps the verification honest: a stale
     # buffer from an earlier config would hide a kernel that never writes.
@@ -191,16 +198,27 @@ def measure_config(
         if not checked["bitwise_exact"]:
             record["wall_seconds"] = time.perf_counter() - start
             return record
+        record["promotable"] = True
     else:
         record["verification_status"] = "skipped"
-    timing = time_graph(
-        call,
-        warmup=warmup,
-        repeats=graph_calls,
-        samples=samples,
-    )
+    try:
+        timing = time_graph(
+            call,
+            warmup=warmup,
+            repeats=graph_calls,
+            samples=samples,
+            validate_graph=graph_validator([case]) if check else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve timing failure status
+        record["promotable"] = False
+        record["measurement_status"] = "timing_failure"
+        record["failure_reason"] = f"{type(exc).__name__}: {exc}"[:2000]
+        record["cuda_fatal"] = is_cuda_fatal(exc)
+        record["wall_seconds"] = time.perf_counter() - start
+        return record
     record.update(timing.as_row())
     record["measurement_status"] = "ok"
+    record["graph_replay_checked"] = check
     record["wall_seconds"] = time.perf_counter() - start
     return record
 
@@ -215,6 +233,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--route-pattern", default="uniform")
     parser.add_argument("--seed", type=int, default=4242)
+    parser.add_argument("--scale-mode", choices=["varied", "unit"], default="varied")
     parser.add_argument("--block-m", type=int, nargs="+", default=[16])
     parser.add_argument("--block-n", type=int, nargs="+", default=[64, 128])
     parser.add_argument("--block-k", type=int, nargs="+", default=[64, 128])
@@ -256,122 +275,208 @@ def main(argv: list[str] | None = None) -> int:
     header = {
         "schema": "tilelang-moe-autotune-v1",
         "git_head": git_head(),
+        **run_identity(args),
         "env": env,
         "arguments": vars(args),
+        "mode": "strict" if args.check else "diagnostic",
         "note": (
-            "each candidate is verified against deepseek_v41_moe_harness."
-            "reference_stage (bitwise) before it is timed"
+            "candidates are promotable only after deepseek_v41_moe_harness."
+            "reference_stage passes bitwise"
         ),
     }
     failures: list[str] = []
     validated: list[dict[str, Any]] = []
+    baselines = {}
+    attempted = 0
+    generated_sources = set()
     with out_path.open("w") as handle:
         handle.write(json.dumps(header, default=str) + "\n")
-        for stage in stages:
-            default_m, default_n = select_production_tile(
-                args.tokens, args.topk, args.experts
-            )
-            case = build_case(
-                stage=stage,
-                num_experts=args.experts,
-                topk=args.topk,
-                tokens=args.tokens,
-                pattern=args.route_pattern,
-                seed=args.seed,
-                block_m=args.block_m[0],
-                block_n=default_n,
-                device=device,
-            )
-            reference = case.reference
-            if args.baseline_rounds:
-                baseline_timing = time_graph(
-                    production_call(case),
-                    warmup=args.warmup,
-                    repeats=args.graph_calls,
-                    samples=args.samples,
+        try:
+            for stage in stages:
+                default_m, default_n = select_production_tile(
+                    args.tokens, args.topk, args.experts
                 )
-                baseline_row = {
-                    "stage": stage,
-                    "config": f"production-{default_m}x{default_n}",
-                    "kind": "baseline",
-                    "measurement_status": "ok",
-                    "verification_status": "pass",
-                    **baseline_timing.as_row(),
-                }
-                handle.write(json.dumps(baseline_row, default=str) + "\n")
-                handle.flush()
-                print(
-                    f"baseline {stage} {default_m}x{default_n} "
-                    f"p50={baseline_timing.p50_us:.2f}us"
+                baseline_case = build_case(
+                    stage=stage,
+                    num_experts=args.experts,
+                    topk=args.topk,
+                    tokens=args.tokens,
+                    pattern=args.route_pattern,
+                    seed=args.seed,
+                    scale_mode=args.scale_mode,
+                    block_m=default_m,
+                    block_n=default_n,
+                    device=device,
                 )
-            configs = config_grid(
-                stage=stage,
-                num_experts=args.experts,
-                topk=args.topk,
-                block_ms=args.block_m,
-                block_ns=args.block_n,
-                block_ks=args.block_k,
-                stages=args.num_stages,
-                thread_counts=args.threads,
-                decodes=args.decode,
-                max_configs=args.max_configs,
-            )
-            print(f"{stage}: {len(configs)} candidate configs")
-            for config in configs:
-                try:
-                    record = measure_config(
-                        case=case,
-                        config=config,
-                        reference=reference,
-                        warmup=args.warmup,
-                        samples=args.samples,
-                        graph_calls=args.graph_calls,
-                        check=args.check,
+                if args.baseline_rounds:
+                    baseline_case.routed_out.fill_(float("nan"))
+                    production_call(baseline_case)()
+                    torch.accelerator.synchronize()
+                    baseline_check = first_mismatch(
+                        baseline_case.routed_out, baseline_case.reference
                     )
-                except Exception as exc:  # noqa: BLE001
-                    record = {
-                        "stage": stage,
-                        "config": config.label,
-                        "verification_status": "harness_failure",
-                        "failure_reason": (
-                            f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"[
-                                :4000
-                            ]
-                        ),
-                    }
-                    if is_cuda_fatal(exc):
-                        handle.write(json.dumps(record, default=str) + "\n")
-                        handle.flush()
-                        raise
-                handle.write(json.dumps(record, default=str) + "\n")
-                handle.flush()
-                if record.get("cuda_fatal"):
-                    print(
-                        f"CUDA-fatal failure at {config.label}; stopping",
-                        file=sys.stderr,
-                    )
-                    raise SystemExit(3)
-                if record["measurement_status"] == "ok":
-                    validated.append(record)
-                    if args.dump_dir:
-                        dump = Path(args.dump_dir)
-                        dump.mkdir(parents=True, exist_ok=True)
-                        (dump / f"{config.label}.cu").write_text(
-                            TileLangMoeGemm.create(
-                                config, tokens=case.tokens, slots=case.slot_count
-                            ).source
+                    if not baseline_check["bitwise_exact"]:
+                        raise RuntimeError(
+                            f"production baseline failed reference: {baseline_check}"
                         )
-                    print(
-                        f"  ok  {config.label:34s} p50={record['p50_us']:9.2f}us "
-                        f"p90={record['p90_us']:9.2f}us"
+                    baseline_timing = time_graph(
+                        production_call(baseline_case),
+                        warmup=args.warmup,
+                        repeats=args.graph_calls,
+                        samples=args.samples * args.baseline_rounds,
+                        validate_graph=graph_validator([baseline_case]),
                     )
-                else:
-                    reason = record.get("failure_reason", record["verification_status"])
-                    failures.append(f"{config.label}: {reason}")
-                    print(f"  FAIL {config.label:34s} {reason}"[:200])
+                    baseline_row = {
+                        "stage": stage,
+                        "config": f"production-{default_m}x{default_n}",
+                        "kind": "baseline",
+                        "measurement_status": "ok",
+                        "verification_status": "pass",
+                        "correctness": baseline_check,
+                        "graph_replay_checked": True,
+                        "input_sha256": case_identity(baseline_case),
+                        **baseline_timing.as_row(),
+                    }
+                    baselines[stage] = baseline_timing.p50_us
+                    handle.write(json.dumps(baseline_row, default=str) + "\n")
+                    handle.flush()
+                    print(
+                        f"baseline {stage} {default_m}x{default_n} "
+                        f"p50={baseline_timing.p50_us:.2f}us"
+                    )
+                configs = config_grid(
+                    stage=stage,
+                    num_experts=args.experts,
+                    topk=args.topk,
+                    block_ms=args.block_m,
+                    block_ns=args.block_n,
+                    block_ks=args.block_k,
+                    stages=args.num_stages,
+                    thread_counts=args.threads,
+                    decodes=args.decode,
+                    max_configs=args.max_configs,
+                )
+                print(f"{stage}: {len(configs)} candidate configs")
+                cases = {
+                    block_m: build_case(
+                        stage=stage,
+                        num_experts=args.experts,
+                        topk=args.topk,
+                        tokens=args.tokens,
+                        pattern=args.route_pattern,
+                        seed=args.seed,
+                        block_m=block_m,
+                        block_n=default_n,
+                        device=device,
+                        weights=baseline_case.weights,
+                        routing_ids=baseline_case.routing_ids,
+                        a_q=baseline_case.a_q,
+                        a_scale=baseline_case.a_scale,
+                    )
+                    for block_m in sorted({config.block_m for config in configs})
+                }
+                source_configs = {}
+                for config in configs:
+                    attempted += 1
+                    case = cases[config.block_m]
+                    try:
+                        record = measure_config(
+                            case=case,
+                            config=config,
+                            reference=case.reference,
+                            warmup=args.warmup,
+                            samples=args.samples,
+                            graph_calls=args.graph_calls,
+                            check=args.check,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        record = {
+                            "stage": stage,
+                            "config": config.label,
+                            "verification_status": "harness_failure",
+                            "measurement_status": "harness_failure",
+                            "promotable": False,
+                            "failure_reason": (
+                                (
+                                    f"{type(exc).__name__}: {exc}\n"
+                                    f"{traceback.format_exc()}"
+                                )[:4000]
+                            ),
+                        }
+                        record["cuda_fatal"] = is_cuda_fatal(exc)
+                    source_hash = record.get("generated_source_sha256")
+                    if source_hash:
+                        generated_sources.add(source_hash)
+                        record["duplicate_source_of"] = source_configs.get(source_hash)
+                        source_configs.setdefault(source_hash, config.label)
+                    handle.write(json.dumps(record, default=str) + "\n")
+                    handle.flush()
+                    if record.get("cuda_fatal"):
+                        print(
+                            f"CUDA-fatal failure at {config.label}; stopping",
+                            file=sys.stderr,
+                        )
+                        raise RuntimeError(record.get("failure_reason", "CUDA failure"))
+                    if record["measurement_status"] == "ok" and record.get(
+                        "promotable", False
+                    ):
+                        validated.append(record)
+                        if args.dump_dir:
+                            dump = Path(args.dump_dir)
+                            dump.mkdir(parents=True, exist_ok=True)
+                            (dump / f"{config.label}.cu").write_text(
+                                TileLangMoeGemm.create(
+                                    config, tokens=case.tokens, slots=case.slot_count
+                                ).source
+                            )
+                        print(
+                            f"  ok  {config.label:34s} p50={record['p50_us']:9.2f}us "
+                            f"p90={record['p90_us']:9.2f}us"
+                        )
+                    else:
+                        reason = record.get(
+                            "failure_reason", record["verification_status"]
+                        )
+                        failures.append(f"{config.label}: {reason}")
+                        print(f"  FAIL {config.label:34s} {reason}"[:200])
+        except Exception as exc:  # noqa: BLE001 - summary survives fatal failures
+            reason = f"{type(exc).__name__}: {exc}"
+            failures.append(reason)
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "run_failure",
+                        "failure_reason": reason,
+                        "promotable": False,
+                    }
+                )
+                + "\n"
+            )
         summary = {
             "schema": "tilelang-moe-autotune-summary-v1",
+            "attempted": attempted,
+            "unique_generated_sources": len(generated_sources),
             "candidates": len(validated),
+            "by_stage": {
+                stage: {
+                    "baseline_p50_us": baselines.get(stage),
+                    "ranked": sorted(
+                        (
+                            {
+                                "config": r["config"],
+                                "p50_us": r["p50_us"],
+                                "baseline_ratio": r["p50_us"] / baselines[stage]
+                                if stage in baselines
+                                else None,
+                            }
+                            for r in validated
+                            if r["stage"] == stage
+                        ),
+                        key=lambda r: r["p50_us"],
+                    ),
+                }
+                for stage in stages
+            },
             "failures": len(failures),
             "failure_list": failures,
             "validated": sorted(
@@ -384,13 +489,14 @@ def main(argv: list[str] | None = None) -> int:
                     }
                     for row in validated
                 ),
-                key=lambda row: row["p50_us"],
+                key=lambda row: (row["stage"], row["p50_us"]),
             ),
-            "all_passed": not failures,
+            "all_passed": bool(args.check) and bool(validated) and not failures,
+            "mode": "strict" if args.check else "diagnostic",
         }
         handle.write(json.dumps({"kind": "summary", **summary}, default=str) + "\n")
     print(json.dumps({k: v for k, v in summary.items() if k != "validated"}, indent=2))
-    return 0 if validated else 1
+    return 0 if summary["all_passed"] else 1
 
 
 if __name__ == "__main__":

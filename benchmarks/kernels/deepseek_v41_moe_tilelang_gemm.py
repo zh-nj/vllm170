@@ -15,16 +15,16 @@ Contract reproduced from ``csrc/libtorch_stable/moe/mxfp4_int8_sm80``:
   plus ``[E, ceil(K/32/4), ceil(N/8), 8]`` 2-bit shift fields; the kernel
   decodes it to INT8, so the packed bytes are read exactly once per pass and
   no expanded INT8 copy of the weights exists anywhere.
-* The accumulator is INT32 (m16n8k32 INT8 MMA with saturating accumulate; the
-  operand ranges keep ``|acc| <= 127 * 96 * K << INT32_MAX``).
+* The accumulator is INT32 (m16n8k32 INT8 MMA); the operand ranges keep
+  ``|acc| <= 127 * 96 * K < INT32_MAX`` so saturation is unnecessary.
 * Epilogue: ``rne_bf16(float32(acc) * a_scale[src_row] * channel_scale[e, n])``
   with the activation scale applied first.
 * Writes go to the caller's ``routed_out[slot, :]``; rows whose
   ``sorted_ids`` entry is not a valid slot are not written.
 
-The TileLang decode is deliberately structural: the packed byte index, the
-nibble order and the shift field are recomputed from the documented layout
-rather than copied from the production ``__byte_perm`` tricks.
+The scalar/LUT decoders reconstruct the documented layout. The optional
+``prmt`` decoder imports a CUDA word-level helper into the TileLang kernel;
+all variants are checked against the independent structural reference.
 """
 
 import argparse
@@ -67,6 +67,24 @@ _MAG_PACKED = 0xC8643210 - (1 << 32)
 # ``nn``-th row of an 8-row group is ``nn * 16 + ((p % 8) // 2) * 4 +
 # (p // 8) * 2 + (p % 2)``.
 _BYTES_PER_N_GROUP = 16
+
+_PRMT_DECODE_SOURCE = r"""
+#include <stdint.h>
+__device__ __forceinline__ uint32_t dsv41_negate_i8x4(uint32_t magnitude) {
+  return (0x80808080u - magnitude) ^ 0x80808080u;
+}
+__device__ __forceinline__ uint32_t dsv41_decode_x1(uint32_t q4, uint32_t shift) {
+  uint32_t magnitude = __byte_perm(0x03020100u, 0x0c080604u, q4) << shift;
+  uint32_t negative = dsv41_negate_i8x4(magnitude);
+  uint32_t select = 0x3210u | ((q4 & 0x8888u) >> 1);
+  return __byte_perm(magnitude, negative, select);
+}
+__device__ __forceinline__ uint64_t dsv41_decode_x2(uint32_t q4_pair, uint32_t shift) {
+  uint32_t lo = dsv41_decode_x1(q4_pair, shift);
+  uint32_t hi = dsv41_decode_x1(q4_pair >> 16, shift);
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+"""
 
 
 def align_capacity(num_valid_tokens: int, block_m: int, num_experts: int) -> int:
@@ -127,7 +145,7 @@ def build_kernel(
     k_iters = k // block_k
     assert kb_tile in (1, 2, 4), f"block_k {block_k} must be 32, 64 or 128"
     assert n % block_n == 0 and k % block_k == 0 and kb_tile <= 4
-    assert decode in ("mxfp4", "lut", "luta", "raw")
+    assert decode in ("mxfp4", "lut", "luta", "prmt", "raw")
 
     def byte_offset(nn, kk32):
         """Packed byte holding both nibbles of ``k_pair = kk32 // 2``."""
@@ -152,6 +170,8 @@ def build_kernel(
         routed_out: T.Tensor((slots, n), "bfloat16"),
     ):
         with T.Kernel(T.ceildiv(n, block_n), max_m_tiles, threads=threads) as (bx, by):
+            if decode == "prmt":
+                T.import_source(_PRMT_DECODE_SOURCE)
             m0 = by * block_m
             if m0 < num_post_pad[0]:
                 expert = expert_ids[by]
@@ -196,15 +216,12 @@ def build_kernel(
                     asc_s[i] = a_scale[row_s[i]]
 
                 T.clear(c_i)
-                # Stage 0 is the global -> shared traffic, stage 1 the decode
-                # and the MMA that consume it. Spelling the schedule out keeps
-                # the planner from rejecting a decode that reads two different
-                # async copies; ``num_stages=1`` degenerates to no overlap.
+                # Keep all three shared copies ahead of their consumers.
+                # Depth one has no overlap; greater depths expand the buffers.
                 for ko in T.Pipelined(
                     k_iters,
-                    num_stages=max(1, num_stages),
                     order=[0, 1, 2, 3, 4],
-                    stage=[0, 0, 0, 1, 1],
+                    stage=[0, 0, 0, max(0, num_stages - 1), max(0, num_stages - 1)],
                 ):
                     for i, kk in T.Parallel(block_m, block_k):
                         a_s[i, kk] = a_q[row_s[i], ko * block_k + kk]
@@ -333,9 +350,46 @@ def build_kernel(
                                     & 0xFF,
                                 ),
                             )
+                    elif decode == "prmt":
+                        # Decode four packed bytes with the CUDA PRMT helper.
+                        # The output bytes span two separate 16-column K regions.
+                        for nn, kb_rel, t, j, nib in T.Parallel(
+                            block_n, kb_tile, 4, 4, 2
+                        ):
+                            shift = T.Cast(
+                                "int32",
+                                (
+                                    sh_s[nn // 8, nn % 8]
+                                    >> (2 * ((ko * kb_tile + kb_rel) % 4))
+                                )
+                                & 3,
+                            )
+                            base = (nn % 8) * _BYTES_PER_N_GROUP + t * 4
+                            word = (
+                                T.Cast("uint32", p_s[kb_rel, nn // 8, base + 0])
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, nn // 8, base + 1])
+                                    << 8
+                                )
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, nn // 8, base + 2])
+                                    << 16
+                                )
+                                | (
+                                    T.Cast("uint32", p_s[kb_rel, nn // 8, base + 3])
+                                    << 24
+                                )
+                            )
+                            decoded = T.call_extern(
+                                "uint64", "dsv41_decode_x2", word, shift
+                            )
+                            b_frag[
+                                nn,
+                                kb_rel * 32 + (j // 2) * 16 + t * 4 + (j % 2) * 2 + nib,
+                            ] = T.Cast("int8", (decoded >> (8 * (j * 2 + nib))) & 0xFF)
                     else:
-                        # Ablation only: same shared-memory traffic, no E2M1
-                        # expansion. The numbers are wrong on purpose.
+                        # Deliberately wrong ablation; compiler simplification
+                        # can change traffic and resources as well as decoding.
                         for nn, kk in T.Parallel(block_n, block_k):
                             b_frag[nn, kk] = T.Cast(
                                 "int8", p_s[kk // 32, nn // 8, (nn % 8) * 16 + kk % 16]
@@ -437,26 +491,62 @@ class TileLangMoeGemm:
 # ---------------------------------------------------------------------------
 
 
+def candidate_routes(
+    tokens: int, topk: int, num_experts: int, pattern: str, seed: int
+) -> torch.Tensor:
+    if pattern == "tile-boundary":
+        # Exactly tokens slots per selected expert: M15/16/17 cross BM16.
+        return make_routing_ids(1, topk, num_experts, "uniform", seed).repeat(tokens, 1)
+    return make_routing_ids(tokens, topk, num_experts, pattern, seed)
+
+
+def activation_scales(rows: int, device: torch.device, mode: str) -> torch.Tensor:
+    if mode == "unit":
+        return torch.ones(rows, dtype=torch.float32, device=device)
+    return (
+        0.037
+        + torch.arange(rows, dtype=torch.float32, device=device).remainder(997) / 811
+    )
+
+
 def build_packed_weights(
-    num_experts: int, stage: str, device: torch.device
+    num_experts: int,
+    stage: str,
+    device: torch.device,
+    *,
+    seed: int = 0,
+    scale_mode: str = "varied",
 ) -> dict[str, torch.Tensor]:
-    """Synthetic weights in the production packed layout (unit channel scale)."""
+    """Deterministic synthetic weights in the production packed layout."""
     if stage == W13_STAGE:
         n, k = 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE
     else:
         n, k = HIDDEN_SIZE, INTERMEDIATE_SIZE
+    generator = torch.Generator(device=device).manual_seed(seed)
+    packed = torch.empty(
+        (num_experts, k // 32, n // 8, 128), dtype=torch.uint8, device=device
+    ).random_(0, 256, generator=generator)
+    shift2 = torch.empty(
+        (num_experts, (k // 32 + 3) // 4, n // 8, 8),
+        dtype=torch.uint8,
+        device=device,
+    ).random_(0, 256, generator=generator)
+    if scale_mode == "unit":
+        channel_scale = torch.ones((num_experts, n), dtype=torch.float32, device=device)
+    elif scale_mode == "varied":
+        channel_scale = (
+            0.0313
+            + torch.arange(num_experts * n, device=device, dtype=torch.float32)
+            .remainder(997)
+            .reshape(num_experts, n)
+            / 811.0
+        )
+    else:
+        raise ValueError(f"unknown scale mode {scale_mode!r}")
     return {
-        "packed": torch.empty(
-            (num_experts, k // 32, n // 8, 128), dtype=torch.uint8, device=device
-        ).random_(0, 256),
-        "shift2": torch.empty(
-            (num_experts, (k // 32 + 3) // 4, n // 8, 8),
-            dtype=torch.uint8,
-            device=device,
-        ).random_(0, 256),
-        "channel_scale": torch.ones(
-            (num_experts, n), dtype=torch.float32, device=device
-        ),
+        "packed": packed,
+        "shift2": shift2,
+        "channel_scale": channel_scale,
     }
 
 
@@ -468,6 +558,7 @@ def check_case(
     tokens: int,
     pattern: str,
     seed: int,
+    scale_mode: str = "varied",
     config_kwargs: dict[str, Any],
     device: torch.device,
 ) -> dict[str, Any]:
@@ -485,12 +576,16 @@ def check_case(
         **config_kwargs,
     )
     slots = tokens * topk
-    routing_ids = make_routing_ids(tokens, topk, num_experts, pattern, seed).to(device)
-    weights = build_packed_weights(num_experts, stage, device)
-    torch.manual_seed(seed)
+    routing_ids = candidate_routes(tokens, topk, num_experts, pattern, seed).to(device)
+    weights = build_packed_weights(
+        num_experts, stage, device, seed=seed, scale_mode=scale_mode
+    )
     m_in = slots if slots_are_source else tokens
-    a_q = torch.empty((m_in, k), dtype=torch.int8, device=device).random_(-127, 128)
-    a_scale = torch.ones((m_in,), dtype=torch.float32, device=device)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    a_q = torch.empty((m_in, k), dtype=torch.int8, device=device).random_(
+        -127, 128, generator=generator
+    )
+    a_scale = activation_scales(m_in, device, scale_mode)
 
     gemm = TileLangMoeGemm.create(config, tokens=tokens, slots=slots)
     routed_out = torch.full(
@@ -558,13 +653,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--route-pattern", default="uniform")
     parser.add_argument("--seed", type=int, default=4242)
+    parser.add_argument("--scale-mode", choices=["varied", "unit"], default="varied")
     parser.add_argument("--block-m", type=int, default=16)
     parser.add_argument("--block-n", type=int, default=128)
     parser.add_argument("--block-k", type=int, default=64)
     parser.add_argument("--num-stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=128)
     parser.add_argument(
-        "--decode", choices=["mxfp4", "lut", "luta", "raw"], default="mxfp4"
+        "--decode",
+        choices=["mxfp4", "lut", "luta", "prmt", "raw"],
+        default="mxfp4",
     )
     parser.add_argument("--dump-dir", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
@@ -601,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
             tokens=args.tokens,
             pattern=args.route_pattern,
             seed=args.seed,
+            scale_mode=args.scale_mode,
             config_kwargs=config_kwargs,
             device=device,
         )
