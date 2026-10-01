@@ -29,13 +29,21 @@ v0.1.15 发布说明的兼容性条目与本库逐条对照：
 | 移除 `T.Pipelined` 的 `sync`/`group` 参数 | 0 处使用 | 无 |
 | 移除 `T.gemm_sp` 的 `k_pack` | 0 处使用 | 无 |
 | `T.symbolic` 降级为废弃别名，改用 `T.dynamic` | 0 处使用 `T.symbolic`；全部用 `T.dynamic` | 无 |
-| 追踪期查询线程数的 kernel 必须在 `T.Kernel` 显式传 `threads=` | 5 个 mhc CUDA 文件存在不传 `threads=` 的调用（见下） | **待定风险** |
+| 追踪期查询线程数的 kernel 必须在 `T.Kernel` 显式传 `threads=` | 5 个 mhc CUDA 文件存在不传 `threads=` 的调用（见下） | **已上机排除**（见下） |
 | 256-bit 全局 load/store 限制在 SM100+ | SM80 目标本就不会生成 | 无（反而是保护） |
 | kernel 缓存参数改存 JSON、二进制缓存目录改为不可变、哈希校验强制 | — | 升级后首次编译为冷缓存 |
 
 **待定风险：mhc 组的 `threads=` 省略。** `mhc/head_compute_mix_cuda.py:27,62`、`mhc/sinkhorn_cuda.py:24,76`、`mhc/expand_cuda.py:15,40`、`mhc/norm_fn_cuda.py:21,44`、`mhc/pre_split_mixes_cuda.py:35,106` 都是 `T.Kernel(...)` 不带 `threads=`，依赖 TileLang 自行推断。0.1.15 只对"追踪期查询线程数"的 kernel 强制要求显式 `threads=`，因此是否真的破坏取决于这些 kernel 是否查询线程数。
 
-**这一项本轮没能验证**：这些 kernel 用 `T.const()` 风格的张量标注（`expand_cuda.py:6-9`），而我复检用的离线探针要替换 `tilelang.jit` 才能跳过设备查询，`T.const()` 在非 eager builder 环境下直接抛 `JITNoBuilderError`。要判定必须上机。mhc 属于旁支（与 FP8 dense linear 无关），但若要复用其中任何一个，先在有卡环境确认这一点。
+**已上机验证：省略 `threads=` 在 0.1.15 上不构成破坏。** 离线探针当时判定不了，因为这些 kernel 用 `T.const()` 风格标注（`expand_cuda.py:6-9`），而探针要替换 `tilelang.jit` 才能跳过设备查询，`T.const()` 在非 eager builder 下直接抛 `JITNoBuilderError`。在有卡环境改用真实 `tilelang.jit` 后，两个独立的无 `threads=` kernel 均**编译并运行正确**（空闲 SM80，UUID `GPU-f385e0d6-452b-ad54-922e-ef7f4deb6216`）：
+
+| kernel | 覆盖 | 结果 |
+| --- | --- | --- |
+| `mhc/expand_cuda.py:15,40` `expand_to_mhc_fwd` | n=64/32/17/64 × h=5120/4096/7168/128 | 4/4 与 `torch/mhc.py:4` 参考**逐位相等** |
+| `mhc/norm_fn_cuda.py:21` `mhc_fn_normw_merge_fwd` | 两个 `n_blk` 分支 + 不整齐尾部（m=64 n=8192/7000、m=8 n=256、m=1 n=513） | 4/4 **逐位相等** |
+| `mhc/norm_fn_cuda.py:44` `mhc_fn_normw_merge_bwd`（用 `finalize_reducer`） | m=32/16/4 × n=4096/1024/700 | `fn_grad` **逐位相等**，`normw_grad` 差 ~1e-6（fp32 累加顺序） |
+
+结论：0.1.15 的 `threads=` 限制只作用于"追踪期查询线程数"的 kernel，这两个不属于此列。**另外发现一个不是版本问题的契约陷阱**：`norm_fn_cuda.py:57` 是 `fn_grad[i_m, i_n] += ...`，即 `fn_grad` 是**累加目标**、调用方必须预先清零；用 NaN 填充去测会得到全 NaN 并误判为 kernel 缺写。`head_compute_mix`/`sinkhorn`/`pre_split_mixes` 三个文件本轮未逐一验证。
 
 ## 二、P0 契约在 0.1.15 上的复验
 

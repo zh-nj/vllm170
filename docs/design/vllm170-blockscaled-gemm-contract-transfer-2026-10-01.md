@@ -95,6 +95,13 @@ Ascend 的 SF layout helper 把概念写得很干净（`layout/ascend.py:95-105`
 
 ## 四、对现有两个 kernel 的具体建议
 
+> 落地状态（2026-10-01）：本节 `dsv41_sm80_tilelang.py` 的三条已实现于提交
+> `43571bf677`，并以"生成 CUDA 逐字节不变 + SM80 测试套件 112 passed 不变 +
+> 六项负例断言全部触发"验收。下面"未来的 W8A16 / MXFP8 候选"三条仍是待办。
+> 本节的 `sf_b_granularity_k` 是借用块量化 GEMM 的命名；本格式的真实
+> K 粒度是 `_PACKED_K_GROUP = 32`（一个 packed block），shift word 覆盖
+> `_SHIFT_WORD_K_BLOCKS = 4` 个这样的 block。
+
 ### `dsv41_sm80_tilelang.py`（已提交的 SM80 候选）
 
 - 把 `ko` 手算的 scale 偏移改成显式的 `(k_start, sf_b_granularity_k)` 契约，索引算术集中一处。

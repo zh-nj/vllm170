@@ -1,5 +1,15 @@
 # DSV41F SM80 TileLang grouped GEMM 可选接入
 
+> 2026-10-01 复测修订：本文的性能数字与冻结参数已过期，保留作原始记录。
+> 在 tilelang 0.1.15 + 当前代码（PRMT 解码循环整形、W2 改为 128 threads /
+> 3 stages、契约重构）下重测，专家段收益为 **fixed 1.20% / 1.25%、rotating
+> 1.45% / 1.23%**（两轮独立运行，均 `bitwise_exact=true`），不再是
+> 8.05% / 7.85%。两点必须同时看：本轮的 CUTLASS 基线是 **171.3 µs**，而本文
+> 记录的是 **200.4 µs**；CUTLASS 路径与本轮改动无关，这个位移只能来自会话间
+> 机器状态（本文测量时生产 PP5 的五个进程仍在卡上），因此两轮的百分比不可
+> 直接相减比较。另：下文"冻结参数"中的 **W2 64 threads、双缓冲**已改为
+> 128 threads、3 stages。原始证据见 `artifacts/tilelang-015-remeasure-20261001/`。
+
 日期：2026-10-01。承接 [PRMT 离线实现与复测](vllm170-dsv41f-sm80-tilelang-prmt-optimization-2026-09-30.md)。
 
 ## 接入方式与隔离范围
