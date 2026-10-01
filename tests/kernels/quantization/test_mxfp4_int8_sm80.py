@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+import json
+import subprocess
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.mxfp4_int8_sm80 import (
     Mxfp4Int8Sm80Experts,
+    dsv41_sm80_tilelang_enabled,
     make_mxfp4_int8_sm80_decode_metadata,
     select_mxfp4_int8_sm80_tile,
 )
@@ -679,7 +686,10 @@ def _explicit_routing(tokens, topk, num_experts, device, order=None):
 @_NEEDS_SM80
 @pytest.mark.parametrize("topk", [3, 6])
 @pytest.mark.parametrize("tokens", [1, 4])
-def test_w13_grouped_gemm_matches_sparse_reference(topk: int, tokens: int) -> None:
+@pytest.mark.parametrize("varied_scales", [False, True])
+def test_w13_grouped_gemm_matches_sparse_reference(
+    topk: int, tokens: int, varied_scales: bool
+) -> None:
     """Guards W13's non-zero result: token-row A, slot-row output, scales."""
     num_experts, device = 8, torch.device("cuda")
     positions = _positions(_W13_N_POSITIONS, _W13_K_POSITIONS)
@@ -690,6 +700,16 @@ def test_w13_grouped_gemm_matches_sparse_reference(topk: int, tokens: int) -> No
     )
     a_q = torch.randint(-127, 128, (tokens, _W13[1]), dtype=torch.int8, device=device)
     a_scale = torch.ones((tokens,), dtype=torch.float32, device=device)
+    if varied_scales:
+        channel_scale.copy_(
+            0.11
+            + torch.arange(num_experts * _W13[0], device=device).reshape_as(
+                channel_scale
+            )
+            % 997
+            / 811
+        )
+        a_scale.copy_(0.037 + torch.arange(tokens, device=device) / 13)
     routing_ids = _explicit_routing(tokens, topk, num_experts, device)
 
     routed, _, _, _, _ = _run_gemm(
@@ -700,7 +720,8 @@ def test_w13_grouped_gemm_matches_sparse_reference(topk: int, tokens: int) -> No
 
 @_NEEDS_SM80
 @pytest.mark.parametrize("topk", [3, 6])
-def test_w2_grouped_gemm_reads_slot_rows(topk: int) -> None:
+@pytest.mark.parametrize("varied_scales", [False, True])
+def test_w2_grouped_gemm_reads_slot_rows(topk: int, varied_scales: bool) -> None:
     """Guards W2's A-row contract: slot, not token.
 
     a_q[slot, 0] is strictly increasing, so reading a_q[slot // topk, 0] (the
@@ -717,23 +738,22 @@ def test_w2_grouped_gemm_reads_slot_rows(topk: int) -> None:
     a_q = torch.zeros((num_routed, _W2[1]), dtype=torch.int8, device=device)
     a_q[:, 0] = torch.arange(1, num_routed + 1, dtype=torch.int8)
     a_scale = torch.ones((num_routed,), dtype=torch.float32, device=device)
+    if varied_scales:
+        channel_scale.copy_(
+            0.11
+            + torch.arange(num_experts * _W2[0], device=device).reshape_as(
+                channel_scale
+            )
+            % 997
+            / 811
+        )
+        a_scale.copy_(0.037 + torch.arange(num_routed, device=device) / 13)
     routing_ids = _explicit_routing(tokens, topk, num_experts, device)
 
     routed, _, _, _, _ = _run_gemm(
         _W2, a_q, a_scale, b_mxfp4, b_shift2, channel_scale, routing_ids, 16, 128
     )
-    values = a_q[:, 0].tolist()
-    for slot in range(num_routed):
-        # weight code 0x07 -> magnitude 12, positive, shift 0.
-        expected = torch.tensor(float(values[slot]) * 12.0).to(torch.bfloat16)
-        assert routed[slot, 0].item() == expected.item(), f"slot={slot}"
-        if slot >= topk:
-            # The W13 rule would have read this row instead; it must differ, so
-            # the assertion above is really testing the slot-row contract.
-            token_row = torch.tensor(float(values[slot // topk]) * 12.0).to(
-                torch.bfloat16
-            )
-            assert token_row.item() != expected.item(), f"slot={slot} is ambiguous"
+    _check_all_slots(_W2, a_q, a_scale, channel_scale, positions, routing_ids, routed)
 
 
 @_NEEDS_SM80
@@ -958,3 +978,866 @@ def test_reduce_weights_each_slot_exactly_once(topk: int) -> None:
             == torch.tensor(expected_at(token, 0)).to(torch.bfloat16).item()
         )
         assert out[token, 0].item() != plain_average.item()
+
+
+@pytest.fixture
+def moe_harness():
+    from benchmarks.kernels import deepseek_v41_mxfp4_int8_sm80 as driver
+
+    return driver, importlib.import_module(driver.compare.__module__)
+
+
+@pytest.mark.parametrize(
+    "correctness,measurement",
+    [
+        ("not_checked", "ok"),
+        ("skipped", "ok"),
+        ("uncalibrated", "ok"),
+        ("pass", "fail"),
+        ("pass", "skipped"),
+        ("pass", "inconclusive"),
+    ],
+)
+def test_harness_summary_rejects_incomplete_checks(
+    moe_harness, tmp_path, correctness, measurement
+):
+    _, helper = moe_harness
+    path = tmp_path / "summary.json"
+    helper.write_summary(
+        path,
+        [{"correctness_status": correctness, "measurement_status": measurement}],
+        run_status="complete",
+    )
+    assert not json.loads(path.read_text())["all_passed"]
+
+
+def test_harness_summary_requires_completed_run(moe_harness, tmp_path):
+    _, helper = moe_harness
+    path = tmp_path / "summary.json"
+    rows = [{"correctness_status": "pass", "measurement_status": "not_applicable"}]
+    helper.write_summary(path, rows, run_status="complete")
+    assert json.loads(path.read_text())["all_passed"]
+    helper.write_summary(path, rows, run_status="aborted")
+    assert not json.loads(path.read_text())["all_passed"]
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("capture failed"), MemoryError("OOM")]
+)
+def test_harness_abort_preserves_rows_and_invalidates_old_summary(
+    moe_harness, tmp_path, monkeypatch, failure
+):
+    driver, helper = moe_harness
+    summary = tmp_path / "summary.json"
+    summary.write_text('{"all_passed": true}')
+    output = tmp_path / "results.jsonl"
+    args = SimpleNamespace(summary_json=summary, output_jsonl=output, round=1)
+    monkeypatch.setattr(driver, "parse_args", lambda: args)
+    monkeypatch.setattr(driver, "source_identity", lambda: {})
+
+    def fail(args, run_id, provenance, emit):
+        emit(
+            {
+                "run_id": run_id,
+                "correctness_status": "pass",
+                "measurement_status": "not_applicable",
+            }
+        )
+        raise failure
+
+    monkeypatch.setattr(driver, "execute_scan", fail)
+    with pytest.raises(type(failure), match=str(failure)):
+        driver.main()
+    result = json.loads(summary.read_text())
+    assert result["run_status"] == "aborted" and not result["all_passed"]
+    assert len(output.read_text().splitlines()) == 1
+    assert json.loads(output.read_text())["run_id"] == result["run_id"]
+
+
+def test_harness_local_reduce_bound_handles_zero_and_small_outputs(moe_harness):
+    driver, helper = moe_harness
+    weights = torch.tensor([[0.25, 0.25, 0.5]])
+    routed = torch.tensor([[100139008.0, 0.25]] * 3, dtype=torch.bfloat16)
+    expected = helper.reference_reduce(routed, weights)
+    bad = expected.clone()
+    bad[0, 1] = 0
+
+    def verdict(value, ref, operands):
+        return helper.classify(
+            helper.compare(
+                value,
+                ref,
+                term_scale=helper.reduce_term_scale(operands, weights),
+                measure_bf16_steps=True,
+            ),
+            exact_required=False,
+            threshold=driver.REDUCE_THRESHOLD,
+        )[0]
+
+    assert verdict(bad, expected, routed) == "fail"
+    assert verdict(expected, expected, routed) == "pass"
+    assert (
+        verdict(
+            torch.zeros_like(expected),
+            torch.zeros_like(expected),
+            torch.zeros_like(routed),
+        )
+        == "pass"
+    )
+    assert (
+        verdict(
+            torch.ones_like(expected),
+            torch.zeros_like(expected),
+            torch.zeros_like(routed),
+        )
+        == "fail"
+    )
+
+
+def test_harness_byte_accounting_does_not_select_weight_tensors(
+    moe_harness, monkeypatch
+):
+    _, helper = moe_harness
+
+    def no_copy(*args, **kwargs):
+        pytest.fail("byte accounting must not gather weights")
+
+    monkeypatch.setattr(torch.Tensor, "index_select", no_copy)
+    weights = (
+        torch.empty(8, 16, dtype=torch.uint8),
+        torch.empty(8, 4, dtype=torch.uint8),
+        torch.empty(8, 2),
+    )
+    assert helper.stage_weight_bytes(*weights, [0, 0, 7])["total"] == 56
+    with pytest.raises(ValueError, match="expert ID"):
+        helper.stage_weight_bytes(*weights, [8])
+
+
+def test_harness_reduce_bound_tolerates_cancellation_rounding(moe_harness):
+    driver, helper = moe_harness
+    routed = torch.tensor([[100139008.0], [1.0], [-100139008.0]], dtype=torch.bfloat16)
+    weights = torch.tensor([[0.25, 0.5, 0.25]])
+    fp32 = helper.reference_reduce(routed, weights)
+    fp64 = helper.reference_reduce(routed, weights, accumulate_dtype=torch.float64)
+    assert not torch.equal(fp32, fp64)
+    comparison = helper.compare(
+        fp32,
+        fp64,
+        term_scale=helper.reduce_term_scale(routed, weights),
+        measure_bf16_steps=True,
+    )
+    assert (
+        helper.classify(
+            comparison, exact_required=False, threshold=driver.REDUCE_THRESHOLD
+        )[0]
+        == "pass"
+    )
+
+
+@pytest.mark.parametrize(
+    "sets",
+    [
+        [[0, 1], [0, 1]],
+        [[0, 1], [1, 2]],
+        [[0, 1], [2, 3]],
+        [[0, 1, 2, 3, 4, 5], [6, 7, 0, 1, 2, 3]],
+    ],
+)
+def test_harness_rotation_counts_repeated_experts_per_call(moe_harness, sets):
+    driver, _ = moe_harness
+    weights = {
+        stage + suffix: torch.empty(8, width, dtype=dtype)
+        for stage in ("w13", "w2")
+        for suffix, width, dtype in [
+            ("", 16, torch.uint8),
+            ("_shift2", 4, torch.uint8),
+            ("_scale", 2, torch.float32),
+        ]
+    }
+    per_call, period, working_set = driver.rotation_accounting(
+        weights, [torch.tensor([ids]) for ids in sets], 16
+    )
+    assert period == len(sets)
+    assert per_call["w13"]["total"] == sum(len(set(ids)) * 28 for ids in sets) / len(
+        sets
+    )
+    assert working_set["w2"] == len(set.union(*(set(ids) for ids in sets))) * 28
+
+
+def test_harness_seed_reproduces_inputs_across_scan_order(moe_harness, monkeypatch):
+    driver, helper = moe_harness
+    monkeypatch.setattr(driver, "HIDDEN_SIZE", 128)
+    monkeypatch.setattr(driver, "INTERMEDIATE_SIZE", 128)
+
+    def build(seed, tokens=2):
+        weights = driver.build_weights(8, torch.device("cpu"), seed=seed)
+        tensors = driver.build_stage_tensors(
+            weights,
+            tokens=tokens,
+            topk=3,
+            num_routed=tokens * 3,
+            device=torch.device("cpu"),
+            seed=seed,
+        )
+        return {
+            **{k: helper.tensor_hash(v) for k, v in weights.items()},
+            **{stage: helper.tensor_hash(t["a_q"]) for stage, t in tensors.items()},
+        }
+
+    first = build(42)
+    build(5, tokens=3)
+    assert first == build(42)
+    assert first != build(43)
+
+
+def test_harness_fingerprint_includes_staged_and_untracked_sources(
+    moe_harness, tmp_path
+):
+    _, helper = moe_harness
+
+    def git(*args):
+        subprocess.run(
+            ["git", "-C", str(tmp_path), *args], check=True, capture_output=True
+        )
+
+    git("init")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    source = tmp_path / "helper.py"
+    source.write_text("first")
+    first = helper.dirty_diff_hash(tmp_path)
+    source.write_text("second")
+    assert first != helper.dirty_diff_hash(tmp_path)
+    git("add", "helper.py")
+    staged = helper.dirty_diff_hash(tmp_path)
+    source.write_text("third")
+    git("add", "helper.py")
+    assert staged != helper.dirty_diff_hash(tmp_path)
+
+
+@pytest.mark.parametrize("bad_route", [None, 1])
+def test_harness_checks_each_graph_output_and_rejects_noop_replay(
+    moe_harness, monkeypatch, bad_route
+):
+    driver, _ = moe_harness
+    monkeypatch.setattr(driver, "align_routes", lambda ids, *args: (ids, None, None))
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    def make_call(stage, tensors, weights, align, *args):
+        output = tensors[stage]["routed_out"]
+        value = float(align[0][0, 0]) + 1
+
+        def invoke():
+            output.fill_(value if bad_route != value - 1 else -1)
+
+        return invoke
+
+    monkeypatch.setattr(driver, "build_eager_call", make_call)
+    tensors = {"w13": {"routed_out": torch.empty(1, 1), "output": torch.empty(1, 1)}}
+    rows: list[dict] = []
+
+    def build():
+        return driver.build_timed_call(
+            None,
+            "w13",
+            tensors,
+            torch.ones(1, 1),
+            [torch.tensor([[0]]), torch.tensor([[1]])],
+            1,
+            16,
+            128,
+            2,
+            [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
+            {"variant": "16x128"},
+            rows.append,
+        )
+
+    if bad_route is not None:
+        with pytest.raises(AssertionError, match="route=1"):
+            build()
+        assert rows[-1]["correctness_status"] == "fail"
+    else:
+        call, count, validate = build()
+        assert count == 2
+        validate(SimpleNamespace(replay=call))
+        with pytest.raises(AssertionError, match="graph-replay"):
+            validate(SimpleNamespace(replay=lambda: None))
+
+
+@pytest.fixture
+def tilelang_offline_modules():
+    """Load the offline TileLang harness only for tests that exercise it."""
+    try:
+        bench = importlib.import_module(
+            "benchmarks.kernels.deepseek_v41_moe_tilelang_bench"
+        )
+        autotune = importlib.import_module(
+            "benchmarks.kernels.deepseek_v41_moe_tilelang_autotune"
+        )
+    except ImportError as exc:
+        pytest.skip(f"TileLang offline harness is unavailable: {exc}")
+    return bench, autotune
+
+
+def _tilelang_test_config(autotune):
+    return autotune.GemmConfig(
+        n=8,
+        k=32,
+        num_experts=1,
+        topk=1,
+        block_m=16,
+        block_n=8,
+        block_k=32,
+        num_stages=1,
+        threads=32,
+        source_rows_are_slots=False,
+    )
+
+
+def _tilelang_test_case():
+    reference = torch.zeros((1, 1), dtype=torch.bfloat16)
+    return SimpleNamespace(
+        stage="w13",
+        tokens=1,
+        slot_count=1,
+        routed_out=torch.empty_like(reference),
+        reference=reference,
+    )
+
+
+def test_tilelang_no_check_cannot_promote(tilelang_offline_modules, monkeypatch):
+    """Diagnostic timing without reference checks cannot enter promotion set."""
+    _, autotune = tilelang_offline_modules
+    case = _tilelang_test_case()
+    config = _tilelang_test_config(autotune)
+    calls = []
+
+    monkeypatch.setattr(
+        autotune.TileLangMoeGemm,
+        "create",
+        lambda config, tokens, slots: SimpleNamespace(
+            source="test-source", compile_seconds=0.0
+        ),
+    )
+    monkeypatch.setattr(
+        autotune,
+        "candidate_call",
+        lambda gemm, case: lambda: case.routed_out.copy_(case.reference),
+    )
+    monkeypatch.setattr(autotune, "case_identity", lambda case: {})
+
+    def fake_time_graph(call, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(as_row=lambda: {"p50_us": 1.0, "p90_us": 1.0})
+
+    monkeypatch.setattr(autotune, "time_graph", fake_time_graph)
+    monkeypatch.setattr(autotune.torch.accelerator, "synchronize", lambda: None)
+
+    record = autotune.measure_config(
+        case=case,
+        config=config,
+        reference=case.reference,
+        warmup=0,
+        samples=1,
+        graph_calls=1,
+        check=False,
+    )
+
+    assert record["verification_status"] == "skipped"
+    assert record["measurement_status"] == "ok"
+    assert record["promotable"] is False
+    assert record["graph_replay_checked"] is False
+    assert calls and calls[0]["validate_graph"] is None
+
+
+def test_tilelang_timing_failure_is_recorded(tilelang_offline_modules, monkeypatch):
+    """A CUDA-graph/event failure cannot leave a verified candidate timed."""
+    _, autotune = tilelang_offline_modules
+    case = _tilelang_test_case()
+    config = _tilelang_test_config(autotune)
+
+    monkeypatch.setattr(
+        autotune.TileLangMoeGemm,
+        "create",
+        lambda config, tokens, slots: SimpleNamespace(
+            source="test-source", compile_seconds=0.0
+        ),
+    )
+    monkeypatch.setattr(
+        autotune,
+        "candidate_call",
+        lambda gemm, case: lambda: case.routed_out.copy_(case.reference),
+    )
+    monkeypatch.setattr(autotune, "case_identity", lambda case: {})
+
+    def fail_timing(*args, **kwargs):
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(autotune, "time_graph", fail_timing)
+    monkeypatch.setattr(autotune.torch.accelerator, "synchronize", lambda: None)
+
+    record = autotune.measure_config(
+        case=case,
+        config=config,
+        reference=case.reference,
+        warmup=0,
+        samples=1,
+        graph_calls=1,
+        check=True,
+    )
+
+    assert record["verification_status"] == "pass"
+    assert record["measurement_status"] == "timing_failure"
+    assert record["promotable"] is False
+    assert "capture failed" in record["failure_reason"]
+
+
+def test_tilelang_graph_validator_poison_checks_every_output(
+    tilelang_offline_modules, monkeypatch
+):
+    """A replay that writes only one case must fail the other case's check."""
+    bench, _ = tilelang_offline_modules
+    reference = torch.zeros((1, 1), dtype=torch.bfloat16)
+    first = SimpleNamespace(
+        routed_out=torch.ones_like(reference), reference=reference.clone()
+    )
+    second = SimpleNamespace(
+        routed_out=torch.ones_like(reference), reference=reference.clone()
+    )
+
+    class PartialReplay:
+        def replay(self):
+            first.routed_out.copy_(first.reference)
+
+    monkeypatch.setattr(bench.torch.accelerator, "synchronize", lambda: None)
+    validate = bench.graph_validator([first, second])
+    with pytest.raises(ValueError, match="route 1"):
+        validate(PartialReplay())
+    assert torch.isnan(second.routed_out).all()
+
+
+def test_tilelang_first_mismatch_distinguishes_bfloat16_signed_zero(
+    tilelang_offline_modules,
+):
+    bench, _ = tilelang_offline_modules
+    positive_zero = torch.tensor([[0.0]], dtype=torch.bfloat16)
+    negative_zero = torch.tensor([[-0.0]], dtype=torch.bfloat16)
+
+    result = bench.first_mismatch(positive_zero, negative_zero)
+
+    assert result["finite"]
+    assert not result["bitwise_exact"]
+    assert result["mismatches"] == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_tilelang_first_mismatch_rejects_nonfinite_candidate(
+    tilelang_offline_modules, value
+):
+    bench, _ = tilelang_offline_modules
+    candidate = torch.tensor([[value]], dtype=torch.bfloat16)
+    reference = torch.zeros_like(candidate)
+
+    result = bench.first_mismatch(candidate, reference)
+
+    assert not result["finite"]
+    assert not result["bitwise_exact"]
+
+
+@pytest.mark.parametrize("tokens", [15, 16, 17])
+def test_tilelang_tile_boundary_routes_are_slot_balanced(
+    tilelang_offline_modules, tokens
+):
+    bench, _ = tilelang_offline_modules
+    routing_ids = bench.candidate_routes(
+        tokens, topk=3, num_experts=8, pattern="tile-boundary", seed=789
+    )
+
+    assert routing_ids.shape == (tokens, 3)
+    assert bool((routing_ids.sort(dim=1).values.diff(dim=1) != 0).all().item())
+    assert torch.equal(routing_ids, routing_ids[0].expand(tokens, -1))
+    for expert in routing_ids[0].tolist():
+        assert int((routing_ids == expert).sum()) == tokens
+
+
+@_NEEDS_SM80
+@pytest.mark.parametrize("stage", ["w13", "w2"])
+@pytest.mark.parametrize("tokens", [15, 17])
+def test_tilelang_sm80_tile_boundary_candidate_graph(
+    tilelang_offline_modules, stage, tokens
+):
+    """Check both routed GEMM stages across the BM16 boundary on real SM80."""
+    bench, autotune = tilelang_offline_modules
+    device = torch.device("cuda")
+    n, k, source_rows_are_slots = bench.STAGE_SHAPES[stage]
+    config = autotune.GemmConfig(
+        n=n,
+        k=k,
+        num_experts=8,
+        topk=3,
+        block_m=16,
+        block_n=64,
+        block_k=128,
+        num_stages=2 if tokens == 15 else 3,
+        threads=128 if tokens == 15 else 64,
+        source_rows_are_slots=source_rows_are_slots,
+        decode="prmt",
+    )
+    case = bench.build_case(
+        stage=stage,
+        num_experts=8,
+        topk=3,
+        tokens=tokens,
+        pattern="tile-boundary",
+        seed=789,
+        block_m=16,
+        block_n=64,
+        device=device,
+        scale_mode="varied",
+    )
+    gemm = autotune.TileLangMoeGemm.create(
+        config, tokens=case.tokens, slots=case.slot_count
+    )
+    call = bench.candidate_call(gemm, case)
+
+    case.routed_out.fill_(float("nan"))
+    call()
+    torch.accelerator.synchronize()
+    eager = bench.first_mismatch(case.routed_out, case.reference)
+    assert eager["finite"] and eager["bitwise_exact"]
+
+    autotune.time_graph(
+        call,
+        warmup=1,
+        repeats=1,
+        samples=1,
+        validate_graph=bench.graph_validator([case]),
+    )
+
+
+def _tilelang_gate_inputs(*, model_type="deepseek_v41", switch=False):
+    parallel = SimpleNamespace(
+        tp_size=1,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        sp_size=1,
+        use_ep=False,
+    )
+    moe = SimpleNamespace(
+        num_experts=384,
+        num_local_experts=384,
+        experts_per_token=6,
+        hidden_dim=5120,
+        intermediate_size_per_partition=2304,
+        in_dtype=torch.bfloat16,
+        activation=MoEActivation.SILU,
+        has_bias=False,
+        is_lora_enabled=False,
+        moe_parallel_config=parallel,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type=model_type,
+                hidden_size=5120,
+                moe_intermediate_size=2304,
+                n_routed_experts=384,
+            )
+        ),
+        additional_config={"dsv41_sm80_moe_tilelang": switch},
+    )
+    return config, moe
+
+
+def test_dsv41_sm80_tilelang_gate_defaults_off_and_enables_target():
+    config, moe = _tilelang_gate_inputs()
+
+    assert not dsv41_sm80_tilelang_enabled(config, moe)
+    config.additional_config["dsv41_sm80_moe_tilelang"] = True
+    assert dsv41_sm80_tilelang_enabled(config, moe)
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen"])
+def test_dsv41_sm80_tilelang_gate_requires_target_model_identity(model_type):
+    config, moe = _tilelang_gate_inputs(model_type=model_type, switch=True)
+
+    assert not dsv41_sm80_tilelang_enabled(config, moe)
+
+
+@pytest.mark.parametrize("switch", ["true", 1, None])
+def test_dsv41_sm80_tilelang_gate_rejects_non_boolean_target_switch(switch):
+    config, moe = _tilelang_gate_inputs(switch=switch)
+
+    with pytest.raises(ValueError, match="JSON boolean"):
+        dsv41_sm80_tilelang_enabled(config, moe)
+
+
+@pytest.mark.parametrize("switch", ["true", 1, None])
+def test_dsv41_sm80_tilelang_gate_ignores_malformed_switch_for_other_models(switch):
+    config, moe = _tilelang_gate_inputs(model_type="other_model", switch=switch)
+
+    assert not dsv41_sm80_tilelang_enabled(config, moe)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "topk3",
+        "experts256",
+        "wrong_dims",
+        "parallel_tp2",
+        "lora",
+        "bias",
+    ],
+)
+def test_dsv41_sm80_tilelang_gate_falls_back_for_unsupported_moe(mutation):
+    config, moe = _tilelang_gate_inputs(switch=True)
+    if mutation == "topk3":
+        moe.experts_per_token = 3
+    elif mutation == "experts256":
+        moe.num_experts = moe.num_local_experts = 256
+    elif mutation == "wrong_dims":
+        config.model_config.hf_config.hidden_size = 4096
+    elif mutation == "parallel_tp2":
+        moe.moe_parallel_config.tp_size = 2
+    elif mutation == "lora":
+        moe.is_lora_enabled = True
+    else:
+        moe.has_bias = True
+
+    assert not dsv41_sm80_tilelang_enabled(config, moe)
+
+
+@_NEEDS_SM80
+def test_gemm_nonunit_scale_straddles_bf16_rounding_boundary():
+    device = torch.device("cuda")
+    b, shifts = _new_packed(8, *_W2[:2], device)
+    _fill_experts(b, shifts, {(0, 0): (1, 0)}, range(8))
+    a = torch.ones((3, _W2[1]), dtype=torch.int8, device=device)
+    scales = torch.tensor(
+        [1.00390625 - 2**-23, 1.00390625, 1.00390625 + 2**-23], device=device
+    )
+    channel = torch.full((8, _W2[0]), 0.73, device=device)
+    channel[:, 0] = 1.0
+    ids = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device)
+    routed, *_ = _run_gemm(_W2, a, scales, b, shifts, channel, ids, 16, 128)
+    assert routed[:, 0].tolist() == [1.0, 1.0, 1.0078125]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["omit_a", "omit_channel", "token_for_slot", "wrong_expert"]
+)
+def test_harness_nonunit_scales_reject_incorrect_epilogues(
+    moe_harness, monkeypatch, mutation
+):
+    driver, helper = moe_harness
+    monkeypatch.setitem(helper.STAGE_SHAPES, "w2", (8, 128, True))
+    packed, shift = helper.manual_anchor_tensors()
+    packed, shift = packed.repeat(3, 1, 1, 1), shift.repeat(3, 1, 1, 1)
+    a = torch.ones((3, 128), dtype=torch.int8)
+    a_scale = torch.tensor([0.0313, 0.11, 0.73])
+    channel = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 13 + 0.17
+    ids = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+
+    def reference(activation_scale, channel_scale):
+        return helper.reference_stage(
+            a, activation_scale, packed, shift, channel_scale, ids, stage="w2"
+        )
+
+    expected = reference(a_scale, channel)
+    if mutation == "omit_a":
+        observed = reference(torch.ones_like(a_scale), channel)
+    elif mutation == "omit_channel":
+        observed = reference(a_scale, torch.ones_like(channel))
+    elif mutation == "token_for_slot":
+        observed = reference(a_scale[:1].expand_as(a_scale), channel)
+    else:
+        observed = reference(a_scale, channel.roll(1, 0))
+    assert (
+        helper.classify(
+            helper.compare(observed, expected), exact_required=True, threshold=None
+        )[0]
+        == "fail"
+    )
+
+
+@_NEEDS_SM80
+def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
+    tilelang_offline_modules, monkeypatch
+):
+    """Compare the real quantize/GEMM/activation/reduce path and shape fallback."""
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("the frozen candidate targets SM80 only")
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm.model_executor.layers.fused_moe.experts import (
+        dsv41_sm80_tilelang,
+        mxfp4_int8_sm80,
+    )
+
+    bench, _ = tilelang_offline_modules
+    config, moe = _tilelang_gate_inputs(switch=True)
+    for key in (
+        "swiglu_limit",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+    ):
+        setattr(moe, key, None)
+    device = torch.device("cuda")
+    w13 = bench.build_packed_weights(384, "w13", device, seed=911)
+    w2 = bench.build_packed_weights(384, "w2", device, seed=912)
+    # Keep the full nonlinear path well-scaled while varying each channel.
+    w13["channel_scale"].mul_(1e-3)
+    w2["channel_scale"].mul_(1e-3)
+    layer = SimpleNamespace(
+        w13_weight=w13["packed"],
+        w2_weight=w2["packed"],
+        w13_mxfp4_int8_shift2=w13["shift2"],
+        w2_mxfp4_int8_shift2=w2["shift2"],
+    )
+    quant = FusedMoEQuantConfig.make(
+        w1_scale=w13["channel_scale"], w2_scale=w2["channel_scale"]
+    )
+    monkeypatch.setattr(
+        mxfp4_int8_sm80, "get_current_vllm_config_or_none", lambda: config
+    )
+    candidate = Mxfp4Int8Sm80Experts(moe, quant)
+    candidate.process_weights_after_loading(layer)
+    assert candidate._tilelang_decode_gemms is not None
+    config.additional_config["dsv41_sm80_moe_tilelang"] = False
+    baseline = Mxfp4Int8Sm80Experts(moe, quant)
+    baseline.process_weights_after_loading(layer)
+    assert baseline._tilelang_decode_gemms is None
+
+    def no_compilation(*args, **kwargs):
+        pytest.fail("forward/capture must never compile or tune")
+
+    monkeypatch.setattr(dsv41_sm80_tilelang, "compile_decode_gemms", no_compilation)
+    launches = []
+
+    def tracked(index, kernel):
+        def call(*args):
+            launches.append(index)
+            return kernel(*args)
+
+        return call
+
+    candidate._tilelang_decode_gemms = tuple(
+        tracked(i, kernel) for i, kernel in enumerate(candidate._tilelang_decode_gemms)
+    )
+    generator = torch.Generator(device=device).manual_seed(913)
+    for tokens, topk in ((1, 6), (2, 6), (1, 3)):
+        hidden = torch.randn(
+            (tokens, 5120), device=device, dtype=torch.bfloat16, generator=generator
+        )
+        ids = torch.tensor(
+            [[311, 17, 205, 92, 4, 378]], device=device, dtype=torch.int64
+        )[:, :topk].repeat(tokens, 1)
+        weights = torch.linspace(0.07, 0.31, topk, device=device).repeat(tokens, 1)
+        weights /= weights.sum(dim=1, keepdim=True)
+
+        def make_call(experts, tokens, topk, hidden, weights, ids):
+            ws13 = torch.empty(
+                (tokens * topk, 3 * 2304), device=device, dtype=torch.bfloat16
+            )
+            ws2 = torch.empty(
+                (tokens * topk, 5120), device=device, dtype=torch.bfloat16
+            )
+            # Match the modular runner's output/workspace13 storage alias.
+            output = ws13.flatten()[: tokens * 5120].view(tokens, 5120)
+
+            def call():
+                experts.apply(
+                    output,
+                    hidden,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    weights,
+                    ids,
+                    MoEActivation.SILU,
+                    384,
+                    None,
+                    None,
+                    None,
+                    ws13,
+                    ws2,
+                    None,
+                    False,
+                )
+
+            return call, output, ws2
+
+        base_call, expected, expected_slots = make_call(
+            baseline, tokens, topk, hidden, weights, ids
+        )
+        cand_call, output, slots = make_call(
+            candidate, tokens, topk, hidden, weights, ids
+        )
+        launches.clear()
+        base_call()
+        cand_call()
+        assert launches == ([0, 1] if (tokens, topk) == (1, 6) else [])
+        assert bench.first_mismatch(output, expected)["bitwise_exact"]
+        assert bench.first_mismatch(slots, expected_slots)["bitwise_exact"]
+
+        graph = importlib.import_module("deepseek_v41_moe_harness").capture_graph(
+            cand_call, warmup=2, graph_calls=1
+        )
+        for _ in range(2):
+            # Change dynamic data in place while keeping captured tensor pointers.
+            hidden.copy_(
+                torch.randn(
+                    hidden.shape, device=device, dtype=hidden.dtype, generator=generator
+                )
+            )
+            ids.add_(37).remainder_(384)
+            base_call()
+            output.fill_(float("nan"))
+            slots.fill_(float("nan"))
+            graph.replay()
+            torch.accelerator.synchronize()
+            assert bench.first_mismatch(output, expected)["bitwise_exact"]
+            assert bench.first_mismatch(slots, expected_slots)["bitwise_exact"]
+
+
+@pytest.mark.parametrize("requested,minor", [(False, 0), (True, 6)])
+def test_dsv41_tilelang_load_gate_does_not_import_for_ineligible_device(
+    monkeypatch, requested, minor
+):
+    """Default-off and SM86 loading must not import or compile the candidate."""
+    import builtins
+
+    from vllm.model_executor.layers.fused_moe.experts import mxfp4_int8_sm80 as impl
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if "dsv41_sm80_tilelang" in name or "dsv41_sm80_tilelang" in (fromlist or ()):
+            pytest.fail("an ineligible layer imported the TileLang candidate")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(impl.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        impl.current_platform,
+        "get_device_capability",
+        lambda device_id: SimpleNamespace(major=8, minor=minor),
+    )
+    experts = object.__new__(Mxfp4Int8Sm80Experts)
+    experts._tilelang_requested = requested
+    layer = SimpleNamespace(
+        w13_mxfp4_int8_shift2=torch.empty(1),
+        w2_mxfp4_int8_shift2=torch.empty(1),
+    )
+    experts.process_weights_after_loading(layer)
+    assert experts._tilelang_decode_gemms is None

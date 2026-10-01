@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental DSV4.1 MXFP4 -> INT8 modular MoE backend for SM80."""
 
+from typing import TYPE_CHECKING
+
 import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -28,6 +32,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 _HIDDEN_SIZE = 5120
 _INTERMEDIATE_SIZE = 2304
@@ -84,6 +93,40 @@ def select_mxfp4_int8_sm80_tile(
             f"supported values are {_SUPPORTED_DECODE_BLOCK_N}"
         )
     return block_m, _DECODE_BLOCK_N
+
+
+def dsv41_sm80_tilelang_enabled(
+    config: "VllmConfig | None", moe: FusedMoEConfig
+) -> bool:
+    """Opt in only the DSV41F target experts; shape alone is not identity."""
+    if config is None or config.model_config is None:
+        return False
+    hf_config = config.model_config.hf_config
+    if getattr(hf_config, "model_type", None) != "deepseek_v41":
+        return False
+    extra = config.additional_config
+    value = (
+        extra.get("dsv41_sm80_moe_tilelang", False)
+        if isinstance(extra, dict)
+        else False
+    )
+    if not isinstance(value, bool):
+        raise ValueError("dsv41_sm80_moe_tilelang must be a JSON boolean")
+    return (
+        value
+        and getattr(hf_config, "hidden_size", None) == _HIDDEN_SIZE
+        and getattr(hf_config, "moe_intermediate_size", None) == _INTERMEDIATE_SIZE
+        and getattr(hf_config, "n_routed_experts", None) == _DECODE_NUM_EXPERTS
+        and moe.num_experts == moe.num_local_experts == _DECODE_NUM_EXPERTS
+        and moe.experts_per_token == _TARGET_TOPK
+        and moe.hidden_dim == _HIDDEN_SIZE
+        and moe.intermediate_size_per_partition == _INTERMEDIATE_SIZE
+        and moe.in_dtype == torch.bfloat16
+        and moe.activation == MoEActivation.SILU
+        and not moe.has_bias
+        and not moe.is_lora_enabled
+        and Mxfp4Int8Sm80Experts._supports_parallel_config(moe.moe_parallel_config)
+    )
 
 
 def make_mxfp4_int8_sm80_decode_metadata(
@@ -146,6 +189,10 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         self.w2_shift2: torch.Tensor | None = None
         self.decode_sorted_ids: torch.Tensor | None = None
         self.decode_num_post_pad: torch.Tensor | None = None
+        self._tilelang_requested = dsv41_sm80_tilelang_enabled(
+            get_current_vllm_config_or_none(), moe_config
+        )
+        self._tilelang_decode_gemms = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.w13_shift2 = layer.w13_mxfp4_int8_shift2
@@ -153,6 +200,31 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         self.decode_sorted_ids, self.decode_num_post_pad = (
             make_mxfp4_int8_sm80_decode_metadata(self.w13_shift2.device)
         )
+        self._tilelang_decode_gemms = None
+        if self._tilelang_requested and current_platform.is_cuda():
+            capability = current_platform.get_device_capability(
+                self.w13_shift2.device.index
+            )
+            if (
+                capability is not None
+                and capability.major == 8
+                and capability.minor == 0
+            ):
+                from vllm.model_executor.layers.fused_moe.experts import (
+                    dsv41_sm80_tilelang,
+                )
+
+                self._tilelang_decode_gemms = dsv41_sm80_tilelang.prepare_decode_gemms(
+                    layer,
+                    self.w1_scale,
+                    self.w2_scale,
+                    self.decode_sorted_ids,
+                    self.decode_num_post_pad,
+                )
+                logger.info_once(
+                    "DSV41F SM80 TileLang PRMT enabled for M=1, E=384, top-k6; "
+                    "other shapes use CUTLASS."
+                )
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -307,6 +379,10 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     global_num_experts,
                 )
 
+        decode_gemms = (
+            self._tilelang_decode_gemms if use_persistent_decode_metadata else None
+        )
+
         num_routed = m * topk
         scratch = workspace13.flatten()
         gate_up_numel = num_routed * 2 * _INTERMEDIATE_SIZE
@@ -321,46 +397,72 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         with optional_phase_profile_stage("moe.mxfp4_sm80.w13_quant", hidden_states):
             a13_q, a13_scale = quantize_per_token_int8(hidden_states)
         with optional_phase_profile_stage("moe.mxfp4_sm80.w13_gemm", hidden_states):
-            torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
-                a13_q,
-                a13_scale,
-                w1,
-                self.w13_shift2,
-                self.w1_scale,
-                gate_up,
-                gate_up,
-                routing_weights,
-                sorted_ids,
-                expert_ids,
-                num_post_pad,
-                m * topk,
-                block_m,
-                block_n,
-                False,
-            )
+            if decode_gemms is not None:
+                decode_gemms[0](
+                    a13_q,
+                    a13_scale,
+                    w1,
+                    self.w13_shift2,
+                    self.w1_scale,
+                    sorted_ids,
+                    expert_ids,
+                    num_post_pad,
+                    gate_up,
+                )
+            else:
+                torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
+                    a13_q,
+                    a13_scale,
+                    w1,
+                    self.w13_shift2,
+                    self.w1_scale,
+                    gate_up,
+                    gate_up,
+                    routing_weights,
+                    sorted_ids,
+                    expert_ids,
+                    num_post_pad,
+                    m * topk,
+                    block_m,
+                    block_n,
+                    False,
+                )
         with optional_phase_profile_stage("moe.mxfp4_sm80.activation", gate_up):
             self.activation(activation, intermediate, gate_up)
 
         with optional_phase_profile_stage("moe.mxfp4_sm80.w2_quant", intermediate):
             a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
         with optional_phase_profile_stage("moe.mxfp4_sm80.w2_gemm", intermediate):
-            torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
-                a2_q,
-                a2_token_scale,
-                w2,
-                self.w2_shift2,
-                self.w2_scale,
-                output,
-                routed_out,
-                routing_weights,
-                sorted_ids,
-                expert_ids,
-                num_post_pad,
-                m * topk,
-                block_m,
-                block_n,
-                True,
-            )
+            if decode_gemms is not None:
+                decode_gemms[1](
+                    a2_q,
+                    a2_token_scale,
+                    w2,
+                    self.w2_shift2,
+                    self.w2_scale,
+                    sorted_ids,
+                    expert_ids,
+                    num_post_pad,
+                    routed_out,
+                )
+            else:
+                torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
+                    a2_q,
+                    a2_token_scale,
+                    w2,
+                    self.w2_shift2,
+                    self.w2_scale,
+                    output,
+                    routed_out,
+                    routing_weights,
+                    sorted_ids,
+                    expert_ids,
+                    num_post_pad,
+                    m * topk,
+                    block_m,
+                    block_n,
+                    True,
+                )
         with optional_phase_profile_stage("moe.mxfp4_sm80.reduce", routed_out):
             torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_reduce(
                 routed_out,
