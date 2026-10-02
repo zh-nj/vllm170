@@ -15,7 +15,9 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.models.deepseek_v4.amd.rocm import build_swa_ragged_indices_direct
+from vllm.models.deepseek_v4.amd.rocm import (
+    build_swa_ragged_indices_direct as _build_swa_ragged_indices_direct,
+)
 from vllm.models.deepseek_v4_1 import row_probe
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
@@ -609,6 +611,126 @@ class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indptr: torch.Tensor | None = None
 
 
+@triton.jit
+def _build_small_swa_ragged_kernel(
+    swa_lens_ptr,
+    ragged_indptr_ptr,
+    ragged_indices_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    window_size,
+    block_size,
+    NUM_TOKENS: tl.constexpr,
+    INDEX_WIDTH: tl.constexpr,
+    NON_CAUSAL: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    rows = tl.arange(0, BLOCK_ROWS)
+    is_valid = tl.load(is_valid_token_ptr + rows, rows < NUM_TOKENS, other=0)
+    mask = (rows < NUM_TOKENS) & is_valid
+    req_idx = tl.load(token_to_req_indices_ptr + rows, mask, other=0)
+    query_start = tl.load(query_start_loc_ptr + req_idx, mask, other=0)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1, mask, other=0)
+    seq_len = tl.load(seq_lens_ptr + req_idx, mask, other=0)
+    prefix_len = seq_len - (query_end - query_start)
+    if NON_CAUSAL:
+        start_pos = tl.maximum(prefix_len - window_size, 0)
+        end_pos = seq_len
+    else:
+        pos = prefix_len + rows - query_start
+        start_pos = tl.maximum(pos - window_size + 1, 0)
+        end_pos = pos + 1
+    lengths = tl.where(mask, end_pos - start_pos, 0).to(tl.int32)
+    # Small decode batches can recompute the prefix in each CTA, avoiding a
+    # separate indptr launch and any inter-CTA dependency.
+    out_start = tl.sum(tl.where(rows < token_idx, lengths, 0), axis=0)
+    length = tl.sum(tl.where(rows == token_idx, lengths, 0), axis=0)
+    row_start = tl.sum(tl.where(rows == token_idx, start_pos, 0), axis=0)
+    row_req = tl.sum(tl.where(rows == token_idx, req_idx, 0), axis=0)
+    tl.store(swa_lens_ptr + token_idx, length)
+    tl.store(ragged_indptr_ptr + token_idx, out_start)
+    if token_idx == NUM_TOKENS - 1:
+        tl.store(ragged_indptr_ptr + NUM_TOKENS, out_start + length)
+
+    offsets = tl.arange(0, BLOCK_COLS)
+    index_mask = (offsets < length) & (offsets < INDEX_WIDTH)
+    positions = row_start + offsets
+    block_numbers = tl.load(
+        block_table_ptr + row_req * block_table_stride + positions // block_size,
+        index_mask,
+        other=-1,
+    )
+    slot_ids = block_numbers * block_size + positions % block_size
+    tl.store(ragged_indices_ptr + out_start + offsets, slot_ids, index_mask)
+
+
+def build_swa_ragged_indices_direct(
+    *,
+    num_decode_tokens: int,
+    window_size: int,
+    index_width: int,
+    non_causal: bool,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    swa_lens: torch.Tensor,
+    ragged_indices_buffer: torch.Tensor,
+    ragged_indptr_buffer: torch.Tensor,
+    use_fused: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optionally fuse small V4.1 decode ragged metadata in persistent buffers."""
+    if not (use_fused and 0 < num_decode_tokens <= 48 and 0 < index_width <= 256):
+        return _build_swa_ragged_indices_direct(
+            num_decode_tokens=num_decode_tokens,
+            window_size=window_size,
+            index_width=index_width,
+            non_causal=non_causal,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            token_to_req_indices=token_to_req_indices,
+            is_valid_token=is_valid_token,
+            block_table=block_table,
+            block_size=block_size,
+            swa_lens=swa_lens,
+            ragged_indices_buffer=ragged_indices_buffer,
+            ragged_indptr_buffer=ragged_indptr_buffer,
+        )
+    assert num_decode_tokens <= swa_lens.numel()
+    assert ragged_indptr_buffer.numel() >= num_decode_tokens + 1
+    assert ragged_indices_buffer.numel() >= num_decode_tokens * index_width
+    ragged_indptr = ragged_indptr_buffer[: num_decode_tokens + 1]
+    ragged_indices = ragged_indices_buffer[: num_decode_tokens * index_width]
+    _build_small_swa_ragged_kernel[(num_decode_tokens,)](
+        swa_lens,
+        ragged_indptr,
+        ragged_indices,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_table.stride(0),
+        window_size,
+        block_size,
+        NUM_TOKENS=num_decode_tokens,
+        INDEX_WIDTH=index_width,
+        NON_CAUSAL=non_causal,
+        BLOCK_ROWS=triton.next_power_of_2(num_decode_tokens),
+        BLOCK_COLS=triton.next_power_of_2(index_width),
+        num_warps=4,
+    )
+    return ragged_indices, ragged_indptr
+
+
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
     # Keep fused multi-step decode disabled until update_draft_decode_metadata()
     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
@@ -625,6 +747,20 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        additional_config = self.vllm_config.additional_config
+        fused_swa_metadata = (
+            additional_config.get("dsv41_sm80_fused_swa_metadata", False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if not isinstance(fused_swa_metadata, bool):
+            raise ValueError("dsv41_sm80_fused_swa_metadata must be a JSON boolean")
+        self._use_fused_swa_metadata = (
+            fused_swa_metadata
+            and current_platform.is_cuda()
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(80, self.device.index or 0)
+        )
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         # The non-causal (DSpark draft) path widens each token's SWA index list
         # to ``noncausal_index_width`` (>= window_size), so size the persistent
@@ -645,6 +781,24 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
             and current_platform.is_device_capability_family(80)
         )
         self._direct_decode_swa_ragged: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _get_is_valid_token(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mapping: torch.Tensor,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
+    ) -> torch.Tensor:
+        if not self._use_fused_swa_metadata:
+            return super()._get_is_valid_token(
+                common_attn_metadata,
+                slot_mapping,
+                num_decode_tokens,
+                num_prefill_tokens,
+            )
+        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+        torch.ge(slot_mapping, 0, out=is_valid_token)
+        return is_valid_token
 
     def _build_decode_swa_indices(
         self,
@@ -686,6 +840,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
                 swa_lens=self.decode_swa_lens,
                 ragged_indices_buffer=self.decode_swa_ragged_indices_buffer,
                 ragged_indptr_buffer=self.decode_swa_ragged_indptr_buffer,
+                use_fused=self._use_fused_swa_metadata,
             )
         # DSpark decode consumes the ragged fields; dense rows remain unused.
         return self.decode_swa_indices[:, :, :0]

@@ -4,7 +4,6 @@
 
 import argparse
 import json
-import statistics
 from functools import partial
 from pathlib import Path
 
@@ -15,7 +14,9 @@ from benchmarks.kernels.deepseek_v4_sparse_mla_decode import (
     REDUCE_CONFIGS,
     DecodeCase,
 )
-from benchmarks.kernels.deepseek_v41_verify_component_probe import capture, time_cases
+from benchmarks.kernels.deepseek_v41_moe_w2_pipeline import time_graphs
+from benchmarks.kernels.deepseek_v41_verify_component_probe import capture
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _decode_num_splits
 
 
 def main():
@@ -24,16 +25,20 @@ def main():
     parser.add_argument("--queries", type=int, default=6)
     parser.add_argument("--splits", type=int, default=3)
     parser.add_argument("--main-len", type=int, default=128)
+    parser.add_argument("--extra-len", type=int, default=512)
     parser.add_argument("--ratio", type=int, choices=(1, 2), default=1)
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(20261001)
+    splits = args.splits or _decode_num_splits(
+        args.queries, 4, args.main_len, args.extra_len, 32
+    )
     case = DecodeCase(
         args.queries,
         args.main_len,
-        512,
-        args.splits,
+        args.extra_len,
+        splits,
         20261001,
         128,
         0,
@@ -48,7 +53,11 @@ def main():
     case.extra_indices.copy_(
         torch.randint(0, 32768 // args.ratio, case.extra_indices.shape, device="cuda")
     )
-    baseline_partial, baseline_reduce = (16, 32, 4), (1, 4)
+    block_k = 16 if args.queries == 1 else 32
+    baseline_partial = (16, block_k, 4)
+    baseline_reduce = (
+        (1, 8) if args.queries == 1 else (2 if args.queries >= 8 else 1, 4)
+    )
     case.split(baseline_partial, baseline_reduce)
     reference = case.out.clone()
 
@@ -70,7 +79,8 @@ def main():
     )
     if args.quick:
         configs = {
-            name: configs[name] for name in ("partial_16_32_4", "partial_16_32_8")
+            name: configs[name]
+            for name in (f"partial_16_{block_k}_4", f"partial_16_{block_k}_8")
         }
     graphs, comparisons = {}, {}
     for name, (partial_config, reduce_config) in configs.items():
@@ -87,23 +97,25 @@ def main():
             partial_shared_bytes=case.partial_kernel.metadata.shared,
         )
         graphs[name] = {args.queries: capture(call)}
-    raw = time_cases(graphs, args.samples)
+    raw = time_graphs(
+        {name: value[args.queries][0] for name, value in graphs.items()}, args.samples
+    )
     results = {
         name: dict(
             **comparisons[name],
-            median_us=statistics.median(sum(values[args.queries], [])),
-            raw_us=values[args.queries],
+            **values,
         )
         for name, values in raw.items()
     }
     result = dict(
         queries=args.queries,
-        splits=args.splits,
+        splits=splits,
         ratio=args.ratio,
         main_len=args.main_len,
-        scope="synthetic 32K-context, SWA128+top512, random indices, cold L2",
+        extra_len=args.extra_len,
+        scope="synthetic 32K-context, ragged SWA+compressed KV, cold L2",
         gpu=str(torch.cuda.get_device_properties()),
-        timing="one-call graph, 3 rounds, 64MiB flush outside each sample",
+        timing="one-call graph, 3 rounds, 500ms settle, 64MiB flush outside events",
         results=results,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

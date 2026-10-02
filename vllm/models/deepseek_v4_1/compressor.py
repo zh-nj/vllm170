@@ -7,6 +7,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -93,9 +94,26 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         self.token_to_req_indices = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=self.device
         )
+        self._persist_single_req_token_map = (
+            envs.VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(80, self.device.index or 0)
+        )
         self.slot_mapping_buffer = torch.empty(
             max_num_batched_tokens, dtype=torch.int64, device=self.device
         )
+
+    def _get_token_to_req_indices(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        if self._persist_single_req_token_map and common_attn_metadata.num_reqs == 1:
+            indices = self.token_to_req_indices[
+                : common_attn_metadata.num_actual_tokens
+            ]
+            indices.zero_()
+            common_attn_metadata._token_to_req_indices_cache = indices
+            return indices
+        return common_attn_metadata.token_to_req_indices(self.token_to_req_indices)
 
     def build(
         self,
@@ -106,9 +124,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         num_tokens = common_attn_metadata.slot_mapping.numel()
         positions = common_attn_metadata.positions
         assert positions is not None
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
+        token_to_req_indices = self._get_token_to_req_indices(common_attn_metadata)
         slot_mapping = self.slot_mapping_buffer[:num_tokens]
         block_table = common_attn_metadata.block_table_tensor
         _ring_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)](

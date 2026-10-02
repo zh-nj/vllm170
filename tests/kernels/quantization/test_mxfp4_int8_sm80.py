@@ -13,6 +13,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.mxfp4_int8_sm80 import (
     Mxfp4Int8Sm80Experts,
+    dsv41_sm80_hybrid_prefill_enabled,
     dsv41_sm80_tilelang_enabled,
     make_mxfp4_int8_sm80_decode_metadata,
     select_mxfp4_int8_sm80_tile,
@@ -988,6 +989,36 @@ def moe_harness():
     return driver, importlib.import_module(driver.compare.__module__)
 
 
+@_NEEDS_SM80
+def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(moe_harness):
+    """Pairing must neither drop slots nor retain a stale tail after graph replay."""
+    from benchmarks.kernels.deepseek_v41_moe_hybrid_prefill import (
+        HybridRoutes,
+        check_partition,
+    )
+
+    _, helper = moe_harness
+    hot = torch.arange(6, dtype=torch.int32, device="cuda").expand(129, -1).contiguous()
+    spread = helper.make_routing_ids(129, 6, 8, "uniform", 41, device="cuda")
+    aligned = moe_align_block_size(hot, 64, 8)
+    hybrid = HybridRoutes(hot.numel(), 8, hot.device)
+    hybrid.update(aligned)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hybrid.update(aligned)
+    counts = []
+    for ids in (hot, spread, hot):
+        updated = moe_align_block_size(ids, 64, 8)
+        for dest, src in zip(aligned, updated, strict=True):
+            dest.copy_(src)
+        graph.replay()
+        check_partition(ids, aligned, hybrid)
+        counts.append(hybrid.counts.cpu().tolist())
+    assert counts[0] == counts[2] == [6 * 128, 6 * 64]
+    assert counts[1][1] == 0
+
+
 @pytest.mark.parametrize(
     "correctness,measurement",
     [
@@ -1559,6 +1590,183 @@ def _tilelang_gate_inputs(*, model_type="deepseek_v41", switch=False):
     return config, moe
 
 
+def _hybrid_prefill_gate_inputs():
+    config, moe = _tilelang_gate_inputs()
+    config.additional_config.update(
+        ced_prefill=True, dsv41_sm80_moe_hybrid_prefill=True
+    )
+    config.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=5,
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        use_ubatching=False,
+    )
+    config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=2048, max_num_seqs=8
+    )
+    config.use_v2_model_runner = True
+    config.speculative_config = config.lora_config = None
+    return config, moe
+
+
+def test_hybrid_prefill_gate_defaults_off_and_enables_validated_config():
+    config, moe = _hybrid_prefill_gate_inputs()
+    assert dsv41_sm80_hybrid_prefill_enabled(config, moe)
+    del config.additional_config["dsv41_sm80_moe_hybrid_prefill"]
+    assert not dsv41_sm80_hybrid_prefill_enabled(config, moe)
+
+
+@pytest.mark.parametrize("flag", ["true", 1, None])
+def test_hybrid_prefill_gate_requires_json_boolean(flag):
+    config, moe = _hybrid_prefill_gate_inputs()
+    config.additional_config["dsv41_sm80_moe_hybrid_prefill"] = flag
+    with pytest.raises(ValueError, match="JSON boolean"):
+        dsv41_sm80_hybrid_prefill_enabled(config, moe)
+
+
+@pytest.mark.parametrize(
+    "owner,path,value",
+    [
+        ("config", "speculative_config", SimpleNamespace(method="dspark")),
+        ("config", "lora_config", object()),
+        ("config", "parallel_config.pipeline_parallel_size", 3),
+        ("config", "parallel_config.use_ubatching", True),
+        ("config", "scheduler_config.max_num_batched_tokens", 4096),
+        ("config", "model_config.hf_config.model_type", "deepseek_v4"),
+        ("config", "use_v2_model_runner", False),
+        ("moe", "experts_per_token", 3),
+        ("moe", "moe_parallel_config.tp_size", 2),
+    ],
+)
+def test_hybrid_prefill_gate_preserves_other_configurations(owner, path, value):
+    config, moe = _hybrid_prefill_gate_inputs()
+    target = config if owner == "config" else moe
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    setattr(target, parts[-1], value)
+    assert not dsv41_sm80_hybrid_prefill_enabled(config, moe)
+
+
+@pytest.mark.parametrize("ced,fast", [(False, False), (True, True)])
+def test_hybrid_prefill_gate_requires_ced_without_fast_prefill(ced, fast):
+    config, moe = _hybrid_prefill_gate_inputs()
+    config.additional_config.update(ced_prefill=ced, dsv41_fast_prefill=fast)
+    assert not dsv41_sm80_hybrid_prefill_enabled(config, moe)
+
+
+@pytest.mark.parametrize(
+    "kind", ["pure", "missing", "empty", "decode", "mixed", "graph", "ubatch"]
+)
+def test_hybrid_prefill_batch_gate_preserves_decode_mixed_and_graphs(monkeypatch, kind):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.model_executor.layers.fused_moe.experts import mxfp4_int8_sm80 as impl
+
+    span = SimpleNamespace(num_prefills=1, num_decodes=0)
+    context = SimpleNamespace(
+        attn_metadata={"swa": span},
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        ubatch_slices=None,
+    )
+    if kind == "empty":
+        context.attn_metadata = {}
+    elif kind in ("decode", "mixed"):
+        span.num_decodes = 1
+        span.num_prefills = int(kind == "mixed")
+    elif kind == "graph":
+        context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    elif kind == "ubatch":
+        context.attn_metadata = [context.attn_metadata]
+    monkeypatch.setattr(impl, "is_forward_context_available", lambda: kind != "missing")
+    monkeypatch.setattr(impl, "get_forward_context", lambda: context)
+    assert impl._is_pure_eager_prefill() == (kind == "pure")
+
+
+@_NEEDS_SM80
+def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_routes(
+    tilelang_offline_modules, monkeypatch
+):
+    """Exercise both GEMMs, activation and reduction through the production gate."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm.model_executor.layers.fused_moe.experts import mxfp4_int8_sm80 as impl
+
+    config, moe = _hybrid_prefill_gate_inputs()
+    for key in (
+        "swiglu_limit",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+    ):
+        setattr(moe, key, None)
+    bench, _ = tilelang_offline_modules
+    device = torch.device("cuda")
+    weights = [
+        bench.build_packed_weights(384, stage, device, seed=914)
+        for stage in ("w13", "w2")
+    ]
+    for w in weights:
+        w["channel_scale"].mul_(1e-3)
+    layer = SimpleNamespace(
+        w13_mxfp4_int8_shift2=weights[0]["shift2"],
+        w2_mxfp4_int8_shift2=weights[1]["shift2"],
+    )
+    quant = FusedMoEQuantConfig.make(
+        w1_scale=weights[0]["channel_scale"], w2_scale=weights[1]["channel_scale"]
+    )
+    monkeypatch.setattr(impl, "get_current_vllm_config_or_none", lambda: config)
+    candidate = Mxfp4Int8Sm80Experts(moe, quant)
+    candidate.process_weights_after_loading(layer)
+    assert candidate._hybrid_prefill_routes is not None
+    config.additional_config["dsv41_sm80_moe_hybrid_prefill"] = False
+    baseline = Mxfp4Int8Sm80Experts(moe, quant)
+    baseline.process_weights_after_loading(layer)
+    assert baseline._hybrid_prefill_routes is None
+    context = SimpleNamespace(
+        attn_metadata={"swa": SimpleNamespace(num_prefills=1, num_decodes=0)},
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        ubatch_slices=None,
+    )
+    monkeypatch.setattr(impl, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(impl, "get_forward_context", lambda: context)
+    hidden = torch.randn((2048, 5120), device=device, dtype=torch.bfloat16)
+    ids = torch.arange(6, device=device).expand(2048, -1).contiguous()
+    rw = torch.full((2048, 6), 1 / 6, device=device)
+
+    def run(expert):
+        ws13 = torch.empty((12288, 3 * 2304), device=device, dtype=torch.bfloat16)
+        ws2 = torch.empty((12288, 5120), device=device, dtype=torch.bfloat16)
+        output = ws13.flatten()[: 2048 * 5120].view(2048, 5120)
+        expert.apply(
+            output,
+            hidden,
+            weights[0]["packed"],
+            weights[1]["packed"],
+            rw,
+            ids,
+            MoEActivation.SILU,
+            384,
+            None,
+            None,
+            None,
+            ws13,
+            ws2,
+            None,
+            False,
+        )
+        return output.clone(), ws2
+
+    for spread in (False, True):
+        if spread:
+            ids = torch.arange(12288, device=device).view(2048, 6) % 384
+        expected, expected_slots = run(baseline)
+        output, slots = run(candidate)
+        assert torch.isfinite(output).all()
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(slots.view(torch.int16), expected_slots.view(torch.int16))
+
+
 def test_dsv41_sm80_tilelang_gate_defaults_off_and_enables_target():
     config, moe = _tilelang_gate_inputs()
 
@@ -1718,12 +1926,14 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
     candidate = Mxfp4Int8Sm80Experts(moe, quant)
     candidate.process_weights_after_loading(layer)
     assert candidate._tilelang_decode_gemms is not None
+    assert candidate._tilelang_m6_w13 is not None
     assert candidate._tilelang_m6_w2 is not None
     assert candidate._tilelang_activation_quant is not None
     config.additional_config["dsv41_sm80_moe_tilelang"] = False
     baseline = Mxfp4Int8Sm80Experts(moe, quant)
     baseline.process_weights_after_loading(layer)
     assert baseline._tilelang_decode_gemms is None
+    assert baseline._tilelang_m6_w13 is None
     assert baseline._tilelang_m6_w2 is None
     assert baseline._tilelang_activation_quant is None
 
@@ -1731,6 +1941,7 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
         pytest.fail("forward/capture must never compile or tune")
 
     monkeypatch.setattr(dsv41_sm80_tilelang, "compile_decode_gemms", no_compilation)
+    monkeypatch.setattr(dsv41_sm80_tilelang, "compile_m6_w13", no_compilation)
     monkeypatch.setattr(dsv41_sm80_tilelang, "compile_m6_w2", no_compilation)
     monkeypatch.setattr(
         dsv41_sm80_activation, "compile_activation_quant", no_compilation
@@ -1751,6 +1962,7 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
         2, candidate._tilelang_activation_quant
     )
     candidate._tilelang_m6_w2 = tracked(3, candidate._tilelang_m6_w2)
+    candidate._tilelang_m6_w13 = tracked(4, candidate._tilelang_m6_w13)
     generator = torch.Generator(device=device).manual_seed(913)
     for tokens, topk, clamp in (
         (1, 6, initial_clamp),
@@ -1822,6 +2034,7 @@ def test_dsv41_tilelang_experts_apply_and_changing_graph_routes(
         if tokens == 7 and topk == 6 and clamp == initial_clamp:
             expected_launches = [2]
         if tokens == 6 and topk == 6:
+            expected_launches.insert(0, 4)
             expected_launches.append(3)
         assert launches == expected_launches
         assert bench.first_mismatch(output, expected)["bitwise_exact"]
@@ -1890,6 +2103,7 @@ def test_dsv41_tilelang_load_gate_does_not_import_for_ineligible_device(
     )
     experts.process_weights_after_loading(layer)
     assert experts._tilelang_decode_gemms is None
+    assert experts._tilelang_m6_w13 is None
     assert experts._tilelang_m6_w2 is None
     assert experts._tilelang_activation_quant is None
 
@@ -1931,6 +2145,7 @@ def test_dsv41_tilelang_load_preserves_clamped_activation(monkeypatch, source):
         dsv41_sm80_tilelang, "prepare_decode_gemms", lambda *args: ("w13", "w2")
     )
     monkeypatch.setattr(dsv41_sm80_tilelang, "prepare_m6_w2", lambda *args: "m6_w2")
+    monkeypatch.setattr(dsv41_sm80_tilelang, "prepare_m6_w13", lambda *args: "m6_w13")
 
     def unexpected_prepare(device):
         pytest.fail("a clamped layer must not compile or warm the fused activation")
@@ -1945,6 +2160,7 @@ def test_dsv41_tilelang_load_preserves_clamped_activation(monkeypatch, source):
     experts.process_weights_after_loading(layer)
     assert experts.activation_config.clamp_limit == 7.0
     assert experts._tilelang_decode_gemms == ("w13", "w2")
+    assert experts._tilelang_m6_w13 == "m6_w13"
     assert experts._tilelang_m6_w2 == "m6_w2"
     assert experts._tilelang_activation_quant is None
 

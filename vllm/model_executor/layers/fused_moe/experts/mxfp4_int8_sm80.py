@@ -10,6 +10,8 @@ import torch
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -36,6 +38,9 @@ from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.fused_moe.experts.dsv41_sm80_hybrid_prefill import (
+        HybridRoutes,
+    )
 
 logger = init_logger(__name__)
 
@@ -151,6 +156,69 @@ def make_mxfp4_int8_sm80_decode_metadata(
     return sorted_ids, num_post_pad
 
 
+def dsv41_sm80_hybrid_prefill_enabled(
+    config: "VllmConfig | None", moe: FusedMoEConfig
+) -> bool:
+    """Opt in the validated CED PP5 prefill configuration."""
+    if config is None or config.model_config is None:
+        return False
+    hf = config.model_config.hf_config
+    if getattr(hf, "model_type", None) != "deepseek_v41":
+        return False
+    extra = config.additional_config
+    if not isinstance(extra, dict):
+        return False
+    flag = extra.get("dsv41_sm80_moe_hybrid_prefill", False)
+    if not isinstance(flag, bool):
+        raise ValueError("dsv41_sm80_moe_hybrid_prefill must be a JSON boolean")
+    if not flag:
+        return False
+    parallel = config.parallel_config
+    return (
+        extra.get("ced_prefill") is True
+        and not extra.get("dsv41_fast_prefill", False)
+        and config.use_v2_model_runner
+        and config.speculative_config is None
+        and config.lora_config is None
+        and parallel.pipeline_parallel_size == 5
+        and parallel.tensor_parallel_size == parallel.data_parallel_size == 1
+        and not parallel.use_ubatching
+        and config.scheduler_config.max_num_batched_tokens == 2048
+        and config.scheduler_config.max_num_seqs == 8
+        and getattr(hf, "hidden_size", None) == _HIDDEN_SIZE
+        and getattr(hf, "moe_intermediate_size", None) == _INTERMEDIATE_SIZE
+        and getattr(hf, "n_routed_experts", None) == _DECODE_NUM_EXPERTS
+        and moe.num_experts == moe.num_local_experts == _DECODE_NUM_EXPERTS
+        and moe.experts_per_token == _TARGET_TOPK
+        and moe.hidden_dim == _HIDDEN_SIZE
+        and moe.intermediate_size_per_partition == _INTERMEDIATE_SIZE
+        and moe.in_dtype == torch.bfloat16
+        and moe.activation == MoEActivation.SILU
+        and not moe.has_bias
+        and not moe.is_lora_enabled
+        and Mxfp4Int8Sm80Experts._supports_parallel_config(moe.moe_parallel_config)
+    )
+
+
+def _is_pure_eager_prefill() -> bool:
+    if not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    if (
+        context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+        or context.ubatch_slices is not None
+        or not isinstance(metadata, dict)
+    ):
+        return False
+    spans = [m for m in metadata.values() if hasattr(m, "num_prefills")]
+    return (
+        bool(spans)
+        and any(m.num_prefills > 0 for m in spans)
+        and all(getattr(m, "num_decodes", -1) == 0 for m in spans)
+    )
+
+
 class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
     """SM80 INT8-MMA experts for the fixed DSV4.1 TP1 expert shape.
 
@@ -195,7 +263,12 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         self._tilelang_requested = dsv41_sm80_tilelang_enabled(
             get_current_vllm_config_or_none(), moe_config
         )
+        self._hybrid_prefill_requested = dsv41_sm80_hybrid_prefill_enabled(
+            get_current_vllm_config_or_none(), moe_config
+        )
+        self._hybrid_prefill_routes: HybridRoutes | None = None
         self._tilelang_decode_gemms = None
+        self._tilelang_m6_w13: Callable[..., None] | None = None
         self._tilelang_m6_w2: Callable[..., None] | None = None
         self._tilelang_activation_quant: Callable[..., None] | None = None
         self._tilelang_activation_clamp: float | None = None
@@ -207,6 +280,7 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
             make_mxfp4_int8_sm80_decode_metadata(self.w13_shift2.device)
         )
         self._tilelang_decode_gemms = None
+        self._tilelang_m6_w13 = None
         self._tilelang_m6_w2 = None
         self._tilelang_activation_quant = None
         self._tilelang_activation_clamp = None
@@ -233,6 +307,9 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                 self._tilelang_m6_w2 = dsv41_sm80_tilelang.prepare_m6_w2(
                     layer, self.w2_scale
                 )
+                self._tilelang_m6_w13 = dsv41_sm80_tilelang.prepare_m6_w13(
+                    layer, self.w1_scale
+                )
                 if self.activation_config.clamp_limit in (None, 10.0):
                     from vllm.model_executor.layers.fused_moe.experts import (
                         dsv41_sm80_activation,
@@ -251,8 +328,39 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     )
                 logger.info_once(
                     "DSV41F SM80 TileLang PRMT enabled for M=1 GEMMs and "
-                    "M=6 W2/BN128, E=384, top-k6; "
+                    "M=6 W13/BN64 + W2/BN128, E=384, top-k6; "
                     "other shapes use CUTLASS."
+                )
+        self._hybrid_prefill_routes = None
+        if self._hybrid_prefill_requested and current_platform.is_cuda():
+            capability = current_platform.get_device_capability(
+                self.w13_shift2.device.index
+            )
+            if (
+                capability is not None
+                and capability.major == 8
+                and capability.minor == 0
+            ):
+                from vllm.model_executor.layers.fused_moe.experts import (
+                    dsv41_sm80_hybrid_prefill,
+                )
+
+                self._hybrid_prefill_routes = dsv41_sm80_hybrid_prefill.HybridRoutes(
+                    2048 * _TARGET_TOPK, _DECODE_NUM_EXPERTS, self.w13_shift2.device
+                )
+                warmup_ids = (
+                    torch.arange(
+                        _TARGET_TOPK, dtype=torch.int32, device=self.w13_shift2.device
+                    )
+                    .expand(2048, -1)
+                    .contiguous()
+                )
+                self._hybrid_prefill_routes.update(
+                    moe_align_block_size(warmup_ids, 64, _DECODE_NUM_EXPERTS)
+                )
+                logger.info_once(
+                    "DSV41F SM80 CED hybrid BM128 pairs/BM64 tails enabled "
+                    "for pure eager M=2048 prefill, PP5, E=384, top-k6."
                 )
 
     @property
@@ -394,6 +502,7 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
             and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
             and block_m == _DECODE_BLOCK_M
         )
+        use_hybrid_prefill = False
         if use_persistent_decode_metadata:
             assert self.decode_sorted_ids is not None
             assert self.decode_num_post_pad is not None
@@ -407,9 +516,28 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     block_m,
                     global_num_experts,
                 )
+                use_hybrid_prefill = (
+                    self._hybrid_prefill_routes is not None
+                    and m == 2048
+                    and topk == _TARGET_TOPK
+                    and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
+                    and (block_m, block_n) == (64, 128)
+                    and _is_pure_eager_prefill()
+                )
+                if use_hybrid_prefill:
+                    assert self._hybrid_prefill_routes is not None
+                    self._hybrid_prefill_routes.update(
+                        (sorted_ids, expert_ids, num_post_pad)
+                    )
 
         decode_gemms = (
             self._tilelang_decode_gemms if use_persistent_decode_metadata else None
+        )
+        use_m6_gemms = (
+            m == _TILELANG_W2_TOKENS
+            and topk == _TARGET_TOPK
+            and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
+            and (block_m, block_n) == (_DECODE_BLOCK_M, 128)
         )
 
         num_routed = m * topk
@@ -426,8 +554,11 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         with optional_phase_profile_stage("moe.mxfp4_sm80.w13_quant", hidden_states):
             a13_q, a13_scale = quantize_per_token_int8(hidden_states)
         with optional_phase_profile_stage("moe.mxfp4_sm80.w13_gemm", hidden_states):
-            if decode_gemms is not None:
-                decode_gemms[0](
+            w13_gemm = decode_gemms[0] if decode_gemms is not None else None
+            if use_m6_gemms:
+                w13_gemm = self._tilelang_m6_w13
+            if w13_gemm is not None:
+                w13_gemm(
                     a13_q,
                     a13_scale,
                     w1,
@@ -437,6 +568,19 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     expert_ids,
                     num_post_pad,
                     gate_up,
+                )
+            elif use_hybrid_prefill:
+                assert self._hybrid_prefill_routes is not None
+                self._hybrid_prefill_routes.gemm(
+                    a13_q,
+                    a13_scale,
+                    w1,
+                    self.w13_shift2,
+                    self.w1_scale,
+                    gate_up,
+                    gate_up,
+                    routing_weights,
+                    False,
                 )
             else:
                 torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(
@@ -487,12 +631,7 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                 a2_q, a2_token_scale = quantize_per_token_int8(intermediate)
         with optional_phase_profile_stage("moe.mxfp4_sm80.w2_gemm", intermediate):
             w2_gemm = decode_gemms[1] if decode_gemms is not None else None
-            if (
-                m == _TILELANG_W2_TOKENS
-                and topk == _TARGET_TOPK
-                and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
-                and (block_m, block_n) == (_DECODE_BLOCK_M, 128)
-            ):
+            if use_m6_gemms:
                 w2_gemm = self._tilelang_m6_w2
             if w2_gemm is not None:
                 w2_gemm(
@@ -505,6 +644,19 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     expert_ids,
                     num_post_pad,
                     routed_out,
+                )
+            elif use_hybrid_prefill:
+                assert self._hybrid_prefill_routes is not None
+                self._hybrid_prefill_routes.gemm(
+                    a2_q,
+                    a2_token_scale,
+                    w2,
+                    self.w2_shift2,
+                    self.w2_scale,
+                    output,
+                    routed_out,
+                    routing_weights,
+                    True,
                 )
             else:
                 torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm(

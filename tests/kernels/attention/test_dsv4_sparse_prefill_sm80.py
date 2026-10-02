@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -102,7 +103,9 @@ def test_single_request_swa_builder_reuses_persistent_token_map() -> None:
     torch.testing.assert_close(builder._get_token_to_req_indices(common_slow), rebuilt)
 
 
-def test_single_request_swa_builder_recomputes_validity() -> None:
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_single_request_swa_builder_recomputes_validity(device, fused) -> None:
     """Validity tracks the live slot mapping, not the previous batch.
 
     A single request does not imply every slot is live: eviction and rejected
@@ -114,22 +117,23 @@ def test_single_request_swa_builder_recomputes_validity() -> None:
     )
 
     builder = object.__new__(DeepseekV4ROCMAiterSparseSWAMetadataBuilder)
+    builder._use_fused_swa_metadata = fused
     # Stale mask from a batch that had invalid slots.
-    builder.is_valid_token = torch.tensor([True, False, True, False])
+    builder.is_valid_token = torch.tensor([True, False, True, False], device=device)
     common = SimpleNamespace(num_reqs=1)
 
     # A fully live single-request decode batch must clear the stale entries.
-    live = torch.tensor([3, 4], dtype=torch.int64)
+    live = torch.tensor([3, 4], dtype=torch.int64, device=device)
     actual = builder._get_is_valid_token(common, live, 2, 0)
     assert actual.data_ptr() == builder.is_valid_token.data_ptr()
-    torch.testing.assert_close(actual, torch.ones(2, dtype=torch.bool))
+    torch.testing.assert_close(actual, torch.ones(2, dtype=torch.bool, device=device))
 
     # The reverse direction: a single request whose slots are PAD must be
     # reported invalid rather than inheriting the previous all-live mask.
-    padded = torch.tensor([7, 8, -1, -1], dtype=torch.int64)
+    padded = torch.tensor([7, 8, -1, -1], dtype=torch.int64, device=device)
     torch.testing.assert_close(
         builder._get_is_valid_token(common, padded, 4, 0),
-        torch.tensor([True, True, False, False]),
+        torch.tensor([True, True, False, False], device=device),
     )
 
 
@@ -149,7 +153,7 @@ def test_v41_single_request_fast_paths_ignore_max_num_seqs(monkeypatch) -> None:
     monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP", True)
     monkeypatch.setattr(envs, "VLLM_DEEPSEEK_V4_DIRECT_RAGGED_SWA", True)
 
-    def flags(max_num_seqs: int) -> tuple[bool, bool, bool]:
+    def flags(max_num_seqs: int, fused=False) -> tuple[bool, bool, bool]:
         spec = SlidingWindowMLASpec(
             block_size=32,
             num_kv_heads=1,
@@ -172,6 +176,7 @@ def test_v41_single_request_fast_paths_ignore_max_num_seqs(monkeypatch) -> None:
             ),
             speculative_config=None,
             attention_config=None,
+            additional_config={"dsv41_sm80_fused_swa_metadata": fused},
         )
         builder = DeepseekV4ROCMAiterSparseSWAMetadataBuilder(
             spec,
@@ -181,11 +186,13 @@ def test_v41_single_request_fast_paths_ignore_max_num_seqs(monkeypatch) -> None:
         )
         return (
             builder._persist_single_req_token_map,
-            builder._use_paged_decode_swa,
+            builder._use_direct_ragged_swa,
             builder._requires_decode_swa_lens_tail_clear(),
         )
 
     assert flags(1) == flags(8) == (True, True, False)
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        flags(8, fused="false")
     assert not hasattr(
         DeepseekV4ROCMAiterSparseSWAMetadataBuilder(
             SlidingWindowMLASpec(
@@ -210,6 +217,7 @@ def test_v41_single_request_fast_paths_ignore_max_num_seqs(monkeypatch) -> None:
                 ),
                 speculative_config=None,
                 attention_config=None,
+                additional_config={},
             ),
             torch.device("cpu"),
         ),
@@ -237,7 +245,8 @@ def test_v41_single_request_fast_paths_ignore_max_num_seqs(monkeypatch) -> None:
     assert actual.data_ptr() == rebuilt.data_ptr()
 
 
-def test_persistent_token_map_handles_real_batch_transitions() -> None:
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_persistent_token_map_handles_real_batch_transitions(device: str) -> None:
     """Every map builder must survive a real multi -> single -> multi sequence.
 
     Unlike the synthetic-stub checks above, this drives the genuine
@@ -260,19 +269,22 @@ def test_persistent_token_map_handles_real_batch_transitions() -> None:
         boundaries = [0]
         for length in query_lens:
             boundaries.append(boundaries[-1] + length)
-        qsl = torch.tensor(boundaries, dtype=torch.int32)
+        qsl_cpu = torch.tensor(boundaries, dtype=torch.int32)
+        qsl = qsl_cpu.to(device)
         return CommonAttentionMetadata(
             query_start_loc=qsl,
-            query_start_loc_cpu=qsl,
+            query_start_loc_cpu=qsl_cpu,
             seq_lens=torch.tensor(
-                [max(length, 1)] * len(query_lens), dtype=torch.int32
+                [max(length, 1)] * len(query_lens), dtype=torch.int32, device=device
             ),
             num_reqs=len(query_lens),
             num_actual_tokens=boundaries[-1],
             max_query_len=max(query_lens),
             max_seq_len=max(query_lens),
-            block_table_tensor=torch.zeros(len(query_lens), 2, dtype=torch.int32),
-            slot_mapping=torch.arange(boundaries[-1], dtype=torch.int64),
+            block_table_tensor=torch.zeros(
+                len(query_lens), 2, dtype=torch.int32, device=device
+            ),
+            slot_mapping=torch.arange(boundaries[-1], dtype=torch.int64, device=device),
         )
 
     builders = (
@@ -292,12 +304,14 @@ def test_persistent_token_map_handles_real_batch_transitions() -> None:
         for fast_path in (True, False):
             builder = object.__new__(builder_cls)
             builder._persist_single_req_token_map = fast_path
-            setattr(builder, buffer_name, torch.zeros(16, dtype=torch.int32))
+            setattr(
+                builder, buffer_name, torch.zeros(16, dtype=torch.int32, device=device)
+            )
             for want, query_lens in expected:
                 actual = builder._get_token_to_req_indices(common(query_lens))
                 torch.testing.assert_close(
                     actual,
-                    torch.tensor(want, dtype=torch.int32),
+                    torch.tensor(want, dtype=torch.int32, device=device),
                     msg=f"{builder_cls.__name__} fast_path={fast_path} "
                     f"query_lens={query_lens}",
                 )
@@ -305,7 +319,7 @@ def test_persistent_token_map_handles_real_batch_transitions() -> None:
         # The published pointer must stay the builder buffer's slice.
         builder = object.__new__(builder_cls)
         builder._persist_single_req_token_map = True
-        buffer = torch.zeros(16, dtype=torch.int32)
+        buffer = torch.zeros(16, dtype=torch.int32, device=device)
         setattr(builder, buffer_name, buffer)
         # Multi-request step: the general path publishes a slice of the same
         # buffer, so compare the storage and the values, not object identity.
@@ -314,7 +328,7 @@ def test_persistent_token_map_handles_real_batch_transitions() -> None:
         assert published.data_ptr() == buffer.data_ptr()
         torch.testing.assert_close(
             metadata._token_to_req_indices_cache,
-            torch.arange(8, dtype=torch.int32),
+            torch.arange(8, dtype=torch.int32, device=device),
         )
         assert published.shape == (8,)
         assert published.dtype == torch.int32
@@ -324,7 +338,9 @@ def test_persistent_token_map_handles_real_batch_transitions() -> None:
         published = builder._get_token_to_req_indices(metadata)
         assert published.data_ptr() == buffer.data_ptr()
         assert metadata._token_to_req_indices_cache is published
-        torch.testing.assert_close(published, torch.zeros(4, dtype=torch.int32))
+        torch.testing.assert_close(
+            published, torch.zeros(4, dtype=torch.int32, device=device)
+        )
 
 
 def test_single_request_v41_builders_reuse_persistent_token_map() -> None:
@@ -516,8 +532,12 @@ def test_glm_sparse_prefill_tuning_matches_default(monkeypatch) -> None:
 
 @torch.inference_mode()
 @pytest.mark.parametrize(
-    "num_queries,main_block_size,extra_block_size",
-    [(q, 256, 256) for q in (1, 2, 4, 8)] + [(6, 128, 64), (6, 128, 128)],
+    "num_queries,main_block_size,extra_block_size,extra_len,num_splits",
+    [(q, 256, 256, 64, 32) for q in (1, 2, 4, 8)]
+    + [(6, 128, 64, 512, 3), (6, 128, 128, 512, 3)]
+    + [(q, 128, 64, 512, 0) for q in (1, 2, 3, 5, 12, 48)]
+    + [(q, 128, 128, 0, 0) for q in (1, 5, 6)]
+    + [(49, 128, 128, 512, 3), (6, 128, 128, 512, 32)],
 )
 @pytest.mark.parametrize("caller_output", [False, True])
 def test_sparse_decode_split_and_caller_output_match(
@@ -525,6 +545,8 @@ def test_sparse_decode_split_and_caller_output_match(
     num_queries: int,
     main_block_size: int,
     extra_block_size: int,
+    extra_len: int,
+    num_splits: int,
     caller_output: bool,
 ) -> None:
     from vllm.models.deepseek_v4.common.ops import quantize_and_insert_k_cache
@@ -536,8 +558,7 @@ def test_sparse_decode_split_and_caller_output_match(
     from vllm.v1.worker import workspace
 
     num_heads, head_dim = 64, 512
-    main_len = 133 if num_queries == 6 else 128
-    extra_len = 512 if num_queries == 6 else 64
+    main_len = 133 if main_block_size == 128 else 128
     num_rows = 1024
     torch.manual_seed(23)
     q = torch.randn(
@@ -568,12 +589,8 @@ def test_sparse_decode_split_and_caller_output_match(
     extra_indices = torch.arange(
         num_queries * extra_len, dtype=torch.int32, device="cuda"
     ).remainder_(num_rows)
-    extra_indptr = torch.arange(
-        0,
-        (num_queries + 1) * extra_len,
-        extra_len,
-        dtype=torch.int32,
-        device="cuda",
+    extra_indptr = (
+        torch.arange(num_queries + 1, dtype=torch.int32, device="cuda") * extra_len
     )
     sink = torch.randn(num_heads, dtype=torch.float32, device="cuda")
     scale = head_dim**-0.5
@@ -588,17 +605,15 @@ def test_sparse_decode_split_and_caller_output_match(
         attn_sink=sink,
         nope_head_dim=448,
         rope_head_dim=64,
-        extra_cache=extra_cache,
-        extra_indices=extra_indices,
-        extra_indptr=extra_indptr,
+        extra_cache=extra_cache if extra_len else None,
+        extra_indices=extra_indices if extra_len else None,
+        extra_indptr=extra_indptr if extra_len else None,
     )
 
     manager = workspace.WorkspaceManager(torch.device("cuda"))
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_SPARSE_DECODE_SPLIT", "1")
-    monkeypatch.setenv(
-        "VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", "3" if num_queries == 6 else "32"
-    )
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_SM80_DECODE_NUM_SPLITS", str(num_splits))
     monkeypatch.setenv(
         "VLLM_DEEPSEEK_V4_SPARSE_DECODE_CALLER_OUTPUT", str(int(caller_output))
     )
@@ -616,13 +631,27 @@ def test_sparse_decode_split_and_caller_output_match(
     monkeypatch.setattr(
         sparse_mod, "_rocm_sparse_attn_decode_triton", capture_caller_output
     )
+    partial_launches = []
+    original_partial = sparse_mod._sparse_attn_decode_partial_kernel
+
+    class TrackedPartial:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                partial_launches.append(kwargs["num_warps"])
+                return original_partial[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(
+        sparse_mod, "_sparse_attn_decode_partial_kernel", TrackedPartial()
+    )
 
     def candidate() -> None:
         rocm_sparse_attn_decode(
             q=q,
             kv_cache=extra_cache,
             swa_k_cache=main_cache,
-            swa_only=False,
+            swa_only=extra_len == 0,
             topk_indices=None,
             topk_lens=extra_lens,
             swa_indices=swa_indices,
@@ -640,14 +669,15 @@ def test_sparse_decode_split_and_caller_output_match(
         )
 
     candidate()
+    promoted = main_block_size == 128 and num_queries <= 48 and num_splits <= 16
+    assert partial_launches[-1] == (8 if promoted else 4)
     torch.accelerator.synchronize()
     assert (caller_outputs[-1] is output) is caller_output
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(output).all()
-    if num_queries == 6:
+    if main_block_size == 128:
         # Compare the public output against the previous four-warp launch.
         tuned = output.clone()
-        original_partial = sparse_mod._sparse_attn_decode_partial_kernel
 
         class FourWarpPartial:
             def __getitem__(self, grid):
@@ -672,6 +702,18 @@ def test_sparse_decode_split_and_caller_output_match(
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+    if main_block_size == 128:
+        q.add_(0.125)
+        with monkeypatch.context() as reference_patch:
+            reference_patch.setattr(
+                sparse_mod, "_sparse_attn_decode_partial_kernel", FourWarpPartial()
+            )
+            candidate()
+        expected = output.clone()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 @torch.inference_mode()
@@ -819,6 +861,7 @@ def test_direct_swa_ragged_matches_dense_pack(non_causal: bool) -> None:
     for build_direct in (
         build_swa_ragged_indices_direct,
         build_v41_swa_ragged_indices_direct,
+        partial(build_v41_swa_ragged_indices_direct, use_fused=True),
     ):
         direct_lens = torch.full_like(reference_lens, -77)
         direct_indices_buffer = torch.full(
@@ -916,12 +959,90 @@ def test_direct_single_token_swa_ragged_matches_dense_pack(seq_len: int) -> None
         swa_lens=direct_lens,
         ragged_indices_buffer=direct_indices_buffer,
         ragged_indptr_buffer=direct_indptr_buffer,
+        use_fused=True,
     )
 
     torch.testing.assert_close(direct_lens, reference_lens)
     torch.testing.assert_close(direct_indptr, reference_indptr)
     nnz = int(reference_indptr[-1].item())
     torch.testing.assert_close(direct_indices[:nnz], reference_indices[:nnz])
+
+
+@pytest.mark.parametrize(
+    "num_tokens,index_width", [(6, 128), (12, 128), (48, 128), (49, 128), (6, 512)]
+)
+@pytest.mark.parametrize("non_causal", [False, True])
+@torch.inference_mode()
+def test_v41_fused_swa_ragged_graph_tracks_live_inputs(
+    num_tokens: int, index_width: int, non_causal: bool
+) -> None:
+    """Captured metadata must follow live lengths, PAD masks and block tables."""
+    from vllm.models.deepseek_v4.amd.rocm import (
+        build_swa_ragged_indices_direct as reference,
+    )
+    from vllm.models.deepseek_v4_1.amd.rocm import build_swa_ragged_indices_direct
+
+    num_reqs = max(1, num_tokens // 6)
+    qsl = torch.arange(num_reqs + 1, dtype=torch.int32, device="cuda") * 6
+    qsl[-1] = num_tokens
+    width = max(index_width, 256) if non_causal else index_width
+    seq_lens = torch.full((num_reqs,), 32768, dtype=torch.int32, device="cuda")
+    token_to_req = torch.arange(num_reqs, dtype=torch.int32, device="cuda")
+    token_to_req = token_to_req.repeat_interleave(qsl[1:] - qsl[:-1])
+    valid = torch.ones(num_tokens, dtype=torch.bool, device="cuda")
+    table = torch.arange(num_reqs * 1024, dtype=torch.int32, device="cuda")
+    table = table.reshape(num_reqs, -1)
+    common = dict(
+        num_decode_tokens=num_tokens,
+        window_size=128,
+        index_width=width,
+        non_causal=non_causal,
+        query_start_loc=qsl,
+        seq_lens=seq_lens,
+        token_to_req_indices=token_to_req,
+        is_valid_token=valid,
+        block_table=table,
+        block_size=64,
+    )
+
+    def buffers():
+        return dict(
+            swa_lens=torch.full((num_tokens,), -77, dtype=torch.int32, device="cuda"),
+            ragged_indices_buffer=torch.full(
+                (num_tokens * width + 8,), -77, dtype=torch.int32, device="cuda"
+            ),
+            ragged_indptr_buffer=torch.full(
+                (num_tokens + 1,), -77, dtype=torch.int32, device="cuda"
+            ),
+        )
+
+    output, expected = buffers(), buffers()
+    build = partial(build_swa_ragged_indices_direct, **common, **output, use_fused=True)
+    build()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indices, indptr = build()
+    assert indices.data_ptr() == output["ragged_indices_buffer"].data_ptr()
+    assert indptr.data_ptr() == output["ragged_indptr_buffer"].data_ptr()
+
+    for context_len, all_pad in ((0, False), (32768, True), (128, False)):
+        seq_lens.copy_(qsl[1:] - qsl[:-1] + context_len)
+        valid.fill_(not all_pad)
+        if not all_pad:
+            valid[::3] = False
+        table.add_(3)
+        reference(**common, **expected)
+        graph.replay()
+        torch.testing.assert_close(output["swa_lens"], expected["swa_lens"])
+        torch.testing.assert_close(indptr, expected["ragged_indptr_buffer"])
+        nnz = int(indptr[-1].item())
+        torch.testing.assert_close(
+            indices[:nnz], expected["ragged_indices_buffer"][:nnz]
+        )
+        torch.testing.assert_close(
+            output["ragged_indices_buffer"][-8:],
+            torch.full((8,), -77, dtype=torch.int32, device="cuda"),
+        )
 
 
 @torch.inference_mode()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Frozen M=1 GEMMs and M=6 W2 PRMT for DSV41F E384/top-k6 on SM80.
+"""Frozen M=1 and M=6 PRMT GEMMs for DSV41F E384/top-k6 on SM80.
 
 Imported only after the model/backend/device opt-in gate. No runtime search or
 benchmark dependencies; callers own all tensors and routing metadata.
@@ -105,9 +105,10 @@ def _build_decode_gemm(
     source_rows_are_slots: bool, *, tokens: int = 1, block_n: int = 64
 ):
     if (tokens, block_n) != (1, 64) and not (
-        source_rows_are_slots and (tokens, block_n) == (_TILELANG_W2_TOKENS, 128)
+        tokens == _TILELANG_W2_TOKENS
+        and block_n == (128 if source_rows_are_slots else 64)
     ):
-        raise ValueError("only M1/BN64 and M6 W2/BN128 are supported")
+        raise ValueError("only M1/BN64 and M6 W13/BN64 or W2/BN128 are supported")
     num_experts, topk = _DECODE_NUM_EXPERTS, _TARGET_TOPK
     slots = tokens * topk
     n, k = (
@@ -121,7 +122,7 @@ def _build_decode_gemm(
     block_k = 128
     threads = 128
     num_stages = 3 if source_rows_are_slots else 2
-    use_word_load = source_rows_are_slots and tokens == _TILELANG_W2_TOKENS
+    use_word_load = not source_rows_are_slots or tokens == _TILELANG_W2_TOKENS
     decode_source = _PRMT_DECODE_SOURCE
     if use_word_load:
         decode_source += _PACKED_WORD_LOAD_SOURCE
@@ -264,6 +265,16 @@ def compile_decode_gemms(device_index: int):
 
 
 @cache
+def compile_m6_w13(device_index: int):
+    """Compile the frozen q5 W13 variant before Graph capture."""
+    with torch.accelerator.device_index(device_index):
+        return tilelang.compile(
+            _build_decode_gemm(False, tokens=_TILELANG_W2_TOKENS, block_n=64),
+            pass_configs=PASS_CONFIGS,
+        )
+
+
+@cache
 def compile_m6_w2(device_index: int):
     """Compile the frozen q5 W2 variant once per worker, before Graph capture."""
     with torch.accelerator.device_index(device_index):
@@ -273,8 +284,7 @@ def compile_m6_w2(device_index: int):
         )
 
 
-def prepare_m6_w2(layer, w2_scale):
-    """Warm M6 W2 after prepare_decode_gemms validates the packed weights."""
+def _prepare_m6_gemm(layer, channel_scale, source_rows_are_slots: bool):
     device = layer.w2_weight.device
     slots = _TILELANG_W2_TOKENS * _TARGET_TOPK
     ids = torch.arange(slots, dtype=torch.int32, device=device).view(
@@ -283,22 +293,39 @@ def prepare_m6_w2(layer, w2_scale):
     sorted_ids, expert_ids, num_post_pad = moe_align_block_size(
         ids, _DECODE_BLOCK_M, _DECODE_NUM_EXPERTS
     )
-    kernel = compile_m6_w2(device.index)
-    a = torch.zeros((slots, _INTERMEDIATE_SIZE), dtype=torch.int8, device=device)
-    a_scale = torch.ones(slots, dtype=torch.float32, device=device)
-    output = torch.empty((slots, _HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    if source_rows_are_slots:
+        kernel = compile_m6_w2(device.index)
+        rows, k, n = slots, _INTERMEDIATE_SIZE, _HIDDEN_SIZE
+        weight, shift = layer.w2_weight, layer.w2_mxfp4_int8_shift2
+    else:
+        kernel = compile_m6_w13(device.index)
+        rows, k, n = _TILELANG_W2_TOKENS, _HIDDEN_SIZE, 2 * _INTERMEDIATE_SIZE
+        weight, shift = layer.w13_weight, layer.w13_mxfp4_int8_shift2
+    a = torch.zeros((rows, k), dtype=torch.int8, device=device)
+    a_scale = torch.ones(rows, dtype=torch.float32, device=device)
+    output = torch.empty((slots, n), dtype=torch.bfloat16, device=device)
     kernel(
         a,
         a_scale,
-        layer.w2_weight,
-        layer.w2_mxfp4_int8_shift2,
-        w2_scale,
+        weight,
+        shift,
+        channel_scale,
         sorted_ids,
         expert_ids,
         num_post_pad,
         output,
     )
     return kernel
+
+
+def prepare_m6_w13(layer, w13_scale):
+    """Warm M6 W13 after prepare_decode_gemms validates the packed weights."""
+    return _prepare_m6_gemm(layer, w13_scale, False)
+
+
+def prepare_m6_w2(layer, w2_scale):
+    """Warm M6 W2 after prepare_decode_gemms validates the packed weights."""
+    return _prepare_m6_gemm(layer, w2_scale, True)
 
 
 def prepare_decode_gemms(layer, w13_scale, w2_scale, sorted_ids, num_post_pad):

@@ -182,8 +182,9 @@ def probe_apply(
     sampled=False,
     baseline_runtime=False,
     baseline_runtime_kernel=None,
+    w13_kernel=None,
 ):
-    """Compare only W2; both arms use the live activation fusion."""
+    """Compare GEMMs while both arms use the live activation fusion."""
     device = weights["w13"]["packed"].device
     parallel = SimpleNamespace(
         tp_size=1, pcp_size=1, dp_size=1, ep_size=1, sp_size=1, use_ep=False
@@ -233,6 +234,9 @@ def probe_apply(
         candidate.process_weights_after_loading(layer)
     assert baseline._tilelang_activation_quant is not None
     assert candidate._tilelang_activation_quant is not None
+    if w13_kernel is not None:
+        baseline._tilelang_m6_w13 = None
+        candidate._tilelang_m6_w13 = None
     if baseline_runtime:
         if not runtime:
             raise ValueError("a live TileLang baseline requires a runtime candidate")
@@ -254,6 +258,7 @@ def probe_apply(
         [[0.07, 0.11, 0.13, 0.17, 0.23, 0.29]], device=device
     ).repeat(6, 1)
     registered = set()
+    registered_w13 = set()
     dispatch_calls = {"baseline_w2": 0, "candidate_w2": 0}
     original = torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm
     if baseline_runtime:
@@ -274,6 +279,14 @@ def probe_apply(
         candidate._tilelang_m6_w2 = runtime_call
 
     def dispatch(*args):
+        if (
+            w13_kernel is not None
+            and not args[-1]
+            and args[5].data_ptr() in registered_w13
+        ):
+            dispatch_calls["candidate_w13"] = dispatch_calls.get("candidate_w13", 0) + 1
+            w13_kernel(*args[:5], *args[8:11], args[5])
+            return None
         if args[-1]:
             if not runtime and args[6].data_ptr() in registered:
                 dispatch_calls["candidate_w2"] += 1
@@ -286,6 +299,7 @@ def probe_apply(
     with patch.object(torch.ops._moe_C, "dsv4_mxfp4_int8_sm80_moe_gemm", dispatch):
         for pattern, period in (("hot", 1), ("spread", 1), ("rotating", 40)):
             registered.clear()
+            registered_w13.clear()
             dispatch_calls = {"baseline_w2": 0, "candidate_w2": 0}
             pairs = []
             for i in range(period):
@@ -301,16 +315,20 @@ def probe_apply(
                 a = make_apply_case(baseline, layer, hidden, routing_weights, ids)
                 b = make_apply_case(candidate, layer, hidden, routing_weights, ids)
                 registered.add(b[2].data_ptr())
+                registered_w13.add(b[1].data_ptr())
                 pairs.append((a, b))
             for a, b in pairs:
                 a[0]()
                 b[0]()
                 require_exact(a[1], b[1])
                 require_exact(a[2], b[2])
-            assert dispatch_calls == {
+            expected_calls = {
                 "baseline_w2": period,
                 "candidate_w2": period,
-            }, dispatch_calls
+            }
+            if w13_kernel is not None:
+                expected_calls["candidate_w13"] = period
+            assert dispatch_calls == expected_calls, dispatch_calls
             mutations = 0
             if period == 1:
                 saved_hidden, saved_ids = hidden.clone(), pairs[0][0][3].clone()
@@ -371,7 +389,11 @@ def probe_apply(
                 runtime_candidate=runtime,
                 runtime_baseline=baseline_runtime,
                 actual_weight_sample=sampled,
-                scope="Experts.apply; same live activation; only W2 differs",
+                scope=(
+                    "Experts.apply; same live activation; W13 override"
+                    if w13_kernel is not None
+                    else "Experts.apply; same live activation; only W2 differs"
+                ),
                 **result,
             )
             results.append(row)

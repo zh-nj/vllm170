@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms import current_platform
@@ -164,6 +165,11 @@ class DeepseekV4SparseMLAMetadataBuilder(
         self.req_id_per_token_buffer = torch.empty(
             (max_num_batched_tokens,), dtype=torch.int32, device=device
         )
+        self._persist_single_req_token_map = (
+            envs.VLLM_DEEPSEEK_V4_PERSIST_SINGLE_REQ_TOKEN_MAP
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(80, device.index or 0)
+        )
 
         assert isinstance(self.kv_cache_spec.tokens_per_state, int)
         self.compress_ratio = self.kv_cache_spec.tokens_per_state
@@ -182,6 +188,18 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 max_num_batched_tokens, dtype=torch.int64, device=device
             )
 
+    def _get_token_to_req_indices(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        if self._persist_single_req_token_map and common_attn_metadata.num_reqs == 1:
+            indices = self.req_id_per_token_buffer[
+                : common_attn_metadata.num_actual_tokens
+            ]
+            indices.zero_()
+            common_attn_metadata._token_to_req_indices_cache = indices
+            return indices
+        return common_attn_metadata.token_to_req_indices(self.req_id_per_token_buffer)
+
     def build(
         self,
         common_prefix_len: int,
@@ -189,7 +207,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
         fast_build: bool = False,
     ) -> DeepseekV4FlashMLAMetadata:
         cm = common_attn_metadata
-        req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
+        req_id_per_token = self._get_token_to_req_indices(cm)
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:

@@ -3661,11 +3661,20 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_warps = (
             8
             if use_sm80_split
-            and num_queries == 6
+            and 1 <= num_queries <= 48
             and num_heads == 64
-            and num_splits == 3
-            and has_extra
-            and extra_indices.numel() == num_queries * 512
+            and num_splits <= 16
+            and (
+                (has_extra and extra_indices.numel() == num_queries * 512)
+                or (
+                    not has_extra
+                    and (
+                        main_window_size <= 133
+                        if use_paged_main
+                        else main_indices.numel() <= num_queries * 133
+                    )
+                )
+            )
             else 4
         )
         _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](

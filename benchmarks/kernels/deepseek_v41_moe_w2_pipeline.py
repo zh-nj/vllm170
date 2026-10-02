@@ -8,6 +8,7 @@ import inspect
 import json
 import statistics
 import time
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -23,7 +24,9 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 )
 
 
-def compile_variant(stages, threads, destination, *, word_load=False):
+def compile_variant(
+    stages, threads, destination, *, word_load=False, source_rows_are_slots=True
+):
     source = inspect.getsource(runtime._build_decode_gemm)
     source = source.replace("    threads = 128\n", f"    threads = {threads}\n")
     source = source.replace(
@@ -33,11 +36,14 @@ def compile_variant(stages, threads, destination, *, word_load=False):
     suffix = "-word" if word_load else ""
     has_word_switch = "    use_word_load = " in source
     if has_word_switch:
-        source = source.replace(
-            "    use_word_load = source_rows_are_slots "
-            "and tokens == _TILELANG_W2_TOKENS\n",
-            f"    use_word_load = {word_load}\n",
-        )
+        assignments = [
+            line
+            for line in source.splitlines(keepends=True)
+            if line.startswith("    use_word_load = ")
+        ]
+        if len(assignments) != 1:
+            raise ValueError("expected one packed-word load assignment")
+        source = source.replace(assignments[0], f"    use_word_load = {word_load}\n")
     elif word_load:
         begin = source.index("                        word = (\n")
         end = source.index("                        decoded =", begin)
@@ -49,7 +55,8 @@ def compile_variant(stages, threads, destination, *, word_load=False):
             + "                        )\n"
             + source[end:]
         )
-    path = destination / f"template-s{stages}-t{threads}{suffix}.py"
+    prefix = "" if source_rows_are_slots else "w13-"
+    path = destination / f"{prefix}template-s{stages}-t{threads}{suffix}.py"
     path.write_text(source)
     namespace = dict(vars(runtime))
     if word_load and not has_word_switch:
@@ -61,11 +68,17 @@ __device__ __forceinline__ uint32_t dsv41_load_u32(const uint8_t* data) {
     exec(compile(source, str(path.resolve()), "exec"), namespace)
     start = time.perf_counter()
     kernel = runtime.tilelang.compile(
-        namespace["_build_decode_gemm"](True, tokens=6, block_n=128),
+        namespace["_build_decode_gemm"](
+            source_rows_are_slots,
+            tokens=6,
+            block_n=128 if source_rows_are_slots else 64,
+        ),
         pass_configs=runtime.PASS_CONFIGS,
     )
     generated = kernel.get_kernel_source()
-    (destination / f"kernel-s{stages}-t{threads}{suffix}.cu").write_text(generated)
+    (destination / f"{prefix}kernel-s{stages}-t{threads}{suffix}.cu").write_text(
+        generated
+    )
     return kernel, dict(
         compile_s=time.perf_counter() - start,
         template_sha256=hashlib.sha256(source.encode()).hexdigest(),
@@ -131,11 +144,17 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--word-only", action="store_true")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--w13", action="store_true")
     args = parser.parse_args()
     dest = args.output_dir
     dest.mkdir(parents=True, exist_ok=True)
     if args.apply and not args.word_only:
         parser.error("--apply requires --word-only")
+    if args.w13:
+        if not args.word_only:
+            parser.error("--w13 requires --word-only")
+        probe_w13(args)
+        return
     all_weights = load_sampled_weights(
         args.model,
         torch.device("cuda"),
@@ -236,6 +255,113 @@ def main():
         cupti_python_available=False,
     )
     (dest / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def probe_w13(args):
+    """Compare M6 W13 BN64 scalar/word against the current CUTLASS stage."""
+    dest = args.output_dir
+    weights = load_sampled_weights(
+        args.model,
+        torch.device("cuda"),
+        dest,
+        stages=("w13", "w2") if args.apply else ("w13",),
+    )
+    w = weights["w13"]
+    kernels, compilation = {}, {}
+    for word in (False, True):
+        name = "word" if word else "scalar"
+        kernels[name], compilation[name] = compile_variant(
+            2, 128, dest, word_load=word, source_rows_are_slots=False
+        )
+    torch.manual_seed(20261002)
+    a = torch.randint(-127, 128, (6, 5120), device="cuda", dtype=torch.int8)
+    scale = torch.linspace(0.0007, 0.013, 6, device="cuda")
+    out = torch.empty(36, 4608, device="cuda", dtype=torch.bfloat16)
+    routing = torch.ones(6, 6, device="cuda")
+    rows = []
+    patterns = {
+        "hot": torch.arange(6).repeat(6, 1),
+        "mid": torch.arange(6)[None, :] + torch.arange(6)[:, None] * 3,
+        "spread": torch.arange(36).view(6, 6),
+    }
+    for pattern, raw_ids in patterns.items():
+        ids = raw_ids.to(device="cuda", dtype=torch.int32) + 137
+        metadata = moe_align_block_size(ids, 16, 384)
+        calls = dict(
+            cutlass=partial(
+                torch.ops._moe_C.dsv4_mxfp4_int8_sm80_moe_gemm,
+                a,
+                scale,
+                w["packed"],
+                w["shift2"],
+                w["channel_scale"],
+                out,
+                out,
+                routing,
+                *metadata,
+                36,
+                16,
+                128,
+                False,
+            )
+        )
+        calls.update(
+            {
+                name: partial(
+                    kernel,
+                    a,
+                    scale,
+                    w["packed"],
+                    w["shift2"],
+                    w["channel_scale"],
+                    *metadata,
+                    out,
+                )
+                for name, kernel in kernels.items()
+            }
+        )
+        calls["cutlass"]()
+        expected = out.clone()
+        graphs = {}
+        for name, call in calls.items():
+            call()
+            require_exact(out, expected)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call()
+            out.fill_(float("nan"))
+            graph.replay()
+            require_exact(out, expected)
+            graphs[name] = graph
+        timing = time_graphs(graphs, args.samples)
+        rows.append(dict(pattern=pattern, exact=True, timing=timing))
+        (dest / "results.json").write_text(json.dumps(rows, indent=2) + "\n")
+        print(pattern, {k: v["median_us"] for k, v in timing.items()}, flush=True)
+    (dest / "metadata.json").write_text(
+        json.dumps(
+            dict(
+                scope="M6 W13 BN64; checkpoint layer20; synthetic INT8/routes; cold L2",
+                compilation=compilation,
+                gpu=str(torch.cuda.get_device_properties(0)),
+                source_sha256=hashlib.sha256(
+                    Path(runtime.__file__).read_bytes()
+                ).hexdigest(),
+                timing="CUDA Events; 3 alternating rounds; 500ms settle; 64MiB flush",
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
+    if args.apply:
+        probe_apply(
+            weights,
+            runtime.compile_m6_w2(0),
+            dest,
+            runtime=True,
+            sampled=True,
+            baseline_runtime=True,
+            w13_kernel=kernels["word"],
+        )
 
 
 if __name__ == "__main__":
