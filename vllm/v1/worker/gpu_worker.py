@@ -158,16 +158,33 @@ class AsyncIntermediateTensors(IntermediateTensors):
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
         comm_complete_callback: Callable[[], None] | None = None,
+        comm_start_callback: Callable[
+            [],
+            tuple[
+                dict[str, Any] | None,
+                list[Handle],
+                list[Callable[[], None]],
+            ],
+        ]
+        | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_complete_callback = comm_complete_callback
+        self._comm_start_callback = comm_start_callback
         self._comm_waited = False
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
+        if self._comm_start_callback is not None:
+            tensors, self._comm_handles, self._comm_postprocess = (
+                self._comm_start_callback()
+            )
+            assert tensors is not None
+            self.tensors = tensors
+            self._comm_start_callback = None
         if self._comm_handles:
             for handle in self._comm_handles:
                 handle.wait()
@@ -513,6 +530,10 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
+        self._defer_pp_recv = _dsv41_sm80_target_prepare_ahead(
+            self.vllm_config, self.use_v2_model_runner, self.device
+        )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -1212,20 +1233,27 @@ class Worker(WorkerBase):
                     recv_generation,
                 )
 
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
-                    recv_buffers=recv_buffers,
+            receive = partial(
+                get_pp_group().irecv_tensor_dict,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+                recv_buffers=recv_buffers,
+            )
+            if self._defer_pp_recv:
+                intermediate_tensors = AsyncIntermediateTensors(
+                    {},
+                    comm_complete_callback=comm_complete_callback,
+                    comm_start_callback=receive,
                 )
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-                comm_complete_callback=comm_complete_callback,
-            )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = receive()
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                    comm_complete_callback=comm_complete_callback,
+                )
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -1529,6 +1557,41 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
+
+
+def _dsv41_sm80_target_prepare_ahead(
+    vllm_config: VllmConfig, use_v2_model_runner: bool, device: torch.device
+) -> bool:
+    """Opt in to preparing DSV41F inputs before receiving the PP header."""
+    extra = vllm_config.additional_config
+    enabled = (
+        extra.get("dsv41_sm80_target_prepare_ahead", False)
+        if isinstance(extra, dict)
+        else False
+    )
+    if not isinstance(enabled, bool):
+        raise ValueError("dsv41_sm80_target_prepare_ahead must be a JSON boolean")
+    hf = vllm_config.model_config.hf_config
+    parallel = vllm_config.parallel_config
+    speculative = vllm_config.speculative_config
+    return bool(
+        enabled
+        and use_v2_model_runner
+        and current_platform.is_cuda()
+        and device.type == "cuda"
+        and current_platform.is_device_capability(80, device.index or 0)
+        and getattr(hf, "model_type", None) == "deepseek_v41"
+        and getattr(hf, "hidden_size", None) == 5120
+        and getattr(hf, "n_routed_experts", None) == 384
+        and getattr(hf, "num_hidden_layers", None) == 40
+        and parallel.pipeline_parallel_size == 5
+        and parallel.tensor_parallel_size == 1
+        and parallel.data_parallel_size == 1
+        and speculative is not None
+        and speculative.method == "dspark"
+        and speculative.num_speculative_tokens == 5
+        and not speculative.enable_adaptive_verification
+    )
 
 
 def _strict_bf16_gemm(vllm_config: VllmConfig) -> bool:
