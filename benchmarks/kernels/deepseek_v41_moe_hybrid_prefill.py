@@ -11,6 +11,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.experts.dsv41_sm80_hybrid_prefill import (
     HybridRoutes,
+    SmallTailRoutes,
 )
 
 
@@ -48,7 +49,7 @@ def check_partition(ids, aligned, hybrid):
     seen = []
     total = 0
     for b, (sorted_ids, expert_ids, count) in zip(
-        (128, 64), hybrid.metadata(), strict=True
+        getattr(hybrid, "block_sizes", (128, 64)), hybrid.metadata(), strict=True
     ):
         n = int(count.item())
         total += n
@@ -59,7 +60,10 @@ def check_partition(ids, aligned, hybrid):
             assert bool((flat[valid] == expert).all())
             seen.extend(valid.tolist())
     assert sorted(seen) == list(range(flat.numel()))
-    assert total == int(aligned[2].item())
+    expected = int(aligned[2].item())
+    if isinstance(hybrid, SmallTailRoutes):
+        expected -= int(hybrid.counts[2].item()) // 16 * 48
+    assert total == expected
 
 
 def gemm(a, scales, weights, route_weights, output, metadata, b, stage):
@@ -81,14 +85,30 @@ def gemm(a, scales, weights, route_weights, output, metadata, b, stage):
 
 
 def make_calls(
-    a, scales, weights, rw, baseline_out, candidate_out, aligned, hybrid, stage
+    a,
+    scales,
+    weights,
+    rw,
+    baseline_out,
+    candidate_out,
+    aligned,
+    hybrid,
+    stage,
+    baseline_hybrid=None,
 ):
     def baseline():
-        gemm(a, scales, weights, rw, baseline_out, aligned, 64, stage)
+        if baseline_hybrid is None:
+            gemm(a, scales, weights, rw, baseline_out, aligned, 64, stage)
+        else:
+            baseline_hybrid.update(aligned)
+            for b, meta in zip((128, 64), baseline_hybrid.metadata(), strict=True):
+                gemm(a, scales, weights, rw, baseline_out, meta, b, stage)
 
     def candidate():
         hybrid.update(aligned)
-        for b, meta in zip((128, 64), hybrid.metadata(), strict=True):
+        for b, meta in zip(
+            getattr(hybrid, "block_sizes", (128, 64)), hybrid.metadata(), strict=True
+        ):
             gemm(a, scales, weights, rw, candidate_out, meta, b, stage)
 
     return baseline, candidate
@@ -121,13 +141,33 @@ def main():
         type=Path,
         default=Path("artifacts/dsv41f-ced-prefill-round2-20261002"),
     )
+    parser.add_argument(
+        "--small-tail", action="store_true", help="Compare BM16 tails to current hybrid"
+    )
+    parser.add_argument(
+        "--round5",
+        type=Path,
+        default=Path("artifacts/dsv41f-ced-prefill-round5-20261003"),
+    )
+    parser.add_argument("--layers", nargs="+", type=int, default=[0, 14])
+    parser.add_argument("--expected-uuid", required=True)
     args = parser.parse_args()
     device = torch.device("cuda")
     assert torch.cuda.get_device_capability() == (8, 0)
+    assert str(
+        torch.cuda.get_device_properties(0).uuid
+    ) == args.expected_uuid.removeprefix("GPU-")
     info = environment()
     # The shared harness uses NVML index 0, which is not the visible CMP GPU.
     info.pop("clock_and_power", None)
-    result = {"environment": info, "correctness": [], "timing": []}
+    result = {
+        "environment": info,
+        "variant": "small_tail" if args.small_tail else "hybrid",
+        "timing_boundary": "route repartition/copies plus one W13 or W2 GEMM stage",
+        "correctness": [],
+        "timing": [],
+    }
+    route_class = SmallTailRoutes if args.small_tail else HybridRoutes
     torch.manual_seed(41)
 
     def save():
@@ -135,7 +175,7 @@ def main():
 
     for stage, (n, k, slots_source) in STAGE_SHAPES.items():
         weights = build_packed_weights(8, stage, device, seed=41, scale_mode="varied")
-        for tokens in (1, 63, 64, 65, 127, 128, 129):
+        for tokens in (1, 16, 17, 63, 64, 65, 127, 128, 129):
             ids = (
                 torch.arange(6, dtype=torch.int32, device=device)
                 .expand(tokens, -1)
@@ -143,7 +183,7 @@ def main():
             )
             # Odd/even route blocks, zero large-list, zero small-list, and both.
             aligned = align_routes(ids, 64, 8)
-            hybrid = HybridRoutes(ids.numel(), 8, device)
+            hybrid = route_class(ids.numel(), 8, device)
             hybrid.update(aligned)
             check_partition(ids, aligned, hybrid)
             rows = tokens * 6 if slots_source else tokens
@@ -165,7 +205,11 @@ def main():
                 routing_ids=ids,
                 stage=stage,
             )
-            for b, metadata in zip((128, 64), hybrid.metadata(), strict=True):
+            for b, metadata in zip(
+                getattr(hybrid, "block_sizes", (128, 64)),
+                hybrid.metadata(),
+                strict=True,
+            ):
                 gemm(a, scales, weights, rw, routed, metadata, b, stage)
             assert torch.equal(routed.view(torch.int16), reference.view(torch.int16))
             assert bool((output[tokens * 6 :] == -123).all())
@@ -184,23 +228,59 @@ def main():
                 (args.round2 / "candidate-validation.json").read_text()
             )["corpus_routes"],
         }
+        if args.small_tail:
+            profiles = {
+                "corpus": next(
+                    p
+                    for p in json.loads((args.round5 / "experiment.json").read_text())[
+                        "profiles"
+                    ]
+                    if p["mode"] == "hybrid"
+                ),
+                "hot": {
+                    "ranks": [
+                        {
+                            "routes": [
+                                {
+                                    "layer": 0,
+                                    "ids": [list(range(6))] * 2044,
+                                    "weights": [[1 / 6] * 6] * 2044,
+                                    "counts": [2044] * 6 + [0] * 378,
+                                    "active_experts": 6,
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
         for workload, profile in profiles.items():
-            for layer in (0, 14):
+            for layer in [0] if workload == "hot" else args.layers:
                 route = next(
                     r
                     for rank in profile["ranks"]
                     for r in rank["routes"]
                     if r["layer"] == layer
                 )
-                ids = histogram_routes(route["counts"]).to(device)
+                ids = (
+                    torch.tensor(route["ids"], dtype=torch.int32, device=device)
+                    if args.small_tail
+                    else histogram_routes(route["counts"]).to(device)
+                )
+                assert ids.shape == ((2044 if args.small_tail else 2048), 6)
+                assert (
+                    torch.bincount(ids.flatten().long(), minlength=384).cpu().tolist()
+                    == route["counts"]
+                )
                 aligned = align_routes(ids, 64, 384)
-                hybrid = HybridRoutes(ids.numel(), 384, device)
+                hybrid = route_class(ids.numel(), 384, device)
                 hybrid.update(aligned)
                 check_partition(ids, aligned, hybrid)
                 rows = ids.numel() if slots_source else ids.shape[0]
                 a = torch.randint(-127, 128, (rows, k), dtype=torch.int8, device=device)
                 scales = activation_scales(rows, device, "varied")
                 rw = torch.full(ids.shape, 1 / 6, dtype=torch.float32, device=device)
+                if args.small_tail:
+                    rw.copy_(torch.tensor(route["weights"], device=device))
                 baseline_out = torch.empty(
                     (ids.numel(), n), dtype=torch.bfloat16, device=device
                 )
@@ -216,6 +296,7 @@ def main():
                     aligned,
                     hybrid,
                     stage,
+                    HybridRoutes(ids.numel(), 384, device) if args.small_tail else None,
                 )
                 baseline()
                 candidate()
@@ -241,7 +322,10 @@ def main():
                         "layer": layer,
                         "active_experts": route["active_experts"],
                         "routing_scope": (
-                            "Captured histogram; synthetic row order, "
+                            "DSpark5 M2044 captured corpus routes/weights or synthetic "
+                            "six-hot-expert routes; synthetic activations/weights."
+                            if args.small_tail
+                            else "Captured histogram; synthetic row order, "
                             "activations and weights."
                         ),
                         "counts": hybrid.counts.cpu().tolist(),

@@ -178,7 +178,7 @@ def dsv41_sm80_hybrid_prefill_enabled(
         extra.get("ced_prefill") is True
         and not extra.get("dsv41_fast_prefill", False)
         and config.use_v2_model_runner
-        and config.speculative_config is None
+        and _hybrid_prefill_num_tokens(config) is not None
         and config.lora_config is None
         and parallel.pipeline_parallel_size == 5
         and parallel.tensor_parallel_size == parallel.data_parallel_size == 1
@@ -198,6 +198,24 @@ def dsv41_sm80_hybrid_prefill_enabled(
         and not moe.is_lora_enabled
         and Mxfp4Int8Sm80Experts._supports_parallel_config(moe.moe_parallel_config)
     )
+
+
+def _hybrid_prefill_num_tokens(config: "VllmConfig") -> int | None:
+    spec = config.speculative_config
+    if spec is None:
+        return 2048
+    if (
+        spec.method == "dspark"
+        and getattr(spec, "num_speculative_tokens", None) == 5
+        and getattr(spec, "dspark_num_query_tokens", None) in (None, 5)
+        and getattr(spec, "dspark_pipeline_stage_ranks", None) == [1, 2, 3]
+        and getattr(spec, "draft_sample_method", None) == "greedy"
+        and not getattr(spec, "enable_adaptive_verification", True)
+        and getattr(spec, "num_speculative_tokens_per_batch_size", None) is None
+        and getattr(spec, "max_num_new_slots_for_drafting", None) == 4
+    ):
+        return 2044
+    return None
 
 
 def _is_pure_eager_prefill() -> bool:
@@ -263,8 +281,26 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
         self._tilelang_requested = dsv41_sm80_tilelang_enabled(
             get_current_vllm_config_or_none(), moe_config
         )
+        config = get_current_vllm_config_or_none()
         self._hybrid_prefill_requested = dsv41_sm80_hybrid_prefill_enabled(
-            get_current_vllm_config_or_none(), moe_config
+            config, moe_config
+        )
+        self._hybrid_prefill_num_tokens = 0
+        if self._hybrid_prefill_requested:
+            assert config is not None
+            num_tokens = _hybrid_prefill_num_tokens(config)
+            assert num_tokens is not None
+            self._hybrid_prefill_num_tokens = num_tokens
+        extra = config.additional_config if config is not None else {}
+        small_tail = (
+            extra.get("dsv41_sm80_moe_small_tail_prefill", False)
+            if isinstance(extra, dict)
+            else False
+        )
+        if not isinstance(small_tail, bool):
+            raise ValueError("dsv41_sm80_moe_small_tail_prefill must be a JSON boolean")
+        self._small_tail_prefill_requested = (
+            small_tail and self._hybrid_prefill_num_tokens == 2044
         )
         self._hybrid_prefill_routes: HybridRoutes | None = None
         self._tilelang_decode_gemms = None
@@ -345,14 +381,21 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                     dsv41_sm80_hybrid_prefill,
                 )
 
-                self._hybrid_prefill_routes = dsv41_sm80_hybrid_prefill.HybridRoutes(
-                    2048 * _TARGET_TOPK, _DECODE_NUM_EXPERTS, self.w13_shift2.device
+                route_class = (
+                    dsv41_sm80_hybrid_prefill.SmallTailRoutes
+                    if self._small_tail_prefill_requested
+                    else dsv41_sm80_hybrid_prefill.HybridRoutes
+                )
+                self._hybrid_prefill_routes = route_class(
+                    self._hybrid_prefill_num_tokens * _TARGET_TOPK,
+                    _DECODE_NUM_EXPERTS,
+                    self.w13_shift2.device,
                 )
                 warmup_ids = (
                     torch.arange(
                         _TARGET_TOPK, dtype=torch.int32, device=self.w13_shift2.device
                     )
-                    .expand(2048, -1)
+                    .expand(self._hybrid_prefill_num_tokens, -1)
                     .contiguous()
                 )
                 self._hybrid_prefill_routes.update(
@@ -360,8 +403,11 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                 )
                 logger.info_once(
                     "DSV41F SM80 CED hybrid BM128 pairs/BM64 tails enabled "
-                    "for pure eager M=2048 prefill, PP5, E=384, top-k6."
+                    "for pure eager M=%d prefill, PP5, E=384, top-k6.",
+                    self._hybrid_prefill_num_tokens,
                 )
+                if self._small_tail_prefill_requested:
+                    logger.info_once("DSV41F SM80 prefill BM16 small tails enabled.")
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -518,7 +564,7 @@ class Mxfp4Int8Sm80Experts(mk.FusedMoEExpertsModular):
                 )
                 use_hybrid_prefill = (
                     self._hybrid_prefill_routes is not None
-                    and m == 2048
+                    and m == self._hybrid_prefill_num_tokens
                     and topk == _TARGET_TOPK
                     and num_experts == global_num_experts == _DECODE_NUM_EXPERTS
                     and (block_m, block_n) == (64, 128)

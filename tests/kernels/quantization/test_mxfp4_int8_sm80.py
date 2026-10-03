@@ -990,10 +990,14 @@ def moe_harness():
 
 
 @_NEEDS_SM80
-def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(moe_harness):
+@pytest.mark.parametrize("small_tail", [False, True])
+def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(
+    moe_harness, small_tail
+):
     """Pairing must neither drop slots nor retain a stale tail after graph replay."""
     from benchmarks.kernels.deepseek_v41_moe_hybrid_prefill import (
         HybridRoutes,
+        SmallTailRoutes,
         check_partition,
     )
 
@@ -1001,7 +1005,8 @@ def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(moe_harness)
     hot = torch.arange(6, dtype=torch.int32, device="cuda").expand(129, -1).contiguous()
     spread = helper.make_routing_ids(129, 6, 8, "uniform", 41, device="cuda")
     aligned = moe_align_block_size(hot, 64, 8)
-    hybrid = HybridRoutes(hot.numel(), 8, hot.device)
+    route_class = SmallTailRoutes if small_tail else HybridRoutes
+    hybrid = route_class(hot.numel(), 8, hot.device)
     hybrid.update(aligned)
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -1015,8 +1020,11 @@ def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(moe_harness)
         graph.replay()
         check_partition(ids, aligned, hybrid)
         counts.append(hybrid.counts.cpu().tolist())
-    assert counts[0] == counts[2] == [6 * 128, 6 * 64]
+    expected = [6 * 128, 0, 6 * 16] if small_tail else [6 * 128, 6 * 64]
+    assert counts[0] == counts[2] == expected
     assert counts[1][1] == 0
+    if small_tail:
+        assert counts[1][2] == 0
 
 
 @pytest.mark.parametrize(
@@ -1590,7 +1598,7 @@ def _tilelang_gate_inputs(*, model_type="deepseek_v41", switch=False):
     return config, moe
 
 
-def _hybrid_prefill_gate_inputs():
+def _hybrid_prefill_gate_inputs(dspark=False):
     config, moe = _tilelang_gate_inputs()
     config.additional_config.update(
         ced_prefill=True, dsv41_sm80_moe_hybrid_prefill=True
@@ -1606,13 +1614,44 @@ def _hybrid_prefill_gate_inputs():
     )
     config.use_v2_model_runner = True
     config.speculative_config = config.lora_config = None
+    if dspark:
+        config.speculative_config = SimpleNamespace(
+            method="dspark",
+            num_speculative_tokens=5,
+            dspark_num_query_tokens=5,
+            dspark_pipeline_stage_ranks=[1, 2, 3],
+            draft_sample_method="greedy",
+            enable_adaptive_verification=False,
+            num_speculative_tokens_per_batch_size=None,
+            max_num_new_slots_for_drafting=4,
+        )
     return config, moe
 
 
-def test_hybrid_prefill_gate_defaults_off_and_enables_validated_config():
-    config, moe = _hybrid_prefill_gate_inputs()
+@pytest.mark.parametrize("dspark", [False, True])
+def test_hybrid_prefill_gate_defaults_off_and_enables_validated_config(dspark):
+    config, moe = _hybrid_prefill_gate_inputs(dspark)
     assert dsv41_sm80_hybrid_prefill_enabled(config, moe)
     del config.additional_config["dsv41_sm80_moe_hybrid_prefill"]
+    assert not dsv41_sm80_hybrid_prefill_enabled(config, moe)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("method", "dflash"),
+        ("num_speculative_tokens", 4),
+        ("dspark_num_query_tokens", 10),
+        ("dspark_pipeline_stage_ranks", [0, 1, 2]),
+        ("draft_sample_method", "probabilistic"),
+        ("enable_adaptive_verification", True),
+        ("num_speculative_tokens_per_batch_size", {1: 5}),
+        ("max_num_new_slots_for_drafting", 9),
+    ],
+)
+def test_hybrid_prefill_gate_preserves_unvalidated_drafting(name, value):
+    config, moe = _hybrid_prefill_gate_inputs(dspark=True)
+    setattr(config.speculative_config, name, value)
     assert not dsv41_sm80_hybrid_prefill_enabled(config, moe)
 
 
@@ -1683,15 +1722,21 @@ def test_hybrid_prefill_batch_gate_preserves_decode_mixed_and_graphs(monkeypatch
 
 
 @_NEEDS_SM80
+@pytest.mark.parametrize(
+    "dspark,small_tail", [(False, False), (True, False), (True, True)]
+)
 def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_routes(
-    tilelang_offline_modules, monkeypatch
+    tilelang_offline_modules, monkeypatch, dspark, small_tail
 ):
     """Exercise both GEMMs, activation and reduction through the production gate."""
     from vllm.config.compilation import CUDAGraphMode
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm.model_executor.layers.fused_moe.experts import mxfp4_int8_sm80 as impl
 
-    config, moe = _hybrid_prefill_gate_inputs()
+    config, moe = _hybrid_prefill_gate_inputs(dspark)
+    config.additional_config["dsv41_sm80_moe_small_tail_prefill"] = small_tail
+    tokens = 2044 if dspark else 2048
+    num_slots = tokens * 6
     for key in (
         "swiglu_limit",
         "swiglu_alpha",
@@ -1719,6 +1764,10 @@ def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_route
     candidate = Mxfp4Int8Sm80Experts(moe, quant)
     candidate.process_weights_after_loading(layer)
     assert candidate._hybrid_prefill_routes is not None
+    assert candidate._hybrid_prefill_routes.slots == num_slots
+    assert candidate._hybrid_prefill_routes.block_sizes == (
+        (128, 64, 16) if small_tail else (128, 64)
+    )
     config.additional_config["dsv41_sm80_moe_hybrid_prefill"] = False
     baseline = Mxfp4Int8Sm80Experts(moe, quant)
     baseline.process_weights_after_loading(layer)
@@ -1730,14 +1779,14 @@ def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_route
     )
     monkeypatch.setattr(impl, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(impl, "get_forward_context", lambda: context)
-    hidden = torch.randn((2048, 5120), device=device, dtype=torch.bfloat16)
-    ids = torch.arange(6, device=device).expand(2048, -1).contiguous()
-    rw = torch.full((2048, 6), 1 / 6, device=device)
+    hidden = torch.randn((tokens, 5120), device=device, dtype=torch.bfloat16)
+    ids = torch.arange(6, device=device).expand(tokens, -1).contiguous()
+    rw = torch.full((tokens, 6), 1 / 6, device=device)
 
     def run(expert):
-        ws13 = torch.empty((12288, 3 * 2304), device=device, dtype=torch.bfloat16)
-        ws2 = torch.empty((12288, 5120), device=device, dtype=torch.bfloat16)
-        output = ws13.flatten()[: 2048 * 5120].view(2048, 5120)
+        ws13 = torch.empty((num_slots, 3 * 2304), device=device, dtype=torch.bfloat16)
+        ws2 = torch.empty((num_slots, 5120), device=device, dtype=torch.bfloat16)
+        output = ws13.flatten()[: tokens * 5120].view(tokens, 5120)
         expert.apply(
             output,
             hidden,
@@ -1757,9 +1806,11 @@ def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_route
         )
         return output.clone(), ws2
 
-    for spread in (False, True):
-        if spread:
-            ids = torch.arange(12288, device=device).view(2048, 6) % 384
+    for routing in ("hot", "small_tail", "spread"):
+        if routing == "small_tail":
+            ids[-2:] += 6
+        elif routing == "spread":
+            ids = torch.arange(num_slots, device=device).view(tokens, 6) % 384
         expected, expected_slots = run(baseline)
         output, slots = run(candidate)
         assert torch.isfinite(output).all()

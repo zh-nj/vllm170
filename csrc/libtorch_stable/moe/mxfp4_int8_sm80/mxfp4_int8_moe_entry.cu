@@ -79,9 +79,9 @@ void set_max_dynamic_smem_if_needed() {
           Mxfp4PackedBGroupedKernel<Kernel, MXFP4_MOE_MIN_BLOCKS_PER_SM>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     } else {
-      status = cudaFuncSetAttribute(
-          cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          smem_size);
+      status = cudaFuncSetAttribute(cutlass::Kernel<Kernel>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    smem_size);
     }
     STD_TORCH_CHECK(status == cudaSuccess,
                     "failed to set MXFP4-int8 MoE CUTLASS dynamic shared "
@@ -292,8 +292,11 @@ struct Mxfp4Int8MoeGemm {
 
     const cudaStream_t stream = get_current_cuda_stream(a_q.get_device_index());
 
+    const bool prefill_small_tail =
+        TopK == kDsv4TargetTopK && kBlockM == 16 && kBlockN == 128 &&
+        num_valid_tokens == 2044 * kDsv4TargetTopK && num_experts == 384;
     const bool persistent =
-        kBlockM >= 128 && kBlockN >= 64 &&
+        (kBlockM >= 128 || prefill_small_tail) && kBlockN >= 64 &&
         grid_m_tiles * grid_n_tiles > multi_processor_count * 2;
 
     cutlass::gemm::GemmCoord problem_size(static_cast<int>(max_m), kN, kK);
