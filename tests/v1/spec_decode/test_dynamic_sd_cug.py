@@ -15,6 +15,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
@@ -149,6 +150,59 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
             assert desc.num_tokens == num_tokens
             assert desc.num_reqs == num_reqs
             assert desc.num_active_loras == 0
+
+
+@pytest.mark.parametrize(
+    "capture_sizes",
+    [
+        [1, 2, 4, 6, 8, 12, 16, *range(24, 97, 8)],
+        [1, 2, 4, 5, 6, 8, 10, 16, 20, *range(24, 97, 8)],
+    ],
+)
+def test_dynamic_sd_sparse_grid_keeps_pp_decode_query_lengths_separate(
+    monkeypatch, capture_sizes
+):
+    """A PP cohort changing K must replay a graph captured for that exact K."""
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=False),
+    )
+    config = _create_vllm_config_for_dsd(
+        max_num_seqs=8,
+        max_spec_tokens=5,
+        cudagraph_mode="FULL",
+        num_spec_per_batch_size=[(1, 1, 5), (2, 8, 4)],
+    )
+    config.compilation_config.cudagraph_capture_sizes = capture_sizes
+    config.compilation_config.max_cudagraph_capture_size = 96
+    mode = config.compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "DSV41FSWA",
+        uniform_decode_query_len=6,
+        use_v2_model_runner=True,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        config, torch.device("cpu"), mode, decode_query_len=6
+    )
+    manager._graphs_captured = True
+
+    # Both lengths are reachable during a cohort transition because scheduling
+    # the next K does not change already in-flight requests' draft placeholders.
+    for query_len in (5, 6):
+        for num_reqs in range(1, 9):
+            desc = manager.dispatch(
+                num_reqs, num_reqs * query_len, query_len, num_active_loras=0
+            )
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert desc.uniform_token_count == query_len
+            assert desc.num_tokens == desc.num_reqs * query_len
+            assert num_reqs <= desc.num_reqs <= 8
+            if query_len == 5 and num_reqs == 3 and 12 not in capture_sizes:
+                assert desc.num_tokens == 20
+            elif num_reqs <= 4:
+                assert desc.num_tokens == num_reqs * query_len
+    assert manager.dispatch(3, 16, None, 0).cg_mode == CUDAGraphMode.NONE
 
 
 def test_dynamic_sd_cudagraphs_use_clamped_query_length(monkeypatch):

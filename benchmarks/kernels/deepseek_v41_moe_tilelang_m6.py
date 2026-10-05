@@ -26,9 +26,26 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_int8_sm80 import (
     remap_mxfp4_weight_for_int8,
 )
 
+_SAMPLED_LAYER20_EXPERT_IDS = tuple(range(137, 173))
 
-def load_sampled_weights(model, device, dest, *, stages=("w13", "w2")):
-    """Read 36 layer20 experts; remaining E384 slots are explicitly zero."""
+
+def load_sampled_weights(
+    model,
+    device,
+    dest,
+    *,
+    stages=("w13", "w2"),
+    expert_ids=_SAMPLED_LAYER20_EXPERT_IDS,
+    routing_and_hidden="synthetic; no live MoE input capture",
+):
+    """Read selected layer20 experts; remaining E384 slots are zero."""
+    expert_ids = tuple(expert_ids)
+    if (
+        not expert_ids
+        or len(set(expert_ids)) != len(expert_ids)
+        or any(not 0 <= expert < 384 for expert in expert_ids)
+    ):
+        raise ValueError("expert_ids must be distinct integers in [0, 384)")
     mapping = json.loads((model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -71,7 +88,7 @@ def load_sampled_weights(model, device, dest, *, stages=("w13", "w2")):
         if stage not in stages:
             continue
         raw_weight, raw_scale = [], []
-        for expert in range(137, 173):
+        for expert in expert_ids:
             raw_weight.append(
                 torch.cat([read(expert, name, "weight") for name in names])
             )
@@ -92,16 +109,16 @@ def load_sampled_weights(model, device, dest, *, stages=("w13", "w2")):
             expanded = torch.zeros(
                 (384, *tensor.shape[1:]), dtype=tensor.dtype, device=device
             )
-            expanded[137:173].copy_(tensor)
+            expanded.index_copy_(0, torch.tensor(expert_ids, device=device), tensor)
             value[name] = expanded
         weights[stage] = value
     (dest / "checkpoint-provenance.json").write_text(
         json.dumps(
             dict(
                 layer=20,
-                real_experts=list(range(137, 173)),
+                real_experts=list(expert_ids),
                 other_expert_slots="zero; never selected by this probe",
-                routing_and_hidden="synthetic; no live MoE input capture",
+                routing_and_hidden=routing_and_hidden,
                 headroom_bits=3,
                 reuse_weight_storage=True,
                 raw_checkpoint=provenance,

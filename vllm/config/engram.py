@@ -41,20 +41,38 @@ class EngramConfig:
     cpu_offload: bool = Field(default_factory=_default_cpu_offload)
     """Store embedding weights in pinned CPU memory for UVA lookup.
     Defaults to False, or VLLM_PLE_CPU_OFFLOAD when set for compatibility.
-    An explicit value takes precedence over the legacy environment variable."""
+    An explicit value takes precedence over the legacy environment variable.
+    With SSD storage, host memory holds the configured scales, cache and staging."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
 
-    cpu_cache_gb: float = Field(default=0.0, ge=0.0)
+    cpu_cache_gb: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     """Capacity in GiB of each SSD-backed table's pinned CPU FIFO cache.
     Cache hits keep their original insertion order; misses replace the oldest
-    resident rows. This field has no effect unless ``ssd_offload_path`` is set."""
+    resident rows. A nonzero budget requires ``ssd_offload_path``."""
 
-    ssd_offload_path: str | None = None
+    ssd_offload_path: str | None = Field(default=None, min_length=1)
     """Directory for complete file-backed Engram tables.
     The directory should be on a local SSD and is created when necessary."""
+
+    ssd_scale_in_ram: bool = True
+    """Keep SSD table scales in pageable CPU RAM, outside the row-cache budget.
+    Weight bytes remain on SSD. Disable to minimize resident host memory."""
+
+    ssd_io_workers: int = Field(default=8, ge=1, le=32)
+    """Maximum concurrent SSD row readers per local table; 1 reads serially.
+    Small requests and fast page-cache reads use the serial path.
+    This field has no effect unless ``ssd_offload_path`` is set."""
+
+    ssd_batch_reads: bool = False
+    """Use batched mapped reads for large, page-cache-resident SSD requests.
+    Slow probe reads retain the parallel preadv path. Requires RAM scales."""
+
+    ssd_prefetch: bool = False
+    """Start same-step SSD row reads before receiving upstream PP tensors.
+    GPU staging remains at the original lookup boundary. Requires V2 PP."""
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
@@ -79,11 +97,19 @@ class EngramConfig:
             )
         if self.ssd_offload_path and not self.cpu_offload:
             raise ValueError("Engram ssd_offload_path requires cpu_offload")
+        if self.ssd_offload_path and field != "engram_layer_ids":
+            raise ValueError("Engram SSD storage currently requires DeepSeek V4.1")
         if self.cpu_cache_gb and not self.ssd_offload_path:
             raise ValueError("Engram cpu_cache_gb requires ssd_offload_path")
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if (
+            self.ssd_offload_path
+            and self.embedding_across_dp
+            and parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError("Engram SSD storage does not support sharding across DP")
         if (
             self.embedding_across_dp
             and parallel_config.data_parallel_size > 1

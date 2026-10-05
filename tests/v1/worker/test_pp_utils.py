@@ -241,9 +241,11 @@ def test_async_intermediate_tensors_completes_pp_buffer_once():
     assert guard.state is PPRecvBufferState.MODEL
 
 
-def _target_prepare_ahead_config(enabled=True):
+def _target_prepare_ahead_config(enabled=None):
     return SimpleNamespace(
-        additional_config={"dsv41_sm80_target_prepare_ahead": enabled},
+        additional_config=(
+            {} if enabled is None else {"dsv41_sm80_target_prepare_ahead": enabled}
+        ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 model_type="deepseek_v41",
@@ -279,7 +281,9 @@ def _patch_target_prepare_ahead_platform(monkeypatch, *, cuda=True, sm80=True):
 @pytest.mark.parametrize(
     ("additional_config", "expected"),
     [
-        ({}, False),
+        ({}, True),
+        (None, True),
+        ({"ced_prefill": True}, True),
         ({"dsv41_sm80_target_prepare_ahead": False}, False),
         ({"dsv41_sm80_target_prepare_ahead": True}, True),
     ],

@@ -832,6 +832,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
+        self._ssd_engram = bool(
+            self.engram_hash is not None
+            and vllm_config.engram_config is not None
+            and vllm_config.engram_config.ssd_offload_path
+        )
+        self._ssd_prefetch_enabled = bool(
+            self._ssd_engram
+            and vllm_config.engram_config is not None
+            and vllm_config.engram_config.ssd_prefetch
+        )
+        self._pending_engram_rows: tuple[torch.Tensor, torch.Tensor] | None = None
+        if self._ssd_engram:
+            assert self.engram_layout is not None
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self._prepared_engram_hashes = torch.empty(
+                (
+                    max_tokens,
+                    len(self.engram_layout.layer_ids),
+                    self.engram_layout.n_hash_cols,
+                ),
+                dtype=torch.int32,
+            )
+            self._prepared_engram_mask = torch.empty(max_tokens, dtype=torch.bool)
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
@@ -1035,47 +1059,32 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 :num_tokens
             ].clone()
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-        lookback_token_ids: torch.Tensor | None = None,
-        ced_step: CEDStep | None = None,
-        fast_prefill_step: FastPrefillStep | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            if self.pp_shared_kv is not None:
-                self.pp_shared_kv.import_chunk(
-                    intermediate_tensors, self.topk_indices_buffer
-                )
-
-        if intermediate_tensors is not None:
-            self._import_pp_attention_state(positions, intermediate_tensors)
-
-        if self.use_mega_moe:
-            input_ids = input_ids.to(torch.int64)
-
-        # Engram n-gram hashes for the whole (flattened) batch, computed once
-        # on the full token stream — before any sequence-parallel sharding —
-        # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
+    def _prepare_engram_rows(
+        self, input_ids, positions, lookback_token_ids, attn_metadata, *, prefetch=False
+    ):
+        pending = getattr(self, "_pending_engram_rows", None)
+        if pending is not None:
+            if prefetch:
+                raise RuntimeError("Engram SSD prefetch must finish before reuse")
+            self._pending_engram_rows = None
+            hashes, mask = pending
+            if hashes.shape[0] != positions.shape[0]:
+                self._discard_engram_prefetch()
+                raise RuntimeError("Engram SSD prefetch belongs to another batch")
+            try:
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    engram = getattr(layer, "engram", None)
+                    if engram is not None:
+                        engram.embed_tokens.finish_ssd_lookup(
+                            engram.staged_rows[: hashes.shape[0]]
+                        )
+            except Exception:
+                self._discard_engram_prefetch()
+                raise
+            return hashes, mask
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
-        if (
-            self.engram_hash is not None
-            and input_ids is not None
-            and is_forward_context_available()
-        ):
-            attn_metadata = get_forward_context().attn_metadata
+        if self.engram_hash is not None and input_ids is not None:
             if isinstance(attn_metadata, list):
                 attn_metadata = attn_metadata[dbo_current_ubatch_id()]
             if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
@@ -1113,9 +1122,100 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
-                        engram.prepare_embeddings(
-                            engram_hashes[:, engram.layer_hash_index]
-                        )
+                        ids = engram_hashes[:, engram.layer_hash_index]
+                        if prefetch:
+                            engram.embed_tokens.begin_ssd_lookup(ids)
+                        else:
+                            engram.prepare_embeddings(ids)
+                if prefetch:
+                    self._pending_engram_rows = (engram_hashes, engram_mask)
+
+        return engram_hashes, engram_mask
+
+    def begin_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        """Begin same-step CPU reads before the upstream PP receive completes."""
+        if getattr(self, "_ssd_prefetch_enabled", False):
+            if self._pending_engram_rows is not None:
+                raise RuntimeError("Engram SSD prefetch must finish before reuse")
+            try:
+                self._prepare_engram_rows(
+                    input_ids,
+                    positions,
+                    lookback_token_ids,
+                    attn_metadata,
+                    prefetch=True,
+                )
+            except Exception:
+                self._discard_engram_prefetch()
+                raise
+
+    def _discard_engram_prefetch(self):
+        self._pending_engram_rows = None
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.discard_ssd_lookup()
+
+    def prepare_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        """Prepare SSD rows and persistent hash/mask buffers before FULL replay."""
+        if not self._ssd_engram:
+            return False
+        hashes, mask = self._prepare_engram_rows(
+            input_ids, positions, lookback_token_ids, attn_metadata
+        )
+        if hashes is None:
+            raise RuntimeError("SSD Engram FULL replay requires bound SWA metadata")
+        n = positions.shape[0]
+        self._prepared_engram_hashes[:n].copy_(hashes)
+        self._prepared_engram_mask[:n].copy_(mask)
+        return True
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        ced_step: CEDStep | None = None,
+        fast_prefill_step: FastPrefillStep | None = None,
+        engram_embeddings_prepared: bool = False,
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            if self.pp_shared_kv is not None:
+                self.pp_shared_kv.import_chunk(
+                    intermediate_tensors, self.topk_indices_buffer
+                )
+
+        if intermediate_tensors is not None:
+            self._import_pp_attention_state(positions, intermediate_tensors)
+
+        if self.use_mega_moe:
+            input_ids = input_ids.to(torch.int64)
+
+        engram_hashes, engram_mask = None, None
+        if engram_embeddings_prepared:
+            n = positions.shape[0]
+            engram_hashes = self._prepared_engram_hashes[:n]
+            engram_mask = self._prepared_engram_mask[:n]
+        elif is_forward_context_available():
+            engram_hashes, engram_mask = self._prepare_engram_rows(
+                input_ids,
+                positions,
+                lookback_token_ids,
+                get_forward_context().attn_metadata,
+            )
 
         full_num_tokens = positions.shape[0]
         # The tail may temporarily replace `positions` with its compact row
@@ -1696,6 +1796,20 @@ class DeepseekV41LLMForCausalLM(
 
         return DeepseekV41ModelState
 
+    def prepare_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        return self.model.prepare_engram_embeddings(
+            input_ids, positions, lookback_token_ids, attn_metadata
+        )
+
+    def begin_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        self.model.begin_engram_embeddings(
+            input_ids, positions, lookback_token_ids, attn_metadata
+        )
+
     @property
     def token_lookback_depth(self) -> int:
         """Tokens before a chunk start the engram hash needs; the model runner
@@ -1712,6 +1826,7 @@ class DeepseekV41LLMForCausalLM(
         lookback_token_ids: torch.Tensor | None = None,
         ced_step: CEDStep | None = None,
         fast_prefill_step: FastPrefillStep | None = None,
+        engram_embeddings_prepared: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1721,6 +1836,7 @@ class DeepseekV41LLMForCausalLM(
             lookback_token_ids=lookback_token_ids,
             ced_step=ced_step,
             fast_prefill_step=fast_prefill_step,
+            engram_embeddings_prepared=engram_embeddings_prepared,
         )
         return hidden_states
 

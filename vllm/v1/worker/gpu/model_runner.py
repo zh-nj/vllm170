@@ -1945,6 +1945,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
 
+                if not dummy_run:
+                    self.model_state.prepare_pp_independent_inputs(
+                        model_inputs, attn_metadata
+                    )
+
                 # Prepare the intermediate tensors.
                 assert intermediate_tensors is not None
                 assert self.intermediate_tensors is not None

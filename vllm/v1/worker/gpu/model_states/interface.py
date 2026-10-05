@@ -126,6 +126,14 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def prepare_pp_independent_inputs(
+        self,
+        model_inputs: dict[str, Any],
+        attn_metadata: Any,
+    ) -> None:
+        """Start input preparation that does not consume upstream PP tensors."""
+        return None
+
     def prepare_full_cudagraph_inputs(
         self,
         model_inputs: dict[str, Any],

@@ -309,6 +309,20 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     def token_lookback_depth(self) -> int:
         return self.language_model.token_lookback_depth
 
+    def prepare_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        return self.language_model.prepare_engram_embeddings(
+            input_ids, positions, lookback_token_ids, attn_metadata
+        )
+
+    def begin_engram_embeddings(
+        self, input_ids, positions, lookback_token_ids, attn_metadata
+    ):
+        self.language_model.begin_engram_embeddings(
+            input_ids, positions, lookback_token_ids, attn_metadata
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -326,6 +340,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             lookback_token_ids=lookback_token_ids,
             ced_step=kwargs.get("ced_step"),
             fast_prefill_step=kwargs.get("fast_prefill_step"),
+            engram_embeddings_prepared=kwargs.get("engram_embeddings_prepared", False),
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

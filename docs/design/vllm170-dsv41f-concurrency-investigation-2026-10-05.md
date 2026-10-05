@@ -1217,3 +1217,164 @@ Graph 支持；任何流程候选仍要在相同 batch 形状及接受长度下�
 这是恢复验收，不是优化 A/B。本轮没有改推理源码，也没有确认新的提速。
 路由 Graph 验收、离线跨 rank/跨窗口断言、诊断固定输出及生产恢复输出
 检查通过；诊断脚本 ruff/format 和工作区 diff whitespace 检查通过。
+
+## Round 10：验证前缀、动态长度及 Graph 候选缺口（2026-10-06）
+
+Round 1–9 的已验证探针、MoE tile benchmark 和分析已提交为
+`c0ef46101b`。本轮复用 Round 9 的真实路由，先检查低接受率下缩短
+target 验证的机会，再做一个候选的 A→B→A。没有进行 q 扫描。
+证据保存在 `artifacts/dsv41f-concurrency-investigation-20261005/round10/`。
+
+### 自适应验证不能直接用于当前 PP5
+
+`VllmConfig._validate_adaptive_verification()` 在 PP>1 时明确拒绝启用。
+confidence 由末级产生，成本曲线及 confidence 尚未广播给所有 PP rank；
+各 rank 独立裁剪会形成不同的 token 总数、query 边界和传输形状。
+SM80 indexer 的 CPU/GPU query mismatch 支持声明及 SWA/MLA 的
+`UNIFORM_BATCH` 声明也是限制，但放宽这些声明不能解决 PP 一致性。
+
+共享 token→request 映射本身已经读取 GPU `query_start_loc`；CPU 边界
+只提供映射总长度，因此本轮没有新增一个重复的 GPU 映射实现。
+没有启用 `enable_adaptive_verification`，也没有修改 attention 支持声明。
+
+### 原轨迹前缀账本：机会依赖接受率和 batch
+
+对 Round 9 的全部 40 层路由统计保留每个请求前 q 个 query 后的 D。
+相邻记录中同一请求的位置增量 A 作为输出数量代理，截短的数量记为
+`min(A,q)`。只使用存在下一条记录的请求；这是固定原轨迹的前缀机会
+账本，截短后未来 draft anchor 和路由会改变，**不是新配置的速度预测**。
+
+| 原窗口/形状 | q | D/层 | D/q6 | 截短输出代理/q6 |
+| --- | ---: | ---: | ---: | ---: |
+| 固定提示 M6/B1，45 batch | 3 | 12.386 | 62.68% | 51.76% |
+| 固定提示 M6/B1，45 batch | 5 | 17.520 | 88.66% | 84.71% |
+| 不同提示 M18/B3，43 batch | 3 | 33.819 | 66.49% | 80.52% |
+| 不同提示 M18/B3，43 batch | 4 | 40.328 | 79.28% | 91.40% |
+| 不同提示 M18/B3，43 batch | 5 | 45.837 | 90.12% | 97.71% |
+| 不同提示 M18/B3，43 batch | 6 | 50.865 | 100% | 100% |
+
+全部不同提示的 171 个位置增量平均 2.965；截成 q3/q5 后数量保留
+75.54%/95.46%，但只看 B3 窗口是 80.52%/97.71%。因此单请求仍保留
+q6、多请求试 q5，比全局改成 q3 有更小的输出损失。不能将 batch 大小
+当作低接受率的充分条件；同提示并发或实际流量可能有不同接受率。
+
+### 空闲 GPU1：完整 MoE 前缀实验
+
+使用物理 GPU1（SM80，UUID `f385e0d6-452b-ad54-922e-ef7f4deb6216`）、
+CUDA 13.0、Torch 2.13.0+cu130、TileLang 0.1.15。按 layer20 的 D
+选固定 B1 的中位帧，以及不同提示 B3 的最小 D 和中位 D 帧。
+从 checkpoint 仅读取三帧所需的 **81 个专家**，保留原专家 ID；其余
+E384 槽位为零且不参与路由。hidden 和 routing weights 为合成输入。
+
+计时边界是完整 `Experts.apply`，包括量化、路由排列、两次 GEMM、
+激活及加权归约。使用生产可达的 CUTLASS 路径及既有激活融合；每张
+Graph 一次调用，64 MiB L2 flush 在事件区间外，3 轮交替顺序、每轮
+15 个样本。这里**没有生产的 query/token padding、attention、draft
+或 PP 等待**。
+
+| 捕获 step / B / layer20 D(q6) | q6 µs | q5 µs / 降幅 | q4 µs / 降幅 | q3 µs / 降幅 |
+| --- | ---: | ---: | ---: | ---: |
+| 542 / B1 / 15 | 374.784 | 335.872 / 10.38% | 296.960 / 20.77% | 284.672 / 24.04% |
+| 1267 / B3 / 38 | 849.920 | 755.712 / 11.08% | 701.440 / 17.47% | 576.512 / 32.17% |
+| 1357 / B3 / 46 | 1019.904 | 896.000 / 12.15% | 793.600 / 22.19% | 673.792 / 33.94% |
+
+12 个形状的保留 token 输出及 W2 routed slots 均与未截短 q6 bitwise
+一致。改变 hidden/路由后，对输出填 NaN 再 Graph replay，仍逐项一致；
+计时前恢复原始捕获路由。没有把单层冷 L2 时间乘以 40 当作 target
+或端到端时间。benchmark 为
+`benchmarks/kernels/deepseek_v41_moe_verify_prefix.py`，checkpoint 读取
+复用原 loader，并增加可选 `expert_ids`；其原 36 专家默认值保留。
+
+### 通用修复：不同 query 长度需要独立 Graph 候选区间
+
+新增真实稀疏 capture grid 的回归暴露了 `_init_candidates()` 的缺口。
+q5/q6 同时捕获时，旧代码在所有 query 长度之间共用一个
+`current_range_start`：对 B5/q6 的 M30，候选只含 q5 的 M35，检查
+`uniform_token_count` 后被拒绝，尽管 q6 的 M36 Graph 已经捕获。
+于是该请求退回 eager。
+
+候选区间现在按 `(uniform_token_count,max_query_len)` 独立推进；每个
+候选仍经过原来的请求数、query 长度和 LoRA 兼容性检查，FULL/PW
+优先级不变。B5/q6 的 M30 现在匹配 q6/M36。该修复用于 MRv2 的
+所有动态 speculative schedule，不局限于 DSV41F。
+
+离线对照旧源码，固定长度下 FULL_DECODE_ONLY、FULL_AND_PIECEWISE、
+FULL 的完整候选字典分别有 49/97/97 个 key，**新旧逐项一致**。
+回归同时覆盖原生产网格和动态 schedule 的默认网格、B1–B8、q5/q6
+及不均匀 batch 的 fallback。
+
+需区别两个网格：原 q6 默认网格含 12；动态 schedule 默认网格删除
+12、增加 5/10/20。因此原网格下 B3/q5 可匹配 M15，但候选默认网格
+下会匹配 **M20/B4**，比原 B3/q6 的 M18 多算两行。该补齐是源码和
+CPU dispatch 确认的事实；其延迟贡献仍需单独干预才能量化。
+
+### 端到端对照与恢复
+
+一次诊断重启，使用原 GPU2–6、PP5/TP1、CUDA 13、CED、RAM Engram
+及 prepare-ahead。A_before 是旧固定 q6 服务；B 仅使用已修复的通用
+Graph 候选构造，并在原 speculative config 中增加
+`num_speculative_tokens_per_batch_size=[[1,1,5],[2,8,4]]`；A_after 删除
+该 schedule，恢复原 argv/env，保留候选构造修复。
+没有 diagnostic Worker、runtime profiling hook 或开发 RPC。
+
+每个 arm 先做相同 32K/256 C1 固定参考检查，再对相同四个不同提示
+做两次 C4，每请求输出 128 token。共 27 个请求。decode 使用共享探针
+的客户端 decode 区间口径：合计排除每请求首 chunk 的 token，除以
+所有请求首 token 到末 token 的联合窗口；它不是 GPU kernel 时间。
+端到端包含 prefill，以 512 个输出 token 除以整波请求时间。
+
+| arm | C4 decode tok/s，两次 | C4 端到端 tok/s，两次 | 实际验证 draft K | 接受 draft + bonus / 请求验证 |
+| --- | ---: | ---: | ---: | ---: |
+| A_before，固定 q6 | 106.61 / 109.32 | 100.50 / 103.60 | 5.000 / 5.000 | 2.977 / 2.977 |
+| B，默认图网格动态 q5/q6 | 91.55 / 99.04 | 87.42 / 94.61 | 4.281 / 4.220 | 3.066 / 3.042 |
+| A_after，恢复固定 q6 | 107.15 / 109.80 | 101.60 / 104.52 | 5.000 / 5.000 | 2.977 / 2.977 |
+
+A 的四次 decode 均值 **108.22 tok/s**，B 均值 **95.30 tok/s**，
+下降 **11.94%**。A_after 相对 A_before 的均值仅增加 **0.47%**，
+支持这是候选退化而非单向基线漂移。该小样本不代表生产流量分布。
+**拒绝默认网格的动态 q5/q6 配置，原固定 q6 保留。**
+
+计数器来自前后 `/metrics` 差分：`num_draft_tokens_total/num_drafts_total`
+是实际送给 target 验证的 K；`1+num_accepted_tokens_total/num_drafts_total`
+按请求的候选组计，不是全局 scheduler step 的 token 数。B 的平均 K
+确实变小，接受数量反而略升，因此原轨迹 `min(A,q)` 不能代替新的
+端到端测量：不同 draft anchor 和调度顺序会改变后续接受分布。
+
+不能从单层 MoE 的 11%–12% 节省推导整轮提速，具体差距有以下证据边界：
+
+* benchmark 没有图补齐；候选默认网格的 B3/q5 会由 15 补到 20，
+  而原 B3/q6 是 18。本轮没有采集 B 的逐步 batch/Graph 记录，不能
+  将全部 11.94% 退化都归因于这个补齐。
+* DSpark `num_speculative_tokens` 仍为 5，`num_query_per_req` 和 Markov
+  head 的循环读取配置最大长度；propose 不读取
+  `SchedulerOutput.num_spec_tokens_to_schedule`。少验证一个 draft
+  不等于 draft 的 GPU 链少计算一个 query。draft 时间未单独计时。
+* async scheduler 将选定 K 写入下一步 placeholder；PP 中已有请求
+  可能携带不同 K。在 cohort 合并时可能出现不均匀 batch，当前
+  FULL_DECODE_ONLY 会退回 eager。这是代码上的可达路径，本轮未测
+  其发生频率或时间贡献。
+
+三个 arm 的固定 C1 decode 为 **146.53 / 142.58 / 145.53 tok/s**，
+3 份 256-token 输出均与原参考 ID 完全一致。不同提示通过共享
+`one_request()` 的 token ID、usage、长度、finish reason 和 `[DONE]`
+检查；诊断控制器本轮只持久化了汇总，没有保存其原始输出 ID，
+因此不能用于不同提示的输出等价评测。保存缺口已在后续使用的控制器
+中补上，实际运行版本另存为 `trial-e2e-tested.py.txt`，不追补本轮证据。
+
+服务中断约 **12 分 50 秒**。最终父进程 **347443**，PP0–PP4 为
+**350356/350358/350360/350362/350364**；原 argv/env 和物理 GPU
+映射一致，health=200、开发 RPC=404、26662 无 listener。13 个运行
+源码哈希中，仅 `gpu/cudagraph_utils.py` 是本轮保留的已验证修复，
+其余与重启前一致。固定长度的候选表没有变化，**不宣称该修复给
+当前固定 q6 带来速度增益**。
+
+验证：定向 dynamic-SD、Graph manager、adaptive-verification 四个
+CPU suite 共 **46 passed**；补充两个稀疏网格后，Graph suite
+**8 passed**。固定候选表新旧对照、B5/q6 缺口复现、GPU 前缀及
+poison/replay 检查通过。误纳入的 Qwen 模型级 Graph 集成 suite
+已取消，不计入这些通过结果。
+
+本轮完成通用候选修复并保留原生产配置。后续若继续验证长度优化，
+先使用显式图网格控制 B3/q5 的补齐，再量化真实 cohort 的 uniform /
+eager 比例；不能直接推广默认动态 schedule，也不能绕过 PP adaptive
+verification 的一致性检查。

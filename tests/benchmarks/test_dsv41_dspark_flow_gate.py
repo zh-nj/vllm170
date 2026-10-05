@@ -7,6 +7,10 @@ from typing import Any
 import pytest
 
 from benchmarks.deepseek_v4_1 import dspark_flow_gate as gate
+from benchmarks.deepseek_v4_1.concurrency_probe import (
+    _read_metrics,
+    summarize_requests,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -88,6 +92,9 @@ vllm:spec_decode_num_accepted_tokens_total{engine=\"0\"} 8
 vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",position=\"0\"} 4
 vllm:spec_decode_num_accepted_tokens_created{engine=\"0\"} 123
 vllm:prompt_tokens_total{engine=\"0\"} 20
+vllm:prefix_cache_hits_total{engine=\"0\"} 0
+vllm:request_prefill_time_seconds_sum{engine=\"0\"} 2.5
+vllm:request_prefill_time_seconds_count{engine=\"0\"} 1
 """
     monkeypatch.setattr(
         gate.urllib.request,
@@ -103,7 +110,45 @@ vllm:prompt_tokens_total{engine=\"0\"} 20
             '{engine="0",position="0"}'
         ): 4.0,
         'vllm:prompt_tokens_total{engine="0"}': 20.0,
+        'vllm:prefix_cache_hits_total{engine="0"}': 0.0,
+        'vllm:request_prefill_time_seconds_sum{engine="0"}': 2.5,
+        'vllm:request_prefill_time_seconds_count{engine="0"}': 1.0,
     }
 
     after = {"values": {key: value + 1 for key, value in snapshot["values"].items()}}
     assert all(value == 1.0 for value in gate.metric_deltas(snapshot, after).values())
+
+
+def test_concurrent_decode_includes_staggered_arrival_and_entire_first_chunks():
+    """Separate request durations must not inflate aggregate throughput."""
+    requests = [
+        {
+            "first_token_s": 1.0,
+            "last_token_s": 3.0,
+            "completion_tokens": 9,
+            "post_first_chunk_tokens": 6,
+        },
+        {
+            "first_token_s": 4.0,
+            "last_token_s": 6.0,
+            "completion_tokens": 9,
+            "post_first_chunk_tokens": 6,
+        },
+    ]
+    summary = summarize_requests(requests, wall_s=6.0)
+    assert summary["aggregate_decode_span_s"] == 5.0
+    assert summary["aggregate_decode_tok_s"] == 12 / 5
+    assert summary["aggregate_output_tok_s"] == 18 / 6
+
+
+def test_concurrency_probe_retains_labeled_draft_and_preemption_metrics():
+    """Production metrics have engine/model labels; dropping them hides failures."""
+    body = """vllm:spec_decode_num_drafts_total{engine="0",model_name="m"} 12
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="m"} 48
+vllm:num_preemptions_total{engine="0",model_name="m"} 1
+vllm:num_preemptions_created{engine="0",model_name="m"} 123
+"""
+    values = _read_metrics(body)
+    assert values['vllm:spec_decode_num_drafts_total{engine="0",model_name="m"}'] == 12
+    assert values['vllm:num_preemptions_total{engine="0",model_name="m"}'] == 1
+    assert not any("_created" in key for key in values)

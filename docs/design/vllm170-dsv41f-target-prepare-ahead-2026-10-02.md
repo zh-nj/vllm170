@@ -5,6 +5,13 @@
 HEAD为`81175371741318fda60762f62052994be7c0bf31`，前几轮未提交改动保留。
 原始产物：`artifacts/dsv41f-target-opt-round7-20261002/`。
 
+2026-10-05 更新：根据用户要求，target prepare-ahead 改为默认开启。
+直接 `vllm serve` 缺省该配置项时启用，PP5 launcher 也显式写入 true；
+显式 `dsv41_sm80_target_prepare_ahead:false` 仍可回退。原有 DSV41F、
+SM80、V2、PP5/TP1/DP1、DSpark5 和 adaptive verification 关闭的门控保持。
+以下 false 默认值是 10 月 2 日验收时的历史记录；本次只修改默认值，
+不新增端到端速度结论。
+
 ## 1. 端到端结果
 
 同一加载实例中只改变target接收顺序，关闭所有phase/step timing插桩。

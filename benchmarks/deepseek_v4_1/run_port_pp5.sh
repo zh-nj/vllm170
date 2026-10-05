@@ -64,6 +64,39 @@ PORT_PORT=${PORT_PORT:-26663}
 # only, so enabling this adds encoder inputs without moving weights off PP0.
 PORT_MM_IMAGES=${PORT_MM_IMAGES:-2}
 PORT_MODEL_DIR=${PORT_MODEL_DIR:-/media/z/data6/models/DeepSeek-V4.1-Flash}
+# Optional SSD Engram tables; the FIFO budget is per local table, in GiB.
+PORT_ENGRAM_SSD_PATH=${PORT_ENGRAM_SSD_PATH:-}
+PORT_ENGRAM_CPU_CACHE_GB=${PORT_ENGRAM_CPU_CACHE_GB:-0}
+PORT_ENGRAM_SCALE_IN_RAM=${PORT_ENGRAM_SCALE_IN_RAM:-1}
+PORT_ENGRAM_IO_WORKERS=${PORT_ENGRAM_IO_WORKERS:-8}
+PORT_ENGRAM_BATCH_READS=${PORT_ENGRAM_BATCH_READS:-0}
+PORT_ENGRAM_PREFETCH=${PORT_ENGRAM_PREFETCH:-0}
+engram_config=$("${REPO_ROOT}/.venv/bin/python" - "${PORT_ENGRAM_SSD_PATH}" "${PORT_ENGRAM_CPU_CACHE_GB}" "${PORT_ENGRAM_SCALE_IN_RAM}" "${PORT_ENGRAM_IO_WORKERS}" "${PORT_ENGRAM_BATCH_READS}" "${PORT_ENGRAM_PREFETCH}" <<'PY'
+import json
+import math
+import sys
+
+path, raw_budget, raw_scale, raw_workers, raw_batch, raw_prefetch = sys.argv[1:]
+budget = float(raw_budget)
+if not math.isfinite(budget) or budget < 0 or (budget and not path):
+    raise ValueError("Engram cache budget must be finite, non-negative and have an SSD path")
+config = {"cpu_offload": True, "embedding_across_dp": False}
+if path:
+    workers = int(raw_workers)
+    if (
+        raw_scale not in ("0", "1")
+        or raw_batch not in ("0", "1")
+        or raw_prefetch not in ("0", "1")
+        or not 1 <= workers <= 32
+    ):
+        raise ValueError("Engram flags must be 0/1 and IO workers must be 1..32")
+    config.update(ssd_offload_path=path, cpu_cache_gb=budget,
+                  ssd_scale_in_ram=raw_scale == "1", ssd_io_workers=workers,
+                  ssd_batch_reads=raw_batch == "1",
+                  ssd_prefetch=raw_prefetch == "1")
+print(json.dumps(config))
+PY
+)
 PORT_MAX_MODEL_LEN=${PORT_MAX_MODEL_LEN:-1048576}
 # Empty means "let the engine profile and size the KV cache itself" (see kv_args).
 PORT_KV_BYTES=${PORT_KV_BYTES-1300000000}
@@ -98,6 +131,20 @@ if [[ "${PORT_CED_PREFILL}" != "0" && "${PORT_CED_PREFILL}" != "1" ]]; then
     echo "PORT_CED_PREFILL must be 0 or 1." >&2
     exit 2
 fi
+# These DSV41F SM80 paths are validated production configuration candidates.
+# Keep them independently overridable so a caller can reproduce a rollback
+# without replacing the complete additional-config object.
+PORT_FUSED_SWA_METADATA=${PORT_FUSED_SWA_METADATA:-1}
+PORT_MOE_HYBRID_PREFILL=${PORT_MOE_HYBRID_PREFILL:-1}
+PORT_MOE_SMALL_TAIL_PREFILL=${PORT_MOE_SMALL_TAIL_PREFILL:-1}
+for flag_name in PORT_FUSED_SWA_METADATA PORT_MOE_HYBRID_PREFILL \
+    PORT_MOE_SMALL_TAIL_PREFILL; do
+    flag_value=${!flag_name}
+    if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "${flag_name} must be 0 or 1." >&2
+        exit 2
+    fi
+done
 # Draft execution. 0 captures the rank-local draft step into FULL CUDA graphs:
 # each of the three stage ranks captures its share of the draft blocks, the head
 # rank captures the draft-state collapse plus the sequential Markov head. Only
@@ -205,14 +252,20 @@ fi
 # --additional-config here), so split it into the argv array used below.
 read -r -a extra_args <<< "${PORT_EXTRA_ARGS}"
 
-# Merge the CED default with caller config and reject fast prefill in either
+# Merge serving defaults with caller config and reject fast prefill in either
 # --additional-config form.
-merged_extra_args=$("${REPO_ROOT}/.venv/bin/python" - "${PORT_CED_PREFILL}" "${extra_args[@]}" <<'PY'
+merged_extra_args=$("${REPO_ROOT}/.venv/bin/python" - \
+    "${PORT_CED_PREFILL}" "${PORT_FUSED_SWA_METADATA}" \
+    "${PORT_MOE_HYBRID_PREFILL}" "${PORT_MOE_SMALL_TAIL_PREFILL}" \
+    "${extra_args[@]}" <<'PY'
 import json
 import sys
 
 ced_enabled = sys.argv[1] == "1"
-words = sys.argv[2:]
+fused_swa_metadata = sys.argv[2] == "1"
+hybrid_prefill = sys.argv[3] == "1"
+small_tail_prefill = sys.argv[4] == "1"
+words = sys.argv[5:]
 kept = []
 config = {}
 index = 0
@@ -233,6 +286,10 @@ if not isinstance(config, dict):
 if config.get("dsv41_fast_prefill"):
     raise SystemExit("dsv41_fast_prefill is disabled for this deployment")
 config.pop("dsv41_fast_prefill", None)
+config.setdefault("dsv41_sm80_fused_swa_metadata", fused_swa_metadata)
+config.setdefault("dsv41_sm80_moe_hybrid_prefill", hybrid_prefill)
+config.setdefault("dsv41_sm80_moe_small_tail_prefill", small_tail_prefill)
+config.setdefault("dsv41_sm80_target_prepare_ahead", True)
 config["ced_prefill"] = ced_enabled
 kept += ["--additional-config", json.dumps(config, separators=(",", ":"))]
 print(" ".join(kept))
@@ -256,7 +313,7 @@ exec "${VLLM_BIN}" serve "${PORT_MODEL_DIR}" \
     --tokenizer-mode deepseek_v41 \
     --attention-backend TRITON_MLA_SPARSE_DSV41 \
     --moe-backend "${PORT_MOE_BACKEND}" \
-    --engram-config '{"cpu_offload":true,"embedding_across_dp":false}' \
+    --engram-config "${engram_config}" \
     --limit-mm-per-prompt "{\"image\":${PORT_MM_IMAGES}}" \
     --kv-cache-dtype fp8 \
     --block-size 128 \

@@ -48,6 +48,12 @@ def read_engine_metrics(base: str, timeout: float) -> dict[str, object]:
             in {
                 "vllm:prompt_tokens_total",
                 "vllm:generation_tokens_total",
+                "vllm:prefix_cache_queries_total",
+                "vllm:prefix_cache_hits_total",
+                "vllm:request_prefill_time_seconds_sum",
+                "vllm:request_prefill_time_seconds_count",
+                "vllm:request_decode_time_seconds_sum",
+                "vllm:request_decode_time_seconds_count",
             }
         ):
             continue
@@ -72,7 +78,7 @@ def metric_deltas(
     }
 
 
-def run_once(base, model, prompt_ids, max_tokens, timeout):
+def run_once(base, model, prompt_ids, max_tokens, timeout, *, cache_salt=None):
     payload = {
         "model": model,
         "prompt": prompt_ids,
@@ -83,6 +89,8 @@ def run_once(base, model, prompt_ids, max_tokens, timeout):
         "return_token_ids": True,
         "stream_options": {"include_usage": True},
     }
+    if cache_salt is not None:
+        payload["cache_salt"] = cache_salt
     start = time.perf_counter()
     chunks, usage, done = [], None, False
     finish_reason = None

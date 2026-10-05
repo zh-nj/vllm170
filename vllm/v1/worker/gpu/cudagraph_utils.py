@@ -5,7 +5,7 @@ import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from itertools import groupby, product
+from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import torch
@@ -312,15 +312,17 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
-                for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    for i in range(current_range_start, num_tokens + 1):
+                range_starts: dict[tuple[int | None, int | None], int] = defaultdict(
+                    int
+                )
+                # Different query lengths need independent padding ranges; a
+                # smaller incompatible graph must not hide the next valid one.
+                for desc in lora_descs:
+                    query_shape = (desc.uniform_token_count, desc.max_query_len)
+                    for i in range(range_starts[query_shape], desc.num_tokens + 1):
                         key = (i, num_active_loras)
-                        self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
+                        self._candidates.setdefault(key, []).append(desc)
+                    range_starts[query_shape] = desc.num_tokens + 1
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0

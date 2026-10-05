@@ -990,12 +990,15 @@ def moe_harness():
 
 
 @_NEEDS_SM80
-@pytest.mark.parametrize("small_tail", [False, True])
+@pytest.mark.parametrize(
+    "small_tail,fused_metadata", [(False, False), (True, False), (True, True)]
+)
 def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(
-    moe_harness, small_tail
+    moe_harness, small_tail, fused_metadata
 ):
     """Pairing must neither drop slots nor retain a stale tail after graph replay."""
     from benchmarks.kernels.deepseek_v41_moe_hybrid_prefill import (
+        FusedMetadataRoutes,
         HybridRoutes,
         SmallTailRoutes,
         check_partition,
@@ -1005,7 +1008,13 @@ def test_hybrid_prefill_routes_replay_with_changed_expert_occupancy(
     hot = torch.arange(6, dtype=torch.int32, device="cuda").expand(129, -1).contiguous()
     spread = helper.make_routing_ids(129, 6, 8, "uniform", 41, device="cuda")
     aligned = moe_align_block_size(hot, 64, 8)
-    route_class = SmallTailRoutes if small_tail else HybridRoutes
+    route_class = (
+        FusedMetadataRoutes
+        if fused_metadata
+        else SmallTailRoutes
+        if small_tail
+        else HybridRoutes
+    )
     hybrid = route_class(hot.numel(), 8, hot.device)
     hybrid.update(aligned)
     torch.accelerator.synchronize()
@@ -1723,10 +1732,16 @@ def test_hybrid_prefill_batch_gate_preserves_decode_mixed_and_graphs(monkeypatch
 
 @_NEEDS_SM80
 @pytest.mark.parametrize(
-    "dspark,small_tail", [(False, False), (True, False), (True, True)]
+    "dspark,small_tail,fused_metadata",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
 )
 def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_routes(
-    tilelang_offline_modules, monkeypatch, dspark, small_tail
+    tilelang_offline_modules, monkeypatch, dspark, small_tail, fused_metadata
 ):
     """Exercise both GEMMs, activation and reduction through the production gate."""
     from vllm.config.compilation import CUDAGraphMode
@@ -1763,6 +1778,12 @@ def test_hybrid_prefill_experts_apply_preserves_aliased_output_and_changed_route
     monkeypatch.setattr(impl, "get_current_vllm_config_or_none", lambda: config)
     candidate = Mxfp4Int8Sm80Experts(moe, quant)
     candidate.process_weights_after_loading(layer)
+    if fused_metadata:
+        from benchmarks.kernels.deepseek_v41_moe_hybrid_prefill import (
+            FusedMetadataRoutes,
+        )
+
+        candidate._hybrid_prefill_routes = FusedMetadataRoutes(num_slots, 384, device)
     assert candidate._hybrid_prefill_routes is not None
     assert candidate._hybrid_prefill_routes.slots == num_slots
     assert candidate._hybrid_prefill_routes.block_sizes == (

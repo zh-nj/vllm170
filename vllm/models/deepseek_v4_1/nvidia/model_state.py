@@ -92,7 +92,11 @@ class DeepseekV41ModelState(DefaultModelState):
         # suffix/replay state (the two transforms are mutually exclusive).
         self.ced_prefill_enabled = ced_prefill_enabled(vllm_config)
         self.requires_eager_prefill = (
-            self.ced_prefill_enabled or self.fast_prefill_enabled
+            self.ced_prefill_enabled
+            or self.fast_prefill_enabled
+            or bool(
+                vllm_config.engram_config and vllm_config.engram_config.ssd_offload_path
+            )
         )
         pp = get_pp_group()
         _, end_layer = get_pp_indices(
@@ -253,3 +257,20 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids.fill_(-1)
             model_inputs["lookback_token_ids"] = self.lookback_token_ids
         return model_inputs
+
+    def prepare_full_cudagraph_inputs(self, model_inputs, attn_metadata):
+        prepared = self.model.prepare_engram_embeddings(
+            model_inputs["input_ids"],
+            model_inputs["positions"],
+            model_inputs.get("lookback_token_ids"),
+            attn_metadata,
+        )
+        model_inputs["engram_embeddings_prepared"] = prepared
+
+    def prepare_pp_independent_inputs(self, model_inputs, attn_metadata):
+        self.model.begin_engram_embeddings(
+            model_inputs["input_ids"],
+            model_inputs["positions"],
+            model_inputs.get("lookback_token_ids"),
+            attn_metadata,
+        )

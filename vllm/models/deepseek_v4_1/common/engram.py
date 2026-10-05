@@ -39,7 +39,7 @@ import sys
 import time
 import weakref
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from mmap import PAGESIZE
 
@@ -57,8 +57,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.triton_utils import tl, triton
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
+from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
@@ -600,10 +600,14 @@ def _engram_head_shard_weight_loader(
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
     float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
-    part_rows = param.shape[0]
+    ssd = getattr(param, "engram_ssd", None)
+    part_rows = ssd.rows if ssd is not None else param.shape[0]
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
     shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
+    if ssd is not None:
+        ssd.load(param.engram_ssd_kind, shard)
+        return
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
@@ -715,7 +719,8 @@ class ParallelEngramEmbedding(nn.Module):
     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
-    UVA instead of HBM; the TP sharding is unchanged either way.
+    UVA instead of HBM. `ssd_offload_path` stores the shard on disk and stages
+    requested rows through bounded host/device buffers. TP sharding is unchanged.
     """
 
     def __init__(
@@ -725,13 +730,32 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        cpu_cache_gb: float = 0.0,
+        ssd_offload_path: str | None = None,
+        cache_key: str = "engram",
+        max_tokens: int = 2048,
+        ssd_scale_in_ram: bool = True,
+        ssd_io_workers: int = 8,
+        ssd_batch_reads: bool = False,
     ):
         super().__init__()
+        if ssd_offload_path == "":
+            raise ValueError("Engram ssd_offload_path must not be empty")
+        if dim % block_size or max_tokens <= 0:
+            raise ValueError(
+                "Engram requires aligned row dimensions and positive capacity"
+            )
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
-        if cpu_offload and not is_uva_available():
+        if ssd_offload_path is not None and not cpu_offload:
+            raise ValueError("Engram SSD storage requires cpu_offload")
+        if cpu_cache_gb < 0 or not np.isfinite(cpu_cache_gb):
+            raise ValueError("Engram cpu_cache_gb must be finite and non-negative")
+        if cpu_cache_gb and not ssd_offload_path:
+            raise ValueError("Engram cpu_cache_gb requires ssd_offload_path")
+        if cpu_offload and not ssd_offload_path and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self.num_embeddings = num_embeddings
         self.dim = dim
@@ -745,6 +769,7 @@ class ParallelEngramEmbedding(nn.Module):
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
+        self.ssd_table = None
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         self._num_sms = torch.cuda.get_device_properties(
@@ -757,7 +782,57 @@ class ParallelEngramEmbedding(nn.Module):
         deferred = (
             cpu_offload and self.part_num_embeddings * dim >= _ENGRAM_LOAD_CHUNK_BYTES
         )
-        if deferred:
+        if ssd_offload_path is not None:
+            from .engram_ssd import SSDTable
+
+            self.ssd_table = SSDTable(
+                ssd_offload_path,
+                cache_key,
+                self.part_num_embeddings,
+                dim,
+                block_size,
+                self.vocab_start_idx,
+                cpu_cache_gb,
+                scale_in_ram=ssd_scale_in_ram,
+                io_workers=ssd_io_workers,
+                batch_reads=ssd_batch_reads,
+            )
+            self._ssd_prefetch: Future[np.ndarray] | None = None
+            self.weight = nn.Parameter(
+                torch.empty((0, dim), dtype=torch.float8_e4m3fn, device="cpu"),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty((0, dim // block_size), dtype=torch.uint8, device="cpu"),
+                requires_grad=False,
+            )
+            for param, kind in (
+                (self.weight, "weight"),
+                (self.weight_scale_inv, "scale"),
+            ):
+                param.engram_ssd = self.ssd_table
+                param.engram_ssd_kind = kind
+            capacity = max_tokens * self.part_n_hash_cols
+            self._ssd_host_weight = torch.empty(
+                (capacity, dim), dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            self._ssd_host_scales = torch.empty(
+                (capacity, dim // block_size),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+            self._ssd_device_weight = torch.empty_like(
+                self._ssd_host_weight, device=device
+            )
+            self._ssd_device_scales = torch.empty_like(
+                self._ssd_host_scales, device=device
+            )
+            self._ssd_row_ids = torch.arange(capacity, dtype=torch.int32, device=device)
+            self._ssd_copy_done = torch.cuda.Event()
+            self._ssd_copy_pending = False
+        elif deferred:
             from vllm.models.deepseek_v4_1.host_memory import empty_registered
 
             weight, weight_owner = empty_registered(
@@ -782,7 +857,15 @@ class ParallelEngramEmbedding(nn.Module):
                     "engram_vocab_start": self.vocab_start_idx,
                 },
             )
-        if cpu_offload:
+        if self.ssd_table is not None:
+            logger.info(
+                "Engram SSD table: %d rows x %d; host FIFO %.2f GiB; staging %d rows",
+                self.part_num_embeddings,
+                dim,
+                self.ssd_table.capacity * self.ssd_table.row_bytes / 1024**3,
+                capacity,
+            )
+        elif cpu_offload:
             logger.info(
                 "Engram host table: %d rows x %d, %.2f GiB per rank; deferred=%s",
                 self.part_num_embeddings,
@@ -836,6 +919,9 @@ class ParallelEngramEmbedding(nn.Module):
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
             return
+        if getattr(self, "ssd_table", None) is not None:
+            self._lookup_ssd(indices, out, background)
+            return
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
@@ -860,6 +946,97 @@ class ParallelEngramEmbedding(nn.Module):
                 BLOCK_R=16,
                 GRID=grid,
             )
+
+    def _lookup_ssd(self, indices, out, background):
+        if self._ssd_prefetch is not None:
+            raise RuntimeError("Engram SSD prefetch must finish before lookup")
+        packed = self._gather_ssd(indices, out)
+        self._stage_ssd(packed, out, background)
+
+    def _ssd_local_ids(self, indices):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SSD Engram rows must be prepared outside a FULL CUDA graph"
+            )
+        rows = indices.shape[0] * self.part_n_hash_cols
+        if rows > self._ssd_host_weight.shape[0]:
+            raise ValueError("Engram SSD lookup exceeds max_num_batched_tokens")
+        owned_heads = min(self.part_n_hash_cols, self.n_hash_cols - self.head_start)
+        local_ids = np.full(
+            (indices.shape[0], self.part_n_hash_cols), -1, dtype=np.int64
+        )
+        if owned_heads > 0:
+            local_ids[:, :owned_heads] = (
+                indices[:, self.head_start : self.head_start + owned_heads]
+                .cpu()
+                .numpy()
+                .astype(np.int64)
+                - self.vocab_start_idx
+            )
+        return local_ids.reshape(-1)
+
+    def _gather_ssd(self, indices, out):
+        local_ids = self._ssd_local_ids(indices)
+        assert self.ssd_table is not None
+        with optional_phase_profile_stage("engram.ssd_gather", out):
+            return self.ssd_table.gather(local_ids)
+
+    def begin_ssd_lookup(self, indices):
+        """Start CPU reads; fixed host/device staging is untouched until finish."""
+        if self._ssd_prefetch is not None:
+            raise RuntimeError("Engram SSD prefetch must finish before reuse")
+        assert self.ssd_table is not None
+        self._ssd_prefetch = self.ssd_table.prefetch(self._ssd_local_ids(indices))
+
+    def finish_ssd_lookup(self, out):
+        future, self._ssd_prefetch = self._ssd_prefetch, None
+        if future is None:
+            raise RuntimeError("Engram SSD lookup has no pending prefetch")
+        with optional_phase_profile_stage("engram.ssd_gather", out):
+            packed = future.result()
+        self._stage_ssd(packed, out, background=False)
+
+    def discard_ssd_lookup(self):
+        future, self._ssd_prefetch = self._ssd_prefetch, None
+        if future is not None and not future.cancel():
+            future.exception()
+
+    def _stage_ssd(self, packed, out, background):
+        rows = packed.shape[0]
+        if self._ssd_copy_pending:
+            self._ssd_copy_done.synchronize()
+        np.copyto(self._ssd_host_weight[:rows].numpy(), packed[:, : self.dim])
+        np.copyto(self._ssd_host_scales[:rows].numpy(), packed[:, self.dim :])
+        self._ssd_device_weight[:rows].copy_(
+            self._ssd_host_weight[:rows], non_blocking=True
+        )
+        self._ssd_device_scales[:rows].copy_(
+            self._ssd_host_scales[:rows], non_blocking=True
+        )
+        tiles = triton.cdiv(rows, 16)
+        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        with optional_phase_profile_stage("engram.lookup", out):
+            _engram_lookup_kernel[(grid,)](
+                self._ssd_device_weight,
+                self._ssd_device_scales,
+                self._ssd_row_ids,
+                out,
+                0,
+                rows,
+                rows,
+                self.part_n_hash_cols,
+                1,
+                HEAD_START=0,
+                LOCAL_HEADS=self.part_n_hash_cols,
+                TOTAL_HEADS=self.part_n_hash_cols,
+                DIM=self.dim,
+                QUANT_BLOCK=self.block_size,
+                BLOCK_R=16,
+                GRID=grid,
+            )
+        self._ssd_copy_done.record()
+        self._ssd_copy_pending = True
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
         bf16, gathered from all TP shards."""
@@ -1025,6 +1202,13 @@ class Engram(nn.Module):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            cpu_cache_gb=engram_config.cpu_cache_gb if engram_config else 0.0,
+            ssd_offload_path=engram_config.ssd_offload_path if engram_config else None,
+            ssd_scale_in_ram=engram_config.ssd_scale_in_ram if engram_config else True,
+            ssd_io_workers=engram_config.ssd_io_workers if engram_config else 8,
+            ssd_batch_reads=engram_config.ssd_batch_reads if engram_config else False,
+            cache_key=f"{get_current_vllm_config().model_config.model}:{prefix}",
+            max_tokens=get_current_vllm_config().scheduler_config.max_num_batched_tokens,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

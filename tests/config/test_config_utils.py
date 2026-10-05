@@ -3,12 +3,86 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from vllm.config.cache import CacheConfig
+from vllm.config.engram import EngramConfig
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    [
+        ("cpu", "requires cpu_offload"),
+        ("qwen", "requires DeepSeek"),
+        ("dp", "sharding across DP"),
+        ("v1", "Model Runner V2"),
+        ("ubatch", "ubatching"),
+        ("piecewise", "supports NONE"),
+        ("default", None),
+    ],
+)
+def test_engram_ssd_rejects_paths_that_cannot_prepare_rows(mutation, message):
+    """An accepted SSD config must not silently retain RAM storage or stale rows."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.config.vllm import VllmConfig
+
+    config = SimpleNamespace(
+        engram_config=EngramConfig(cpu_offload=True, ssd_offload_path="/tmp/engram"),
+        model_config=SimpleNamespace(
+            architecture="DeepseekV41ForCausalLM",
+            hf_text_config=SimpleNamespace(engram_layer_ids=[1]),
+        ),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, enable_elastic_ep=False, use_ubatching=False
+        ),
+        use_v2_model_runner=True,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    if mutation == "cpu":
+        config.engram_config.cpu_offload = False
+    elif mutation == "qwen":
+        config.model_config.architecture = "Qwen4ExpForCausalLM"
+        config.model_config.hf_text_config = SimpleNamespace(ple_layer_ids=[1])
+    elif mutation == "dp":
+        config.engram_config.embedding_across_dp = True
+        config.parallel_config.data_parallel_size = 2
+    elif mutation == "v1":
+        config.use_v2_model_runner = False
+    elif mutation == "ubatch":
+        config.parallel_config.use_ubatching = True
+    elif mutation == "piecewise":
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    elif mutation == "default":
+        config.compilation_config.cudagraph_mode = None
+    if message is None:
+        VllmConfig._resolve_and_verify_engram_config(cast(VllmConfig, config))
+        assert (
+            config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+    else:
+        with pytest.raises(ValueError, match=message):
+            VllmConfig._resolve_and_verify_engram_config(cast(VllmConfig, config))
+
+
+@pytest.mark.parametrize("budget", [-1, float("nan"), float("inf")])
+def test_engram_ssd_cache_budget_must_be_bounded(budget):
+    with pytest.raises(ValueError):
+        EngramConfig(
+            cpu_offload=True, ssd_offload_path="/tmp/engram", cpu_cache_gb=budget
+        )
+
+
+@pytest.mark.parametrize("workers", [0, 33])
+def test_engram_ssd_io_workers_are_bounded(workers):
+    with pytest.raises(ValueError):
+        EngramConfig(ssd_io_workers=workers)
+
 
 # Helpers
 
@@ -114,7 +188,7 @@ def test_normalize_value_uuid_and_to_json():
     [
         (lambda x: x),
         (type("CallableInstance", (), {"__call__": lambda self: 0}))(),
-        (lambda: (lambda: 0))(),  # nested function instance
+        (lambda: lambda: 0)(),  # nested function instance
     ],
 )
 def test_error_cases(bad):

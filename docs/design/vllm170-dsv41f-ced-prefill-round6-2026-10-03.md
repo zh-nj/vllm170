@@ -1,7 +1,8 @@
 # DSV41F prefill 第六轮：BM16 小尾块与 persistent 调度
 
 日期：2026-10-03。配置保持 DSpark=5、CED 开启，基线是第五轮
-已上线的 M=2044 BM128 pairs / BM64 tails；包含尚未提交的第五轮适配。
+已上线的 M=2044 BM128 pairs / BM64 tails。第五、六轮代码已一起
+提交为 `a33bd2b5cb`。
 原始记录：`artifacts/dsv41f-ced-prefill-round6-20261003/`。
 
 ## 路由证据与候选

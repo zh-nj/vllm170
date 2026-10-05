@@ -1109,6 +1109,17 @@ class VllmConfig:
             model_config = speculative_config.target_model_config
         self.engram_config.verify_model_config(model_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
+        if self.engram_config.ssd_offload_path:
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            if not self.use_v2_model_runner:
+                raise ValueError("Engram SSD storage requires Model Runner V2")
+            if self.parallel_config.use_ubatching:
+                raise ValueError("Engram SSD storage does not support ubatching")
+            if self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+                raise ValueError(
+                    "Engram SSD storage supports NONE, FULL or FULL_DECODE_ONLY graphs"
+                )
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def __post_init__(self):
@@ -1634,6 +1645,13 @@ class VllmConfig:
 
         else:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        if (
+            self.engram_config is not None
+            and self.engram_config.ssd_offload_path
+            and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+        ):
+            raise ValueError("Engram SSD storage cannot use PIECEWISE CUDA graphs")
 
         if self.cache_config.kv_sharing_fast_prefill:
             if (

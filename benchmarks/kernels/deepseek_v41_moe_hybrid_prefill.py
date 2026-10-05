@@ -12,7 +12,112 @@ import torch
 from vllm.model_executor.layers.fused_moe.experts.dsv41_sm80_hybrid_prefill import (
     HybridRoutes,
     SmallTailRoutes,
+    _prefix_max,
 )
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _emit_metadata(
+    src_ids, src_experts, src, selected, dest, dst_ids, dst_experts, B: tl.constexpr
+):
+    lane = tl.arange(0, B)
+    ids = tl.load(
+        src_ids + src[:, None] * 64 + lane[None, :], selected[:, None], other=0
+    )
+    tl.store(dst_ids + dest[:, None] * B + lane[None, :], ids, selected[:, None])
+    expert = tl.load(src_experts + src, selected, other=0)
+    tl.store(dst_experts + dest, expert, selected)
+
+
+@triton.jit
+def _fused_metadata(
+    ids,
+    experts,
+    post_pad,
+    counts,
+    large_ids,
+    large_experts,
+    small_ids,
+    small_experts,
+    tiny_ids,
+    tiny_experts,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    i = tl.arange(0, BLOCK)
+    n = tl.load(post_pad) // 64
+    eid = tl.load(experts + i, i < n, other=-1)
+    prev = tl.load(experts + i - 1, (i > 0) & (i < n), other=-1)
+    nxt = tl.load(experts + i + 1, i + 1 < n, other=-2)
+    start = tl.associative_scan(tl.where((i < n) & (eid != prev), i, 0), 0, _prefix_max)
+    first = (i < n) & (((i - start) % 2) == 0)
+    pair = first & (eid == nxt)
+    tail = first & (eid != nxt)
+    slot16 = tl.load(ids + i * 64 + 16, tail, other=SLOTS)
+    tiny = tail & (slot16 >= SLOTS)
+    tail = tail & ~tiny
+    source = tl.program_id(0) * GROUP + tl.arange(0, GROUP)
+    pair_dst = tl.cumsum(pair.to(tl.int32)) - 1
+    tail_dst = tl.cumsum(tail.to(tl.int32)) - 1
+    tiny_dst = tl.cumsum(tiny.to(tl.int32)) - 1
+    _emit_metadata(
+        ids,
+        experts,
+        source,
+        tl.gather(pair.to(tl.int32), source, 0) != 0,
+        tl.gather(pair_dst, source, 0),
+        large_ids,
+        large_experts,
+        128,
+    )
+    _emit_metadata(
+        ids,
+        experts,
+        source,
+        tl.gather(tail.to(tl.int32), source, 0) != 0,
+        tl.gather(tail_dst, source, 0),
+        small_ids,
+        small_experts,
+        64,
+    )
+    _emit_metadata(
+        ids,
+        experts,
+        source,
+        tl.gather(tiny.to(tl.int32), source, 0) != 0,
+        tl.gather(tiny_dst, source, 0),
+        tiny_ids,
+        tiny_experts,
+        16,
+    )
+    if tl.program_id(0) == 0:
+        tl.store(counts, tl.sum(pair.to(tl.int32)) * 128)
+        tl.store(counts + 1, tl.sum(tail.to(tl.int32)) * 64)
+        tl.store(counts + 2, tl.sum(tiny.to(tl.int32)) * 16)
+
+
+class FusedMetadataRoutes(SmallTailRoutes):
+    """Experimental single-launch partition and copies of accepted route lists."""
+
+    def update(self, aligned):
+        ids, experts, post_pad = aligned
+        group = min(8, triton.next_power_of_2(experts.numel()))
+        _fused_metadata[(triton.cdiv(experts.numel(), group),)](
+            ids,
+            experts,
+            post_pad,
+            self.counts,
+            *self.large,
+            *self.small,
+            *self.tiny,
+            SLOTS=self.slots,
+            BLOCK=triton.next_power_of_2(experts.numel()),
+            GROUP=group,
+            num_warps=4,
+        )
+        return self.metadata()
 
 
 def histogram_routes(counts, topk=6, seed=41):
@@ -101,7 +206,9 @@ def make_calls(
             gemm(a, scales, weights, rw, baseline_out, aligned, 64, stage)
         else:
             baseline_hybrid.update(aligned)
-            for b, meta in zip((128, 64), baseline_hybrid.metadata(), strict=True):
+            for b, meta in zip(
+                baseline_hybrid.block_sizes, baseline_hybrid.metadata(), strict=True
+            ):
                 gemm(a, scales, weights, rw, baseline_out, meta, b, stage)
 
     def candidate():
@@ -141,8 +248,14 @@ def main():
         type=Path,
         default=Path("artifacts/dsv41f-ced-prefill-round2-20261002"),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--small-tail", action="store_true", help="Compare BM16 tails to current hybrid"
+    )
+    mode.add_argument(
+        "--fused-metadata",
+        action="store_true",
+        help="Fold partition and copies into one launch",
     )
     parser.add_argument(
         "--round5",
@@ -162,12 +275,23 @@ def main():
     info.pop("clock_and_power", None)
     result = {
         "environment": info,
-        "variant": "small_tail" if args.small_tail else "hybrid",
+        "variant": "fused_metadata"
+        if args.fused_metadata
+        else "small_tail"
+        if args.small_tail
+        else "hybrid",
         "timing_boundary": "route repartition/copies plus one W13 or W2 GEMM stage",
         "correctness": [],
         "timing": [],
     }
-    route_class = SmallTailRoutes if args.small_tail else HybridRoutes
+    route_class = (
+        FusedMetadataRoutes
+        if args.fused_metadata
+        else SmallTailRoutes
+        if args.small_tail
+        else HybridRoutes
+    )
+    captured_dspark = args.small_tail or args.fused_metadata
     torch.manual_seed(41)
 
     def save():
@@ -228,7 +352,7 @@ def main():
                 (args.round2 / "candidate-validation.json").read_text()
             )["corpus_routes"],
         }
-        if args.small_tail:
+        if captured_dspark:
             profiles = {
                 "corpus": next(
                     p
@@ -263,10 +387,10 @@ def main():
                 )
                 ids = (
                     torch.tensor(route["ids"], dtype=torch.int32, device=device)
-                    if args.small_tail
+                    if captured_dspark
                     else histogram_routes(route["counts"]).to(device)
                 )
-                assert ids.shape == ((2044 if args.small_tail else 2048), 6)
+                assert ids.shape == ((2044 if captured_dspark else 2048), 6)
                 assert (
                     torch.bincount(ids.flatten().long(), minlength=384).cpu().tolist()
                     == route["counts"]
@@ -279,7 +403,7 @@ def main():
                 a = torch.randint(-127, 128, (rows, k), dtype=torch.int8, device=device)
                 scales = activation_scales(rows, device, "varied")
                 rw = torch.full(ids.shape, 1 / 6, dtype=torch.float32, device=device)
-                if args.small_tail:
+                if captured_dspark:
                     rw.copy_(torch.tensor(route["weights"], device=device))
                 baseline_out = torch.empty(
                     (ids.numel(), n), dtype=torch.bfloat16, device=device
@@ -296,7 +420,11 @@ def main():
                     aligned,
                     hybrid,
                     stage,
-                    HybridRoutes(ids.numel(), 384, device) if args.small_tail else None,
+                    SmallTailRoutes(ids.numel(), 384, device)
+                    if args.fused_metadata
+                    else HybridRoutes(ids.numel(), 384, device)
+                    if args.small_tail
+                    else None,
                 )
                 baseline()
                 candidate()
@@ -324,7 +452,7 @@ def main():
                         "routing_scope": (
                             "DSpark5 M2044 captured corpus routes/weights or synthetic "
                             "six-hot-expert routes; synthetic activations/weights."
-                            if args.small_tail
+                            if captured_dspark
                             else "Captured histogram; synthetic row order, "
                             "activations and weights."
                         ),

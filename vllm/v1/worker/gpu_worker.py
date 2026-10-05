@@ -1562,12 +1562,12 @@ class Worker(WorkerBase):
 def _dsv41_sm80_target_prepare_ahead(
     vllm_config: VllmConfig, use_v2_model_runner: bool, device: torch.device
 ) -> bool:
-    """Opt in to preparing DSV41F inputs before receiving the PP header."""
+    """Prepare supported DSV41F inputs before receiving the PP header by default."""
     extra = vllm_config.additional_config
     enabled = (
-        extra.get("dsv41_sm80_target_prepare_ahead", False)
+        extra.get("dsv41_sm80_target_prepare_ahead", True)
         if isinstance(extra, dict)
-        else False
+        else True
     )
     if not isinstance(enabled, bool):
         raise ValueError("dsv41_sm80_target_prepare_ahead must be a JSON boolean")

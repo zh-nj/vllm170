@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import bisect
+import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -518,6 +520,7 @@ def test_v2_model_state_gathers_lookback_window():
     state.rope_state = None
     state.supports_mm_inputs = False
     state.prompt_embeds_state = None
+    state.ced_prefill_enabled = state.fast_prefill_enabled = False
     state.lookback_token_ids = torch.full(
         (max_num_reqs, depth), -1, dtype=torch.int32, device="cuda"
     )
@@ -590,42 +593,161 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
     return layer
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-def test_engram_ssd_fifo_cache_hits_and_evicts_in_order(monkeypatch, tmp_path):
-    rows, dim, cache_rows = 4096, 256, 2
-    row_bytes = dim + dim // 32
-    cpu_cache_gb = (cache_rows * row_bytes + 1) / 1024**3
+def _make_ssd_embedding(monkeypatch, tmp_path, rows, dim, cache_rows=0, **kwargs):
     monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    row_bytes = dim + dim // 32
     with torch.device("cuda"):
-        layer = ParallelEngramEmbedding(
+        return ParallelEngramEmbedding(
             rows,
             dim,
             (rows,),
             cpu_offload=True,
-            cpu_cache_gb=cpu_cache_gb,
+            cpu_cache_gb=(cache_rows * row_bytes + 0.5) / 1024**3,
             ssd_offload_path=str(tmp_path),
             cache_key="test",
+            max_tokens=kwargs.pop("max_tokens", 256),
+            **kwargs,
         )
 
-    weight = (torch.randn(rows, dim) * 4).to(torch.float8_e4m3fn)
-    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+
+def _load_ssd(layer, weight, scales):
     layer.weight.weight_loader(layer.weight, weight)
     layer.weight_scale_inv.weight_loader(
-        layer.weight_scale_inv,
-        scales.view(torch.float8_e8m0fnu),
+        layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
     )
 
-    assert layer.ram_num_embeddings == 0
-    assert layer.ssd_num_embeddings == rows
-    assert layer.cache_num_embeddings == cache_rows
+
+def _make_cpu_ssd_table(
+    tmp_path,
+    rows=768,
+    dim=64,
+    scale_in_ram=True,
+    workers=8,
+    batch_reads=True,
+):
+    from vllm.models.deepseek_v4_1.common.engram_ssd import SSDTable
+
+    table = SSDTable(
+        str(tmp_path),
+        "cpu-test",
+        rows,
+        dim,
+        32,
+        0,
+        0.0,
+        scale_in_ram=scale_in_ram,
+        io_workers=workers,
+        batch_reads=batch_reads,
+    )
+    weight = np.arange(rows * dim, dtype=np.uint8).reshape(rows, dim)
+    scales = np.arange(rows * (dim // 32), dtype=np.uint8).reshape(rows, dim // 32)
+    table.load("weight", torch.from_numpy(weight))
+    table.load("scale", torch.from_numpy(scales))
+    return table, weight, scales
+
+
+@pytest.mark.parametrize("scale_in_ram", [False, True])
+@pytest.mark.parametrize("workers", [1, 8])
+@pytest.mark.parametrize("warm", [False, True])
+def test_engram_ssd_cpu_batch_read_gate(
+    monkeypatch, tmp_path, scale_in_ram, workers, warm
+):
+    """Batch reads preserve raw rows and mmap only on the intended path."""
+    from vllm.models.deepseek_v4_1.common import engram_ssd
+
+    table, weight, scales = _make_cpu_ssd_table(
+        tmp_path, scale_in_ram=scale_in_ram, workers=workers
+    )
+    monkeypatch.setattr(engram_ssd, "_PARALLEL_READ_NS", 10**18 if warm else 0)
+    indices = np.concatenate(
+        (np.arange(600, dtype=np.int64), np.array([3, 599, -1, 768]))
+    )
+    valid = (indices >= 0) & (indices < len(weight))
+    expected = np.zeros((len(indices), table.row_bytes), dtype=np.uint8)
+    expected[valid] = np.concatenate(
+        (weight[indices[valid]], scales[indices[valid]]), axis=1
+    )
+    try:
+        actual = table.gather(indices)
+        repeated = table.gather(indices)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(repeated, expected)
+        should_map = warm and scale_in_ram and workers > 1
+        assert (table._mapped_weight is not None) is should_map
+    finally:
+        table.close()
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_engram_ssd_cpu_batch_read_disabled_never_maps(monkeypatch, tmp_path, warm):
+    """The legacy preadv path remains selected when batch reads are disabled."""
+    from vllm.models.deepseek_v4_1.common import engram_ssd
+
+    table, weight, scales = _make_cpu_ssd_table(
+        tmp_path, scale_in_ram=True, workers=8, batch_reads=False
+    )
+    monkeypatch.setattr(engram_ssd, "_PARALLEL_READ_NS", 10**18 if warm else 0)
+    indices = np.arange(600, dtype=np.int64)
+    expected = np.concatenate((weight[indices], scales[indices]), axis=1)
+    try:
+        np.testing.assert_array_equal(table.gather(indices), expected)
+        assert table._mapped_weight is None
+    finally:
+        table.close()
+
+
+def test_engram_ssd_cpu_prefetch_copies_indices_and_close_drains(monkeypatch, tmp_path):
+    """Prefetch owns its IDs, propagates through close, and rejects reuse."""
+    table, weight, scales = _make_cpu_ssd_table(
+        tmp_path, rows=16, dim=64, scale_in_ram=True, workers=1
+    )
+    indices = np.array([0, 3, 3, -1, 16], dtype=np.int64)
+    original_indices = indices.copy()
+    expected = np.zeros((len(indices), table.row_bytes), dtype=np.uint8)
+    valid = (original_indices >= 0) & (original_indices < len(weight))
+    expected[valid] = np.concatenate(
+        (weight[original_indices[valid]], scales[original_indices[valid]]), axis=1
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_gather = table.gather
+
+    def gated_gather(request_indices):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("prefetch gather was not released")
+        return original_gather(request_indices)
+
+    monkeypatch.setattr(table, "gather", gated_gather)
+    future = table.prefetch(indices)
+    assert entered.wait(5)
+    indices.fill(-1)
+    closer = threading.Thread(target=table.close)
+    closer.start()
+    release.set()
+    closer.join(5)
+    assert not closer.is_alive()
+    np.testing.assert_array_equal(future.result(), expected)
+    with pytest.raises(RuntimeError, match="closed"):
+        table.prefetch(original_indices)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_ssd_fifo_cache_hits_and_evicts_in_order(monkeypatch, tmp_path):
+    """Cache eviction must not change rows in a request larger than the cache."""
+    rows, dim = 4096, 256
+    layer = _make_ssd_embedding(
+        monkeypatch, tmp_path, rows, dim, cache_rows=2, max_tokens=2048
+    )
+    weight = (torch.randn(rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+    _load_ssd(layer, weight, scales)
     assert layer.weight.shape[0] == 0
-    assert layer._ssd_weight_u8 is not None
-    assert layer._ssd_weight_u8.device.type == "cpu"
-    assert layer._cache_weight_u8 is not None
-    assert layer._cache_weight_u8.device.type == "cpu"
-    assert all(parameter.device.type == "cpu" for parameter in layer.parameters())
-    assert not any(buffer.is_cuda for buffer in layer.buffers() if buffer.numel())
+    table = layer.ssd_table
+    assert table.capacity == 2
+    assert table.cache.is_pinned()
+    assert all(p.device.type == "cpu" for p in layer.parameters())
 
     def lookup(row_ids):
         ids = torch.tensor(row_ids, dtype=torch.int32, device="cuda")[:, None]
@@ -635,126 +757,269 @@ def test_engram_ssd_fifo_cache_hits_and_evicts_in_order(monkeypatch, tmp_path):
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     lookup([0, 1])
-    assert layer._cache_keys.tolist() == [0, 1]
-    assert (layer._cache_hits, layer._cache_misses) == (0, 2)
+    assert table.keys.tolist() == [0, 1]
     lookup([0, 2])
-    assert layer._cache_keys.tolist() == [2, 1]
-    assert layer._cache_index[:3].tolist() == [-1, 1, 0]
-    assert (layer._cache_hits, layer._cache_misses) == (1, 3)
+    assert table.keys.tolist() == [2, 1]
     lookup([1, 3])
-    assert layer._cache_keys.tolist() == [2, 3]
-    assert layer._cache_index[:4].tolist() == [-1, -1, 0, 1]
-    assert (layer._cache_hits, layer._cache_misses) == (2, 4)
+    assert table.keys.tolist() == [2, 3]
+    assert (table.hits, table.misses) == (2, 4)
+    lookup([0, 1, 2, 3, 0, 2, -1, rows])
+    assert len(table.index) == table.capacity
+    # Rows cached at batch entry remain usable after earlier FIFO insertions.
+    lookup([0, 2, 3])
+    assert table.keys.tolist() == [3, 2]
+    assert (table.hits, table.misses) == (2, 11)
+    lookup([2, 3] * 512)
+    assert table.keys.tolist() == [3, 2]
+    assert (table.hits, table.misses) == (4, 11)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-@pytest.mark.parametrize("gpu_dequant", [False, True])
-def test_engram_full_ram_reuses_converted_ssd_table(monkeypatch, tmp_path, gpu_dequant):
-    """A full host-RAM budget preloads SSD data and skips checkpoint copies."""
+def test_engram_ssd_reuses_only_complete_matching_checkpoint(monkeypatch, tmp_path):
+    """Restart reuse requires provenance; truncated or replaced files reload."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from vllm.models.deepseek_v4_1.common.engram_ssd import SSDTable
+
     rows, dim = 64, 64
-    row_bytes = dim + dim // 32
-    cpu_cache_gb = (rows * row_bytes + 1) / 1024**3
-    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        engram_ops.envs,
-        "VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT",
-        gpu_dequant,
-    )
-
-    weight = (torch.randn(rows, dim) * 4).to(torch.float8_e4m3fn)
+    checkpoint = tmp_path / "source.safetensors"
+    cache = tmp_path / "cache"
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
     scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
-    cache_id = engram_ops.hashlib.sha256(
-        f"full-ram:{rows}:{dim}:{(rows,)}:0:{rows}".encode()
-    ).hexdigest()[:20]
-    (tmp_path / f"{cache_id}.weight.u8").write_bytes(
-        weight.view(torch.uint8).numpy().tobytes()
-    )
-    (tmp_path / f"{cache_id}.scale.u8").write_bytes(scales.numpy().tobytes())
+    save_file({"weight": weight, "scale": scales}, checkpoint)
 
-    with torch.device("cuda"):
-        second = ParallelEngramEmbedding(
-            rows,
-            dim,
-            (rows,),
-            cpu_offload=True,
-            cpu_cache_gb=cpu_cache_gb,
-            ssd_offload_path=str(tmp_path),
-            cache_key="full-ram",
-        )
+    def load():
+        layer = _make_ssd_embedding(monkeypatch, cache, rows, dim)
+        with safe_open(checkpoint, framework="pt", device="cpu") as file:
+            _load_ssd(layer, file.get_tensor("weight"), file.get_tensor("scale"))
+        return layer
 
-    assert second._full_ram
-    assert second._ram_preloaded
-    assert second.ssd_num_embeddings == 0
-    assert second.weight.shape == weight.shape
-    assert not second.weight.is_pinned()
-    replacement = torch.zeros_like(weight)
-    second.weight.weight_loader(second.weight, replacement)
-    torch.testing.assert_close(second.weight, weight, rtol=0, atol=0)
+    first = load()
+    paths = list(cache.glob("*.u8"))
+    before = {p: p.stat().st_ino for p in paths}
+    second = load()
+    assert before == {p: p.stat().st_ino for p in paths}
+    # The source mtime/size/inode and tensor offset are part of the manifest.
+    save_file({"weight": torch.zeros_like(weight), "scale": scales}, checkpoint)
+    third = load()
     ids = torch.tensor([[0], [7], [31], [63]], dtype=torch.int32, device="cuda")
-    out = torch.empty(4, 1, dim, dtype=torch.bfloat16, device="cuda")
-    second.lookup(ids, out)
     expected = _reference_lookup(weight.cuda(), scales.cuda(), ids, 0, rows)
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    assert bool(second._host_ram_staging_weight_u8) is gpu_dequant
-    if gpu_dequant:
-        assert all(tensor.is_pinned() for tensor in second._host_ram_staging_weight_u8)
-        assert all(tensor.is_cuda for tensor in second._device_staging_weight_u8)
+    torch.testing.assert_close(first(ids), expected, rtol=0, atol=0)
+    torch.testing.assert_close(second(ids), expected, rtol=0, atol=0)
+    assert torch.count_nonzero(third(ids)) == 0
+    # A failed generation is not accepted solely because a file exists.
+    with open(next(p for p in paths if ".weight." in p.name), "wb") as file:
+        file.write(b"incomplete")
+    fourth = load()
+    assert torch.count_nonzero(fourth(ids)) == 0
+    assert all(p.stat().st_size in (rows * dim, rows * dim // 32) for p in paths)
+    assert isinstance(fourth.ssd_table, SSDTable)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 256])
-def test_engram_host_ram_gpu_dequant_matches_torch(background, num_tokens):
-    """Raw staging preserves unowned rows and remains exact after slot reuse."""
-    layer = _make_embedding(cpu_offload=True)
-    weight = torch.empty(layer.weight.shape, dtype=layer.weight.dtype, device="cpu")
-    scales = torch.empty(
-        layer.weight_scale_inv.shape,
-        dtype=layer.weight_scale_inv.dtype,
-        device="cpu",
+@pytest.mark.parametrize("scale_in_ram,workers", [(True, 1), (True, 8), (False, 8)])
+def test_engram_ssd_staging_reuse_matches_torch(
+    monkeypatch, tmp_path, background, num_tokens, scale_in_ram, workers
+):
+    """Uncached reads stay exact when staging slots are reused across streams."""
+    rows, dim = 4096, 256
+    from vllm.models.deepseek_v4_1.common import engram_ssd
+
+    monkeypatch.setattr(engram_ssd, "_PARALLEL_READ_NS", 0)
+    layer = _make_ssd_embedding(
+        monkeypatch,
+        tmp_path,
+        rows,
+        dim,
+        ssd_scale_in_ram=scale_in_ram,
+        ssd_io_workers=workers,
     )
-    weight.copy_(layer.weight)
-    scales.copy_(layer.weight_scale_inv)
-    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-    layer.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
-    layer.cache_key = "gpu-dequant-test"
-    layer._full_ram = True
-    layer._full_ram_gpu_dequant = True
-
-    for _ in range(engram_ops._HOST_RAM_STAGING_SLOTS + 1):
-        ids = torch.randint(
-            0,
-            layer.part_num_embeddings,
-            (num_tokens, layer.n_hash_cols),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        expected = _reference_lookup(
-            weight.cuda(),
-            scales.cuda(),
-            ids,
-            layer.vocab_start_idx,
-            layer.vocab_end_idx,
-        )
-        out = torch.empty(
-            num_tokens,
-            layer.part_n_hash_cols,
-            layer.dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        layer.lookup(ids, out, background=background)
-        assert torch.equal(out, expected)
-
-    assert all(tensor.is_pinned() for tensor in layer._host_ram_staging_weight_u8)
-    assert all(tensor.is_cuda for tensor in layer._device_staging_weight_u8)
+    weight = (torch.randn(rows, dim) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+    _load_ssd(layer, weight, scales)
+    outputs, expected = [], []
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for step in range(3):
+        with torch.cuda.stream(stream if step % 2 else torch.cuda.current_stream()):
+            ids = torch.randint(
+                -1, rows + 1, (num_tokens, 1), dtype=torch.int32, device="cuda"
+            )
+            expected.append(
+                _reference_lookup(weight.cuda(), scales.cuda(), ids, 0, rows)
+            )
+            out = torch.empty(num_tokens, 1, dim, dtype=torch.bfloat16, device="cuda")
+            layer.lookup(ids, out, background=background)
+            outputs.append(out)
+    torch.cuda.current_stream().wait_stream(stream)
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    assert layer.ssd_table.capacity == 0
+    assert (layer.ssd_table._scales is not None) == scale_in_ram
+    if num_tokens == 256 and workers > 1:
+        assert layer.ssd_table._io_pool is not None
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_ssd_parallel_read_failure_keeps_cache_valid(monkeypatch, tmp_path):
+    """All reader tasks must finish before a failed gather leaves its buffers."""
+    from vllm.models.deepseek_v4_1.common import engram_ssd
+
+    monkeypatch.setattr(engram_ssd, "_PARALLEL_READ_NS", 0)
+    rows, dim = 256, 64
+    layer = _make_ssd_embedding(monkeypatch, tmp_path, rows, dim, cache_rows=2)
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    scales = torch.full((rows, dim // 32), 127, dtype=torch.uint8)
+    _load_ssd(layer, weight, scales)
+    table = layer.ssd_table
+    table.gather(np.array([0, 1]))
+    initial = table.cache.clone()
+    read = table._read_into
+
+    def faulty_read(fd, payload, offset):
+        if offset == 100 * dim:
+            raise OSError("SSD read failed")
+        read(fd, payload, offset)
+
+    monkeypatch.setattr(table, "_read_into", faulty_read)
+    with pytest.raises(OSError, match="SSD read failed"):
+        table.gather(np.arange(2, 130))
+    assert table.keys.tolist() == [0, 1]
+    assert table.index == {0: 0, 1: 1}
+    torch.testing.assert_close(table.cache, initial, rtol=0, atol=0)
+
+    ids = torch.full((2, 1), 100, dtype=torch.int32, device="cuda")
+    output = torch.empty(2, 1, dim, dtype=torch.bfloat16, device="cuda")
+    layer.begin_ssd_lookup(ids)
+    with pytest.raises(OSError, match="SSD read failed"):
+        layer.finish_ssd_lookup(output)
+    assert layer._ssd_prefetch is None
+
+    monkeypatch.setattr(table, "_read_into", read)
+    layer.begin_ssd_lookup(ids)
+    layer.finish_ssd_lookup(output)
+    assert layer._ssd_prefetch is None
+    expected = _reference_lookup(weight.cuda(), scales.cuda(), ids, 0, rows)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_engram_ssd_prepared_rows_refresh_before_full_graph(
+    monkeypatch, tmp_path, prefetch
+):
+    """The actual model-state hook must refresh persistent rows and masks."""
+    from vllm.models.deepseek_v4_1.common.mm_preprocess import (
+        IMAGE_SENTINEL_BASE_ID,
+        image_sentinel_mask,
+    )
+    from vllm.models.deepseek_v4_1.nvidia.model import DeepseekV4Model
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+
+    rows, dim = 64, 64
+    layer = _make_ssd_embedding(monkeypatch, tmp_path, rows, dim, cache_rows=2)
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    scales = torch.full((rows, dim // 32), 127, dtype=torch.uint8)
+    _load_ssd(layer, weight, scales)
+    engram = Engram.__new__(Engram)
+    torch.nn.Module.__init__(engram)
+    engram.embed_tokens, engram.layer_hash_index = layer, 0
+    engram.use_sequence_parallel = False
+    engram.staged_rows = torch.zeros(3, 1, dim, dtype=torch.bfloat16, device="cuda")
+
+    class Hash(torch.nn.Module):
+        use_slot_cache = False
+
+        def ensure_cache(self):
+            return True
+
+        def forward(self, input_ids, *args):
+            return (input_ids % rows)[:, None, None].to(torch.int32)
+
+    model = DeepseekV4Model.__new__(DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.engram_hash = Hash()
+    model.engram_swa_prefix, model._ssd_engram = "swa", True
+    model._ssd_prefetch_enabled = prefetch
+    model._pending_engram_rows = None
+    owner = torch.nn.Module()
+    owner.engram = engram
+    model.layers = torch.nn.ModuleList([owner])
+    model.start_layer, model.end_layer = 0, 1
+    model._prepared_engram_hashes = torch.empty(
+        3, 1, 1, dtype=torch.int32, device="cuda"
+    )
+    model._prepared_engram_mask = torch.empty(3, dtype=torch.bool, device="cuda")
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.model = model
+    inputs = {
+        "input_ids": torch.tensor([0, 1, 2], device="cuda"),
+        "positions": torch.arange(3, device="cuda"),
+        "lookback_token_ids": torch.full((1, 3), -1, device="cuda"),
+    }
+    metadata = {
+        "swa": SimpleNamespace(
+            query_start_loc=None, slot_mapping=None, block_table=None
+        )
+    }
+    if prefetch:
+        staged_before = engram.staged_rows.clone()
+        state.prepare_pp_independent_inputs(inputs, metadata)
+        torch.testing.assert_close(engram.staged_rows, staged_before, rtol=0, atol=0)
+        with pytest.raises(RuntimeError, match="must finish"):
+            state.prepare_pp_independent_inputs(inputs, metadata)
+    state.prepare_full_cudagraph_inputs(inputs, metadata)
+    output = torch.empty_like(engram.staged_rows)
+    output_mask = torch.empty_like(model._prepared_engram_mask)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.copy_(engram.embed(model._prepared_engram_hashes[:, 0]))
+        output_mask.copy_(model._prepared_engram_mask)
+    for ids in ([4, 5, 6], [0, IMAGE_SENTINEL_BASE_ID, 1], [0, 2, 1]):
+        inputs["input_ids"].copy_(torch.tensor(ids, device="cuda"))
+        if prefetch:
+            staged_before = engram.staged_rows.clone()
+            state.prepare_pp_independent_inputs(inputs, metadata)
+            torch.testing.assert_close(
+                engram.staged_rows, staged_before, rtol=0, atol=0
+            )
+        state.prepare_full_cudagraph_inputs(inputs, metadata)
+        graph.replay()
+        hashed_ids = inputs["input_ids"] % rows
+        expected = _reference_lookup(
+            weight.cuda(), scales.cuda(), hashed_ids[:, None], 0, rows
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        assert inputs["engram_embeddings_prepared"]
+        assert torch.equal(model._prepared_engram_hashes[:, 0, 0], hashed_ids)
+        assert torch.equal(output_mask, ~image_sentinel_mask(inputs["input_ids"]))
+
+    if prefetch:
+        inputs["input_ids"].copy_(torch.tensor([8, 9, 10], device="cuda"))
+        state.prepare_pp_independent_inputs(inputs, metadata)
+        hashes, mask = model._prepare_engram_rows(
+            inputs["input_ids"],
+            inputs["positions"],
+            inputs["lookback_token_ids"],
+            metadata,
+        )
+        expected = _reference_lookup(
+            weight.cuda(), scales.cuda(), hashes[:, 0], 0, rows
+        )
+        torch.testing.assert_close(engram.embed(hashes[:, 0]), expected, rtol=0, atol=0)
+        assert torch.equal(mask, ~image_sentinel_mask(inputs["input_ids"]))
+        assert model._pending_engram_rows is None
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("cpu_offload", [False, True, "ssd"])
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeypatch):
+def test_engram_head_shards_reconstruct_checkpoint(
+    cpu_offload, tp_size, monkeypatch, tmp_path
+):
     """Keep complete buckets and reconstruct head order, including TP padding."""
     head_sizes = (17, 19, 23, 29, 31, 37)
     num_rows, dim = sum(head_sizes), 64
@@ -781,7 +1046,11 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         )
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
-                num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
+                num_rows + 7,
+                dim,
+                head_sizes,
+                cpu_offload=bool(cpu_offload),
+                ssd_offload_path=str(tmp_path) if cpu_offload == "ssd" else None,
             )
         layer.weight.weight_loader(layer.weight, weight)
         layer.weight_scale_inv.weight_loader(
