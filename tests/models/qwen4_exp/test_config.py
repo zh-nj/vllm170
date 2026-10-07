@@ -85,6 +85,54 @@ def test_qwen4_exp_marlin_decode_block_size_is_exact_sm80_tuning(
     assert actual == expected
 
 
+@pytest.mark.parametrize(
+    ("enabled", "speculation", "sm80", "tp_size", "quantization", "standard"),
+    [
+        (True, False, True, 1, "inc", True),
+        (False, False, True, 1, "inc", False),
+        (True, True, True, 1, "inc", False),
+        (True, False, False, 1, "inc", False),
+        (True, False, True, 2, "inc", False),
+        (True, False, True, 1, "modelopt_fp4", False),
+    ],
+)
+def test_standard_gdn_preserves_speculation_and_non_target_paths(
+    enabled, speculation, sm80, tp_size, quantization, standard, monkeypatch
+) -> None:
+    from vllm.models.qwen4_exp.nvidia import model as model_module
+
+    def initialize(layer, *args):
+        torch.nn.Module.__init__(layer)
+        layer.tp_size = tp_size
+        layer.head_k_dim = layer.head_v_dim = 128
+        layer.enable_fused_gdn_decode = True
+        layer.in_proj_qkvz = layer.in_proj_ba = None
+        layer.gqa_interleaved_layout = False
+
+    config = SimpleNamespace(hidden_size=2560)
+    vllm_config = SimpleNamespace(
+        speculative_config=object() if speculation else None,
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        quant_config=SimpleNamespace(get_name=lambda: quantization),
+    )
+    monkeypatch.setattr(
+        model_module.envs, "VLLM_QWEN4_EXP_GDN_STANDARD_DECODE", enabled
+    )
+    with (
+        patch.object(model_module.QwenGatedDeltaNetAttention, "__init__", initialize),
+        patch.object(
+            model_module.current_platform, "is_device_capability", return_value=sm80
+        ),
+        patch.object(
+            model_module,
+            "can_use_qwen4_exp_sm80_gdn_input_projection",
+            return_value=False,
+        ),
+    ):
+        layer = model_module.Qwen4ExpGatedDeltaNetAttention(config, vllm_config)
+    assert layer.enable_fused_gdn_decode is not standard
+
+
 def test_qwen4_exp_loads_vision_tower_only_on_first_pp_rank() -> None:
     from vllm.model_executor.models.utils import StageMissingLayer
     from vllm.models.qwen4_exp.nvidia.model import (

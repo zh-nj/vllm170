@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import itertools
+import json
+import statistics
+import time
+from pathlib import Path
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -68,8 +73,75 @@ def benchmark(num_tokens, num_experts, topk, ep_size, provider):
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
+def benchmark_m1_e512_decode(output: str | None) -> None:
+    """Compare alignment dispatch in graphs with amortized host submission."""
+    from vllm.platforms import current_platform
+
+    assert current_platform.is_device_capability((8, 0))
+    set_random_seed(0)
+    ids = get_topk_ids(1, 512, 10)
+    previous = envs.VLLM_MOE_ALIGN_M1_E512_SM80
+    graphs, retained = [], []
+    try:
+        for enabled in (False, True):
+            envs.VLLM_MOE_ALIGN_M1_E512_SM80 = enabled
+            for _ in range(3):
+                moe_align_block_size(ids, 8, 512, ignore_invalid_experts=True)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for _ in range(64):
+                    retained.append(
+                        moe_align_block_size(ids, 8, 512, ignore_invalid_experts=True)
+                    )
+            graphs.append(("candidate" if enabled else "baseline", graph))
+    finally:
+        envs.VLLM_MOE_ALIGN_M1_E512_SM80 = previous
+    for _, graph in graphs:
+        graph.replay()
+    torch.accelerator.synchronize()
+    for baseline, candidate in zip(retained[63], retained[-1]):
+        torch.testing.assert_close(candidate, baseline, atol=0, rtol=0)
+    warmup_end = time.monotonic() + 2
+    while time.monotonic() < warmup_end:
+        for _, graph in graphs:
+            for _ in range(10):
+                graph.replay()
+        torch.accelerator.synchronize()
+    samples = {name: [] for name, _ in graphs}
+    for repetition in range(11):
+        for name, graph in graphs if repetition % 2 == 0 else reversed(graphs):
+            for _ in range(10):
+                graph.replay()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(50):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end) * 1000 / (50 * 64))
+    result = {
+        "shape": [1, 10],
+        "num_experts": 512,
+        "block_size": 8,
+        "timing": "CUDA Events, 64 alignments per graph, alternating arms",
+        "median_us": {
+            name: statistics.median(times) for name, times in samples.items()
+        },
+        "samples_us": samples,
+    }
+    print(json.dumps(result, indent=2))
+    if output:
+        Path(output).write_text(json.dumps(result, indent=2) + "\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--decode-m1-e512", action="store_true", help="Run the bounded SM80 decode A/B."
+    )
+    parser.add_argument("--output-json", help="Save decode A/B samples.")
     parser.add_argument(
         "--num_experts",
         type=int,
@@ -85,4 +157,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    benchmark.run(print_data=True, show_plots=True)
+    if args.decode_m1_e512:
+        benchmark_m1_e512_decode(args.output_json)
+    else:
+        benchmark.run(print_data=True, show_plots=True)

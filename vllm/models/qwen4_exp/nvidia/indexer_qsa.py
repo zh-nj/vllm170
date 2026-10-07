@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import cast
 
 import torch
@@ -27,6 +28,7 @@ from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
 )
 from .ops.qsa_pre_indexer import qsa_pre_indexer
+from .ops.qsa_prepare import qsa_prepare
 
 
 def apply_qsa_rope(
@@ -197,6 +199,13 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        projected_qk: torch.Tensor | None = None,
+        main_attention: nn.Module | None = None,
+        main_qkv: torch.Tensor | None = None,
+        main_query_out: torch.Tensor | None = None,
+        main_gate_out: torch.Tensor | None = None,
+        main_slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return fixed-width request-relative token indices padded with ``-1``."""
 
@@ -227,11 +236,13 @@ class QSAIndexer(nn.Module):
         hidden_states = hidden_states[:num_tokens]
         positions = positions[..., :num_tokens]
 
-        # Q/K projection
-        with optional_phase_profile_stage(
-            "qsa.indexer.projection", hidden_states, level="detail"
-        ):
-            projected_qk, _ = self.index_qk_proj(hidden_states)
+        if projected_qk is None:
+            with optional_phase_profile_stage(
+                "qsa.indexer.projection", hidden_states, level="detail"
+            ):
+                projected_qk, _ = self.index_qk_proj(hidden_states)
+        else:
+            projected_qk = projected_qk[:num_tokens]
         projected_q, raw_keys = projected_qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -251,7 +262,27 @@ class QSAIndexer(nn.Module):
             with optional_phase_profile_stage(
                 "qsa.indexer.pre_indexer", projected_q, level="detail"
             ):
-                qsa_pre_indexer(
+                prepare: Callable[..., object] = qsa_pre_indexer
+                main_kwargs = {}
+                if main_attention is not None:
+                    assert main_qkv is not None
+                    assert main_slot_mapping is not None
+                    assert main_query_out is not None
+                    assert main_gate_out is not None
+                    prepare = qsa_prepare
+                    main_kwargs = dict(
+                        main_qkv=main_qkv[:num_tokens],
+                        main_q_norm_weight=main_attention.q_norm.weight,
+                        main_k_norm_weight=main_attention.k_norm.weight,
+                        main_eps=main_attention.q_norm.variance_epsilon,
+                        main_kv_cache=main_attention.kv_cache.transpose(1, 2),
+                        main_slot_mapping=main_slot_mapping[:num_tokens],
+                        main_k_scale=1.0,
+                        main_v_scale=1.0,
+                        main_q_out=main_query_out[:num_tokens],
+                        main_gate_out=main_gate_out[:num_tokens],
+                    )
+                prepare(
                     projected_q,
                     raw_keys,
                     positions,
@@ -275,6 +306,7 @@ class QSAIndexer(nn.Module):
                         if raw_key_state_cache.rope_position_cache is not None
                         else None
                     ),
+                    **main_kwargs,
                 )
         else:
             # Unfused reference path

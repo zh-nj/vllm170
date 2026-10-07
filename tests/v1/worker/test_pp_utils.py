@@ -11,6 +11,7 @@ import torch
 
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker import gpu_worker
+from vllm.v1.worker.gpu import qwen_mtp_utils
 from vllm.v1.worker.gpu.pp_utils import (
     PPRecvBufferGuard,
     PPRecvBufferState,
@@ -431,3 +432,210 @@ def test_worker_execute_model_receive_prepare_order(monkeypatch, defer_receive):
         if not defer_receive
         else ["prepare", "receive", "wait", "postprocess", "forward", "send"]
     )
+
+
+class _FullCudaGraphMode:
+    def has_full_cudagraphs(self):
+        return True
+
+
+def _qwen_mtp_pp_config():
+    hf_config = SimpleNamespace(
+        model_type="qwen4_exp",
+        hidden_size=2560,
+        num_hidden_layers=48,
+        num_experts=512,
+    )
+    return SimpleNamespace(
+        additional_config={"qwen4_exp_mtp_pp_optimizations": True},
+        model_config=SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+            quantization="inc",
+            dtype=torch.bfloat16,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=3,
+            enable_adaptive_verification=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        compilation_config=SimpleNamespace(cudagraph_mode=_FullCudaGraphMode()),
+    )
+
+
+def _patch_qwen_mtp_platform(monkeypatch, *, sm80=True):
+    monkeypatch.setattr(
+        qwen_mtp_utils,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability=lambda capability, _: sm80 and capability == 80,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected"),
+    [
+        ("disabled", False),
+        ("other_model", False),
+        ("missing_mtp", False),
+        ("tp2", False),
+        ("k1", False),
+        ("k2", True),
+        ("k4", False),
+        ("maxseq5", False),
+        ("fp16", False),
+        ("sm90", False),
+    ],
+)
+def test_qwen_mtp_pp_optimizations_gate(monkeypatch, mismatch, expected):
+    """The PP relay fast path remains opt-in and target/topology guarded."""
+    _patch_qwen_mtp_platform(monkeypatch, sm80=mismatch != "sm90")
+    config = _qwen_mtp_pp_config()
+
+    if mismatch == "disabled":
+        config.additional_config["qwen4_exp_mtp_pp_optimizations"] = False
+    elif mismatch == "other_model":
+        config.model_config.hf_config.model_type = "other"
+    elif mismatch == "missing_mtp":
+        config.speculative_config = None
+    elif mismatch == "tp2":
+        config.parallel_config.tensor_parallel_size = 2
+    elif mismatch.startswith("k"):
+        config.speculative_config.num_speculative_tokens = int(mismatch[1:])
+    elif mismatch == "maxseq5":
+        config.scheduler_config.max_num_seqs = 5
+    elif mismatch == "fp16":
+        config.model_config.dtype = torch.float16
+
+    assert (
+        qwen_mtp_utils.qwen_mtp_pp_optimizations_enabled(
+            config, torch.device("cuda", 0)
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("feature", "draft_steps", "expected"),
+    [
+        ("qwen4_exp_mtp_pp_optimizations", 2, True),
+        ("qwen4_exp_mtp_pp_optimizations", 3, True),
+        ("qwen4_exp_mtp_prepare_ahead", 2, False),
+        ("qwen4_exp_mtp_prepare_ahead", 3, True),
+        ("qwen4_exp_mtp_prefix_metadata", 2, False),
+        ("qwen4_exp_mtp_prefix_metadata", 3, True),
+        ("qwen4_exp_mtp_metadata_reuse", 2, False),
+        ("qwen4_exp_mtp_metadata_reuse", 3, True),
+    ],
+)
+def test_qwen_mtp_pp_optimizations_gate_accepts_exact_target(
+    monkeypatch, feature, draft_steps, expected
+):
+    """Each candidate requires its own explicit opt-in on the qualified target."""
+    _patch_qwen_mtp_platform(monkeypatch)
+    config = _qwen_mtp_pp_config()
+    config.additional_config = {feature: True}
+    config.speculative_config.num_speculative_tokens = draft_steps
+    assert (
+        qwen_mtp_utils.qwen_mtp_pp_optimizations_enabled(
+            config, torch.device("cuda", 0), feature
+        )
+        is expected
+    )
+    if feature != "qwen4_exp_mtp_pp_optimizations":
+        assert not qwen_mtp_utils.qwen_mtp_pp_optimizations_enabled(
+            config, torch.device("cuda", 0)
+        )
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        "qwen4_exp_mtp_pp_optimizations",
+        "qwen4_exp_mtp_prepare_ahead",
+        "qwen4_exp_mtp_prefix_metadata",
+        "qwen4_exp_mtp_metadata_reuse",
+    ],
+)
+def test_qwen_mtp_pp_optimizations_gate_rejects_non_boolean(monkeypatch, feature):
+    _patch_qwen_mtp_platform(monkeypatch)
+    config = _qwen_mtp_pp_config()
+    config.additional_config[feature] = "true"
+
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        qwen_mtp_utils.qwen_mtp_pp_optimizations_enabled(
+            config, torch.device("cuda", 0), feature
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("column_step", [1, 3])
+@pytest.mark.parametrize("draft_width", [1, 2, 3])
+def test_copy_pp_draft_tokens_strided_source_cuda_graph(
+    dtype, column_step, draft_width
+):
+    """Graph replay copies non-contiguous relay rows and skips freed slots."""
+    from vllm.v1.worker.gpu.qwen_mtp_utils import copy_pp_draft_tokens
+
+    device = torch.device("cuda", 0)
+    torch.accelerator.set_device_index(device)
+    relay_cols = 2 * draft_width + 3 if column_step == 1 else 3 * draft_width
+    relay = torch.empty((3, relay_cols), dtype=dtype, device=device)
+    source = (
+        relay[:, draft_width + 1 : 2 * draft_width + 1]
+        if column_step == 1
+        else relay[:, ::column_step]
+    )
+    idx_mapping = torch.empty(3, dtype=torch.int32, device=device)
+    destination = torch.full((3, draft_width), -99, dtype=dtype, device=device)
+
+    cases = [
+        (
+            list(range(relay.numel())),
+            [2, -1, 0],
+        ),
+        (
+            [100 + value for value in range(relay.numel())],
+            [0, 2, -1],
+        ),
+        (
+            [200 + 2 * value for value in range(relay.numel())],
+            [-1, 1, 2],
+        ),
+    ]
+    for values, indices in cases:
+        relay.copy_(torch.tensor(values, dtype=dtype, device=device).view_as(relay))
+        idx_mapping.copy_(torch.tensor(indices, dtype=torch.int32, device=device))
+        destination.fill_(-99)
+        copy_pp_draft_tokens(destination, source, idx_mapping)
+    torch.accelerator.synchronize(device)
+
+    graph = torch.cuda.CUDAGraph()
+    destination.fill_(-99)
+    with torch.cuda.graph(graph):
+        copy_pp_draft_tokens(destination, source, idx_mapping)
+
+    for values, indices in cases:
+        relay.copy_(torch.tensor(values, dtype=dtype, device=device).view_as(relay))
+        idx_mapping.copy_(torch.tensor(indices, dtype=torch.int32, device=device))
+        destination.fill_(-99)
+        graph.replay()
+        torch.accelerator.synchronize(device)
+
+        source_cpu = source.cpu().tolist()
+        idx_cpu = idx_mapping.cpu().tolist()
+        expected = [[-99] * draft_width for _ in range(3)]
+        for source_row, destination_row in enumerate(idx_cpu):
+            if destination_row >= 0:
+                expected[destination_row] = source_cpu[source_row][:draft_width]
+        assert destination.cpu().tolist() == expected

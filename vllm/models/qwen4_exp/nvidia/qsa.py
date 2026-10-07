@@ -4,24 +4,33 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from typing import ClassVar, cast
 
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.platforms import current_platform
 from vllm.profiler.phase_profile_hook import optional_phase_profile_stage
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -57,6 +66,74 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
+
+
+class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
+    """Pack sharded Q/gate, K, V and replicated indexer Q/K in one GEMM."""
+
+    def __init__(
+        self,
+        qkv_proj: QKVParallelLinear,
+        index_size: int,
+        quant_config: QuantizationConfig | None,
+    ) -> None:
+        self.num_kv_head_replicas = qkv_proj.num_kv_head_replicas
+        super().__init__(
+            input_size=qkv_proj.input_size,
+            output_sizes=[*qkv_proj.output_sizes, index_size * qkv_proj.tp_size],
+            bias=False,
+            params_dtype=qkv_proj.params_dtype,
+            quant_config=quant_config,
+            prefix=qkv_proj.prefix,
+        )
+
+    def _load_shard(
+        self,
+        loader: Callable[..., None],
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | tuple[int, ...] | None,
+    ) -> None:
+        tp_rank = self.tp_rank
+        param_tp_rank = getattr(param, "tp_rank", None)
+        if loaded_shard_id == 3:
+            shard_rank = 0
+        elif loaded_shard_id in (1, 2):
+            shard_rank = tp_rank // self.num_kv_head_replicas
+        else:
+            shard_rank = tp_rank
+        self.tp_rank = shard_rank
+        if param_tp_rank is not None:
+            param.tp_rank = shard_rank
+        try:
+            loader(param, loaded_weight, loaded_shard_id)
+        finally:
+            self.tp_rank = tp_rank
+            if param_tp_rank is not None:
+                param.tp_rank = param_tp_rank
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None) -> None:
+        self._load_shard(super().weight_loader, param, loaded_weight, loaded_shard_id)
+
+    def weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None) -> None:
+        self._load_shard(
+            super().weight_loader_v2, param, loaded_weight, loaded_shard_id
+        )
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        def remap_shards():
+            for name, weight in weights:
+                shard_id = getattr(weight, "shard_id", None)
+                if isinstance(shard_id, str):
+                    weight = weight.detach()
+                    weight.shard_id = {"q": 0, "k": 1, "v": 2}[shard_id]
+                yield name, weight
+
+        return super().load_weights(remap_shards())
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -310,6 +387,41 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
         )
+        self.index_qk_size = 0
+        if (
+            envs.VLLM_QWEN4_EXP_QSA_MERGED_PROJECTION
+            and current_platform.is_device_capability(80)
+            and tp_size == 1
+            and vllm_config.lora_config is None
+            and self.hidden_size == 2560
+            and self.qkv_proj.output_size == 13312
+            and self.indexer.index_qk_proj.output_size == 640
+            and isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(
+                self.indexer.index_qk_proj.quant_method, UnquantizedLinearMethod
+            )
+        ):
+            self.index_qk_size = self.indexer.index_qk_proj.output_size
+            self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
+                self.qkv_proj, self.index_qk_size, quant_config=None
+            )
+            del self.indexer.index_qk_proj
+            logger.info_once("Using merged QSA QKVG/indexer projections on SM80 TP=1")
+        self.use_fused_prepare = (
+            envs.VLLM_QWEN4_EXP_QSA_FUSED_PREPARE
+            and current_platform.is_device_capability(80)
+            and tp_size == 1
+            and self.hidden_size == 2560
+            and self.num_heads == 24
+            and self.num_kv_heads == 2
+            and self.head_dim == 256
+            and self.use_fused_qk_norm_rope_gate
+            and self.indexer.use_fused_pre_indexer
+        )
+        if self.use_fused_prepare:
+            logger.info_once(
+                "Using fused QSA preparation and BF16 KV write on SM80 TP=1"
+            )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(
             "topk_indices_buffer",
@@ -325,6 +437,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.layer_name in static_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         static_context[self.layer_name] = self
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapper = (
+            WeightsMapper(
+                orig_to_new_stacked={"indexer.index_qk_proj.": ("qkv_proj.", 3)}
+            )
+            if self.index_qk_size
+            else None
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -347,18 +469,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
+        projected_qk: torch.Tensor | None = None,
+        main_qkv: torch.Tensor | None = None,
+        main_gate_out: torch.Tensor | None = None,
     ) -> None:
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
             output.zero_()
+            if main_gate_out is not None:
+                main_gate_out.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
         if self.kv_cache.numel() == 0:
             raise RuntimeError("QSA main K/V cache is not bound")
 
         num_tokens = main_metadata.num_actual_tokens
+        if main_gate_out is not None:
+            main_gate_out[num_tokens:].zero_()
         side_metadata = cast(
             QSAForwardMetadata,
             metadata[self.indexer.raw_key_cache.prefix],
@@ -370,6 +499,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 hidden_states,
                 positions,
                 self.topk_indices_buffer[:num_tokens],
+                projected_qk=projected_qk,
+                main_attention=self if main_qkv is not None else None,
+                main_qkv=main_qkv,
+                main_query_out=query if main_qkv is not None else None,
+                main_gate_out=main_gate_out,
+                main_slot_mapping=main_metadata.slot_mapping,
             )
         if selected.shape != (
             num_tokens,
@@ -377,14 +512,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        with optional_phase_profile_stage("qsa.kv_update", key, level="detail"):
-            impl.do_kv_cache_update(
-                self,
-                key,
-                value,
-                self.kv_cache,
-                main_metadata.slot_mapping,
-            )
+        if main_qkv is None:
+            with optional_phase_profile_stage("qsa.kv_update", key, level="detail"):
+                impl.do_kv_cache_update(
+                    self,
+                    key,
+                    value,
+                    self.kv_cache,
+                    main_metadata.slot_mapping,
+                )
         with optional_phase_profile_stage(
             "qsa.sparse_attention", query, level="detail"
         ):
@@ -408,12 +544,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "qsa.qkv_projection", hidden_states, level="stage"
         ):
             qkv, _ = self.qkv_proj(hidden_states)
-        with optional_phase_profile_stage("qsa.qk_norm_rope", qkv, level="stage"):
-            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            projected_qk = None
+            if self.index_qk_size:
+                qkv, projected_qk = qkv.split(
+                    [2 * self.q_size + 2 * self.kv_size, self.index_qk_size], dim=-1
+                )
         num_tokens = hidden_states.shape[0]
-        query = q.view(num_tokens, self.num_heads, self.head_dim)
-        key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        main_qkv = None
+        main_gate_out = None
+        if self.use_fused_prepare:
+            main_qkv = qkv
+            query = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
+            gate = torch.empty_like(query)
+            main_gate_out = gate
+            key = value = qkv.new_empty(0)
+        else:
+            with optional_phase_profile_stage("qsa.qk_norm_rope", qkv, level="stage"):
+                q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            query = q.view(num_tokens, self.num_heads, self.head_dim)
+            key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+            value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         with optional_phase_profile_stage("qsa.transaction", query, level="stage"):
@@ -425,6 +575,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     key,
                     value,
                     attn_output,
+                    projected_qk,
+                    main_qkv,
+                    main_gate_out,
                     encoded_layer_name,
                 )
             else:
@@ -435,12 +588,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     key,
                     value,
                     attn_output,
+                    projected_qk,
+                    main_qkv,
+                    main_gate_out,
                     encoded_layer_name,
                 )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
             with optional_phase_profile_stage("qsa.gate", gate, level="detail"):
-                flat_output = flat_output * torch.sigmoid(gate)
+                flat_output = flat_output * torch.sigmoid(gate.view(num_tokens, -1))
         with optional_phase_profile_stage(
             "qsa.output_projection", flat_output, level="stage"
         ):
@@ -455,6 +611,9 @@ def qwen4_exp_qsa_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    projected_qk: torch.Tensor | None,
+    main_qkv: torch.Tensor | None,
+    main_gate_out: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
@@ -470,6 +629,9 @@ def qwen4_exp_qsa_with_output(
         key,
         value,
         output,
+        projected_qk=projected_qk,
+        main_qkv=main_qkv,
+        main_gate_out=main_gate_out,
     )
 
 
@@ -480,15 +642,19 @@ def qwen4_exp_qsa_with_output_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    projected_qk: torch.Tensor | None,
+    main_qkv: torch.Tensor | None,
+    main_gate_out: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
+    del hidden_states, positions, query, key, value, output
+    del projected_qk, main_qkv, main_gate_out, layer_name
 
 
 direct_register_custom_op(
     op_name="qwen4_exp_qsa_with_output",
     op_func=qwen4_exp_qsa_with_output,
-    mutates_args=["output"],
+    mutates_args=["output", "query", "main_gate_out"],
     fake_impl=qwen4_exp_qsa_with_output_fake,
 )
 

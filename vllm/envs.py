@@ -52,6 +52,10 @@ if TYPE_CHECKING:
     VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_QWEN4_EXP_PLE_CPU_OFFLOAD: bool = False
     VLLM_QWEN4_EXP_HC_SM80_GEMV: bool = True
+    VLLM_QWEN4_EXP_QSA_MERGED_PROJECTION: bool = True
+    VLLM_QWEN4_EXP_QSA_FUSED_PREPARE: bool = True
+    VLLM_QWEN4_EXP_GDN_STANDARD_DECODE: bool = False
+    VLLM_MOE_ALIGN_M1_E512_SM80: bool = False
     VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -955,6 +959,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_QWEN4_EXP_HC_SM80_GEMV": lambda: bool(
         int(os.getenv("VLLM_QWEN4_EXP_HC_SM80_GEMV", "1"))
+    ),
+    "VLLM_QWEN4_EXP_QSA_MERGED_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_QSA_MERGED_PROJECTION", "1"))
+    ),
+    "VLLM_QWEN4_EXP_QSA_FUSED_PREPARE": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_QSA_FUSED_PREPARE", "1"))
+    ),
+    "VLLM_QWEN4_EXP_GDN_STANDARD_DECODE": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_GDN_STANDARD_DECODE", "0"))
+    ),
+    "VLLM_MOE_ALIGN_M1_E512_SM80": lambda: bool(
+        int(os.getenv("VLLM_MOE_ALIGN_M1_E512_SM80", "0"))
     ),
     "VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_QWEN4_EXP_MTP_FP8_LM_HEAD", "1"))

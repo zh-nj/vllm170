@@ -8,6 +8,7 @@ Run `pytest tests/kernels/moe/test_moe_align_block_size.py`.
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
@@ -241,6 +242,47 @@ def test_moe_align_block_size(
     assert (actual_expert_ids[:actual_num_blocks] >= 0).all() and (
         actual_expert_ids[:actual_num_blocks] < num_experts
     ).all(), "expert_ids should contain valid expert indices"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((8, 0)),
+    reason="M1/E512 decode alignment requires SM80",
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_m1_e512_align_replays_changed_routes(enabled, monkeypatch) -> None:
+    """Graph replay must read new routes and preserve padding and invalid IDs."""
+    monkeypatch.setattr(envs, "VLLM_MOE_ALIGN_M1_E512_SM80", enabled)
+    ids = torch.zeros((1, 10), dtype=torch.int32, device="cuda")
+
+    def run():
+        return moe_align_block_size(
+            ids, block_size=8, num_experts=512, ignore_invalid_experts=True
+        )
+
+    run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for values in (
+        [511, 0, 8, 19, 200, 90, 127, 360, 7, 1],
+        [4] * 10,
+        [1, 1, 1, 3, 3, 4, 4, 4, 4, 4],
+        [-1, 512, 7, 7, 513, 0, 511, -3, 1, 1],
+        [-1] * 10,
+    ):
+        ids.copy_(torch.tensor([values], dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        golden = torch_moe_align_block_size(ids, block_size=8, num_experts=512)
+        torch.testing.assert_close(actual[1], golden[1], atol=0, rtol=0)
+        torch.testing.assert_close(actual[2], golden[2], atol=0, rtol=0)
+        if enabled:
+            torch.testing.assert_close(actual[0], golden[0], atol=0, rtol=0)
+        else:
+            _verify_expert_level_sorting(
+                actual[0], golden[0], actual[1], 8, actual[2].item(), 10
+            )
 
 
 @pytest.mark.skipif(

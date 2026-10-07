@@ -16,6 +16,7 @@ from vllm.models.qwen4_exp.nvidia import (
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.worker.utils import clear_layer_kv_caches
 
 requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
@@ -23,8 +24,10 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("preprojected", [False, True])
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
+    preprojected: bool,
 ) -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     raw_metadata = SimpleNamespace(
@@ -41,10 +44,16 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     )
     updates = []
     selections = []
+    projections = []
+
+    def project(hidden):
+        projections.append(hidden)
+        return torch.zeros(2, 2), None
+
     indexer = SimpleNamespace(
         skip_topk=True,
         _metadata=lambda: (raw_metadata, compressed_metadata),
-        index_qk_proj=lambda hidden: (torch.zeros(2, 2), None),
+        index_qk_proj=project,
         index_n_heads=1,
         index_kv_heads=1,
         index_head_dim=1,
@@ -77,11 +86,49 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
         torch.zeros(2, 4),
         torch.tensor([7, 8]),
         rows,
+        projected_qk=torch.zeros(2, 2) if preprojected else None,
     )
 
     assert actual is rows
     assert len(updates) == 1
     assert not selections
+    assert len(projections) == (0 if preprojected else 1)
+
+
+@pytest.mark.usefixtures("default_vllm_config")
+def test_qsa_merged_projection_loads_checkpoint_shards(monkeypatch) -> None:
+    """Checkpoint Q/gate, K, V and indexer weights retain their output order."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.models.qwen3_next import Qwen3NextModel
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.models.qwen4_exp.nvidia.qsa import (
+        Qwen4ExpQSAAttention,
+        Qwen4ExpQSAQKVIndexerLinear,
+    )
+
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    qkv = linear.QKVParallelLinear(8, 2, 4, 1, bias=False, params_dtype=torch.float32)
+    attention = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.index_qk_size = 6
+    attention.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(qkv, 6, None)
+    model = torch.nn.Module()
+    model.attn = attention
+    weights = [torch.arange(n * 8).reshape(n, 8).float() for n in (8, 2, 2, 6)]
+    names = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+    loaded = AutoWeightsLoader(model).load_weights(
+        ((f"attn.{name}.weight", weight) for name, weight in zip(names, weights)),
+        mapper=Qwen3NextModel.hf_to_vllm_mapper,
+    )
+    assert loaded == {"attn.qkv_proj.weight"}
+    torch.testing.assert_close(attention.qkv_proj.weight, torch.cat(weights))
+    x = torch.randn(3, 8)
+    actual, _ = attention.qkv_proj(x)
+    expected = torch.cat([torch.nn.functional.linear(x, w) for w in weights], dim=-1)
+    torch.testing.assert_close(actual, expected)
 
 
 def _qsa_mqa_paged_reference(
@@ -346,7 +393,9 @@ def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> 
     assert set(slots.tolist()).isdisjoint((committed % capacity).tolist())
 
 
-def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStateCache:
+def _qsa_key_cache(
+    block_size: int, compress_ratio: int, **kwargs
+) -> qsa_cache.QSAKeyStateCache:
     return qsa_cache.QSAKeyStateCache(
         head_size=64,
         dtype=torch.bfloat16,
@@ -356,6 +405,7 @@ def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStat
             compilation_config=SimpleNamespace(static_forward_context={})
         ),
         compress_ratio=compress_ratio,
+        **kwargs,
     )
 
 
@@ -381,6 +431,23 @@ def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
     assert compressed_cache.kv_cache.shape == (2, 8, 1, 64)
     assert raw_cache.kv_cache.data_ptr() == raw_view.data_ptr()
     assert compressed_cache.kv_cache.data_ptr() == compressed_view.data_ptr()
+
+
+def test_clearing_qsa_key_cache_releases_its_storage() -> None:
+    """Profiling teardown clears `kv_cache`; no derived view may keep it alive."""
+    raw_cache = _qsa_key_cache(
+        block_size=32, compress_ratio=4, cache_rope_positions=True
+    )
+    kv = torch.zeros(2, 1, 8, raw_cache.head_size, dtype=torch.bfloat16)
+    references_before_bind = torch._C._storage_Use_Count(kv.untyped_storage()._cdata)
+    raw_cache.bind_kv_cache(kv)
+    assert raw_cache.key_cache.shape[-1] == 64
+    assert raw_cache.rope_position_cache.dtype == torch.int64
+
+    clear_layer_kv_caches([raw_cache])
+
+    references = torch._C._storage_Use_Count(kv.untyped_storage()._cdata)
+    assert references == references_before_bind
 
 
 @pytest.mark.parametrize(
@@ -893,9 +960,11 @@ def test_qsa_selection_chunks_workspace_and_matches_test_reference(
     monkeypatch.setattr(qsa_ops, "_LOGITS_WORKSPACE_BYTES", 32 * keys * 4)
     original_score = qsa_ops.qsa_mqa_paged
     scored_row_counts = []
+    logits_pointers = []
 
     def record_score(query: torch.Tensor, *args, **kwargs):
         scored_row_counts.append(query.shape[0])
+        logits_pointers.append(kwargs["logits_out"].data_ptr())
         return original_score(query, *args, **kwargs)
 
     monkeypatch.setattr(qsa_ops, "qsa_mqa_paged", record_score)
@@ -923,6 +992,7 @@ def test_qsa_selection_chunks_workspace_and_matches_test_reference(
 
     torch.testing.assert_close(actual.sort().values, expected.sort().values)
     assert scored_row_counts == [32, 32, 1]
+    assert len(set(logits_pointers)) == 1
 
 
 @requires_qsa_kernels

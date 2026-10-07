@@ -723,6 +723,8 @@ def qsa_mqa_paged(
     compress_ratio: int,
     num_columns: int | None = None,
     score_scale: float | None = None,
+    *,
+    logits_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -753,7 +755,19 @@ def qsa_mqa_paged(
     columns = capacity if num_columns is None else num_columns
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
-    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    if logits_out is None:
+        logits = torch.empty(
+            (q.shape[0], columns), dtype=torch.float32, device=q.device
+        )
+    else:
+        if (
+            logits_out.shape != (q.shape[0], columns)
+            or logits_out.dtype != torch.float32
+            or logits_out.device != q.device
+            or logits_out.stride(-1) != 1
+        ):
+            raise ValueError("QSA logits output has an invalid shape, dtype or device")
+        logits = logits_out
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
@@ -938,6 +952,9 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
+    logits_buffer = torch.empty(
+        (chunk_rows, columns), dtype=torch.float32, device=q.device
+    )
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
@@ -958,6 +975,7 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
+                logits_out=logits_buffer[: row_end - row_start],
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (

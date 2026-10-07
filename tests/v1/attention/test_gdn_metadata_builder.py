@@ -5,7 +5,7 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -75,6 +76,16 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=0,
     ),
+    "regular_decode_with_prefill": GDNBuildTestCase(
+        seq_lens=[40, 100],
+        query_lens=[1, 50],
+        num_decode_draft_tokens=None,
+        num_speculative_tokens=0,
+        expected_num_decodes=1,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=50,
+        expected_num_spec_decodes=0,
+    ),
     # Multi-token prefill alongside spec decode — no decode to reclassify
     "spec_decode_with_real_prefill": GDNBuildTestCase(
         seq_lens=[100, 20],
@@ -119,6 +130,26 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=1,
         expected_num_spec_decodes=1,
     ),
+    "pure_spec_with_trailing_padding": GDNBuildTestCase(
+        seq_lens=[80, 96, 0],
+        query_lens=[4, 4, 0],
+        num_decode_draft_tokens=[3, 3, -1],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
+    "pure_spec_with_leading_padding": GDNBuildTestCase(
+        seq_lens=[0, 80, 96],
+        query_lens=[0, 4, 4],
+        num_decode_draft_tokens=[-1, 3, 3],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
 }
 
 
@@ -155,9 +186,12 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    block_table: torch.Tensor | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if block_table is not None:
+        common = common.replace(block_table_tensor=block_table)
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
@@ -167,6 +201,105 @@ def _build(
             batch_spec.batch_size, dtype=torch.int32, device=DEVICE
         )
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+
+
+def _build_gdn_with_flag(
+    batch: BatchSpec,
+    num_decode_draft_tokens: list[int],
+    num_accepted_tokens: list[int],
+    flag: bool,
+    common=None,
+) -> GDNAttentionMetadata:
+    """Build the same metadata with the Qwen MTP prefix shortcut toggled."""
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    builder.qwen_mtp_prefix_metadata = flag
+    if common is None:
+        common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    return builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor(
+            num_decode_draft_tokens, dtype=torch.int32
+        ),
+        num_accepted_tokens=torch.tensor(
+            num_accepted_tokens, dtype=torch.int32, device=DEVICE
+        ),
+    )
+
+
+def _assert_public_metadata_equal(
+    expected: GDNAttentionMetadata, actual: GDNAttentionMetadata
+) -> None:
+    """Compare all builder output fields without relying on object identity."""
+
+    def assert_equal(expected_value, actual_value, field_name: str) -> None:
+        if isinstance(expected_value, torch.Tensor):
+            assert isinstance(actual_value, torch.Tensor), field_name
+            torch.testing.assert_close(actual_value, expected_value)
+        elif isinstance(expected_value, dict):
+            assert isinstance(actual_value, dict), field_name
+            assert actual_value.keys() == expected_value.keys(), field_name
+            for key in expected_value:
+                assert_equal(
+                    expected_value[key], actual_value[key], f"{field_name}[{key!r}]"
+                )
+        elif isinstance(expected_value, (list, tuple)):
+            assert isinstance(actual_value, type(expected_value)), field_name
+            assert len(actual_value) == len(expected_value), field_name
+            for index, (expected_item, actual_item) in enumerate(
+                zip(expected_value, actual_value)
+            ):
+                assert_equal(expected_item, actual_item, f"{field_name}[{index}]")
+        else:
+            assert actual_value == expected_value, field_name
+
+    for metadata_field in fields(GDNAttentionMetadata):
+        expected_value = getattr(expected, metadata_field.name)
+        actual_value = getattr(actual, metadata_field.name)
+        assert_equal(expected_value, actual_value, metadata_field.name)
+
+
+@pytest.mark.parametrize(
+    ("batch", "draft_tokens", "accepted_tokens"),
+    [
+        pytest.param(
+            BatchSpec(seq_lens=[80, 96, 0], query_lens=[4, 4, 0]),
+            [3, 3, -1],
+            [3, 2, 1],
+            id="spec-prefix-with-trailing-zero-padding",
+        ),
+        pytest.param(
+            BatchSpec(seq_lens=[0, 80, 96], query_lens=[0, 4, 4]),
+            [-1, 3, 3],
+            [1, 3, 2],
+            id="spec-mask-with-leading-zero-padding",
+        ),
+        pytest.param(
+            BatchSpec(seq_lens=[64, 80, 96], query_lens=[2, 4, 4]),
+            [-1, 3, 3],
+            [2, 3, 2],
+            id="spec-mask-with-mixed-prefill",
+        ),
+    ],
+)
+def test_qwen_mtp_prefix_metadata_matches_baseline(
+    batch, draft_tokens, accepted_tokens
+):
+    """The prefix shortcut preserves state indices and accepted-token values."""
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    baseline = _build_gdn_with_flag(
+        batch, draft_tokens, accepted_tokens, flag=False, common=common
+    )
+    optimized = _build_gdn_with_flag(
+        batch, draft_tokens, accepted_tokens, flag=True, common=common
+    )
+
+    _assert_public_metadata_equal(baseline, optimized)
+    assert optimized.num_accepted_tokens is not None
+    assert baseline.num_accepted_tokens is not None
+    optimized_accepted = optimized.num_accepted_tokens.tolist()
+    baseline_accepted = baseline.num_accepted_tokens.tolist()
+    assert optimized_accepted == baseline_accepted
 
 
 @pytest.mark.parametrize(
@@ -182,6 +315,52 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
+)
+def test_update_block_table_preserves_metadata_and_group_state(
+    test_case: GDNBuildTestCase, full_cuda_graph: bool, mamba_cache_mode: str
+):
+    """Reuse matches a full build without sharing or mutating group state IDs."""
+    batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
+    src, dst, ref = (
+        _create_gdn_builder(test_case.num_speculative_tokens, full_cuda_graph)
+        for _ in range(3)
+    )
+    for builder in (src, dst, ref):
+        builder.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    if mamba_cache_mode == "align":
+        dst.mamba_aligned_state_indices = ref.mamba_aligned_state_indices = (
+            mamba_get_block_table_tensor(
+                common.block_table_tensor, common.seq_lens, ref.kv_cache_spec, "align"
+            )
+        )
+    draft_tokens = test_case.num_decode_draft_tokens
+    expected = _build(ref, batch, draft_tokens, common.block_table_tensor)
+    source = _build(src, batch, draft_tokens)
+    index_fields = (
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "prefill_state_indices",
+    )
+    source_indices = [getattr(source, f) for f in index_fields]
+    source_indices = [t if t is None else t.clone() for t in source_indices]
+    actual = dst.update_block_table(
+        source, common.block_table_tensor, common.slot_mapping
+    )
+    _assert_public_metadata_equal(expected, actual)
+    for field, source_index in zip(index_fields, source_indices):
+        torch.testing.assert_close(getattr(source, field), source_index)
+        value = getattr(actual, field)
+        if full_cuda_graph and actual.num_prefills == 0 and value is not None:
+            assert value.data_ptr() == getattr(dst, field).data_ptr()
+    for field in ("spec_query_start_loc", "spec_token_indx", "num_accepted_tokens"):
+        assert getattr(actual, field) is getattr(source, field)
 
 
 def test_has_initial_state_after_reclassification():

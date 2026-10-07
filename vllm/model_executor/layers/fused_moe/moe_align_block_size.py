@@ -3,10 +3,14 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
+
+logger = init_logger(__name__)
 
 
 def _can_use_sm80_m4_e512_align(
@@ -109,7 +113,26 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    if _can_use_sm80_m4_e512_align(
+    if (
+        envs.VLLM_MOE_ALIGN_M1_E512_SM80
+        and block_size == 8
+        and num_experts == 512
+        and expert_map is None
+        and not pad_sorted_ids
+        and ignore_invalid_experts
+        and topk_ids.shape == (1, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and current_platform.is_device_capability((8, 0))
+    ):
+        from .moe_align_m1_e512 import moe_align_m1_e512_kernel
+
+        logger.info_once("Using SM80 M1/top10/E512 decode MoE alignment")
+        moe_align_m1_e512_kernel[(1,)](
+            topk_ids, sorted_ids, expert_ids, num_tokens_post_pad, num_warps=4
+        )
+    elif _can_use_sm80_m4_e512_align(
         topk_ids,
         block_size,
         num_experts,

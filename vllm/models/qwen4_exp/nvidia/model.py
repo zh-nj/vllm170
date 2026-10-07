@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -216,6 +217,18 @@ class Qwen4ExpGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             gqa_interleaved_layout,
             reduce_results,
         )
+        if (
+            envs.VLLM_QWEN4_EXP_GDN_STANDARD_DECODE
+            and vllm_config.speculative_config is None
+            and current_platform.is_device_capability((8, 0))
+            and self.tp_size == 1
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and vllm_config.quant_config is not None
+            and vllm_config.quant_config.get_name() == "inc"
+            and config.hidden_size == 2560
+            and self.head_k_dim == self.head_v_dim == 128
+        ):
+            self.enable_fused_gdn_decode = False
         self.use_sm80_fused_input_projection = (
             can_use_qwen4_exp_sm80_gdn_input_projection(
                 self.in_proj_qkvz,

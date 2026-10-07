@@ -534,6 +534,14 @@ class Worker(WorkerBase):
         self._defer_pp_recv = _dsv41_sm80_target_prepare_ahead(
             self.vllm_config, self.use_v2_model_runner, self.device
         )
+        if self.use_v2_model_runner:
+            from vllm.v1.worker.gpu.qwen_mtp_utils import (
+                qwen_mtp_pp_optimizations_enabled,
+            )
+
+            self._defer_pp_recv |= qwen_mtp_pp_optimizations_enabled(
+                self.vllm_config, self.device, "qwen4_exp_mtp_prepare_ahead"
+            )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

@@ -18,6 +18,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
 from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
     qsa_pre_indexer,
 )
+from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
@@ -26,6 +27,7 @@ requires_qsa_kernels = pytest.mark.skipif(
     reason="QSA kernels require CUDA and Triton",
 )
 
+MAIN_HQ, MAIN_HK, MAIN_D, MAIN_PAGE = 24, 2, 256, 16
 HQ, D = 4, 128
 CR = 4
 MROPE_SECTION = (11, 11, 10)
@@ -49,8 +51,84 @@ def _make_block_table(block_counts):
     return table, num_blocks
 
 
+def _make_main_inputs(num_tokens: int) -> dict:
+    """Random main-attention arguments with a paged cache in vLLM's layout."""
+    num_blocks = num_tokens // MAIN_PAGE + 2
+    cache = torch.zeros(
+        num_blocks,
+        MAIN_HK,
+        MAIN_PAGE,
+        2 * MAIN_D,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).transpose(1, 2)
+    slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
+    slots[-1] = -1
+    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device="cuda") * 0.2
+    qkv_width = 2 * (MAIN_HQ + MAIN_HK) * MAIN_D
+    return dict(
+        main_qkv=torch.randn(
+            num_tokens,
+            qkv_width + (HQ + 1) * D,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )[:, :qkv_width],
+        main_q_norm_weight=norm_weights[0],
+        main_k_norm_weight=norm_weights[1],
+        main_eps=EPS,
+        main_kv_cache=cache,
+        main_slot_mapping=slots,
+        main_k_scale=0.5,
+        main_v_scale=2.0,
+    )
+
+
+def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
+    """Compare with fused_qk_rmsnorm_rope_gate + reshape_and_cache_flash."""
+    from vllm._custom_ops import reshape_and_cache_flash
+    from vllm.model_executor.layers.fused_qk_norm_rope import (
+        fused_qk_rmsnorm_rope_gate,
+    )
+
+    q_gate, k, v = main["main_qkv"].split(
+        [2 * MAIN_HQ * MAIN_D, MAIN_HK * MAIN_D, MAIN_HK * MAIN_D], dim=-1
+    )
+    q, k, gate = fused_qk_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        main["main_q_norm_weight"],
+        main["main_k_norm_weight"],
+        rope.cos_sin_cache,
+        positions,
+        EPS,
+        MAIN_HQ,
+        MAIN_HK,
+        MAIN_D,
+        rope.rotary_dim,
+        mrope_section=MROPE_SECTION if positions.ndim == 2 else None,
+        norm_beta=1.0,
+    )
+    kv_cache = main["main_kv_cache"]
+    cache = torch.zeros_like(kv_cache)
+    key_cache, value_cache = cache.split(MAIN_D, dim=-1)
+    reshape_and_cache_flash(
+        k.view(-1, MAIN_HK, MAIN_D),
+        v.view(-1, MAIN_HK, MAIN_D),
+        key_cache,
+        value_cache,
+        main["main_slot_mapping"],
+        "auto",
+        torch.tensor(main["main_k_scale"], device="cuda"),
+        torch.tensor(main["main_v_scale"], device="cuda"),
+    )
+    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+    assert torch.equal(gate_out.flatten(1), gate)
+    torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
+
+
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("prepare_main", [False, True])
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
@@ -74,6 +152,7 @@ def _make_block_table(block_counts):
     ],
 )
 def test_qsa_fused_pre_indexer_matches_unfused(
+    prepare_main,
     mrope,
     is_2d_positions,
     cache_rope_positions,
@@ -225,14 +304,24 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     )
     unfused_compressed = fused_compressed.clone()
 
+    main_width = 2 * (MAIN_HQ + MAIN_HK) * MAIN_D if prepare_main else 0
     projected_qk = torch.randn(
-        num_tokens, (HQ + 1) * D, dtype=torch.bfloat16, device=device
-    )
+        num_tokens, main_width + (HQ + 1) * D, dtype=torch.bfloat16, device=device
+    )[:, main_width:]
     q_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
     k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
 
     fused_query = torch.empty(num_tokens, HQ, D, dtype=torch.bfloat16, device=device)
-    qsa_pre_indexer(
+    main = _make_main_inputs(num_tokens) if prepare_main else {}
+    main_outputs = {}
+    if prepare_main:
+        main_shape = (num_tokens, MAIN_HQ, MAIN_D)
+        main_outputs = dict(
+            main_q_out=torch.empty(main_shape, device=device, dtype=torch.bfloat16),
+            main_gate_out=torch.empty(main_shape, device=device, dtype=torch.bfloat16),
+        )
+    prepare = qsa_prepare if prepare_main else qsa_pre_indexer
+    prepared = prepare(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
         positions,
@@ -252,7 +341,14 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         compress_ratio=CR,
         mrope_section=MROPE_SECTION if mrope else None,
         rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
+        **main,
+        **main_outputs,
     )
+    if prepare_main:
+        main_q, main_gate = prepared
+        assert main_q is main_outputs["main_q_out"]
+        assert main_gate is main_outputs["main_gate_out"]
+        _check_main_outputs(main, main_q, main_gate, rope, positions)
 
     unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
     unfused_query = gemma_rmsnorm(

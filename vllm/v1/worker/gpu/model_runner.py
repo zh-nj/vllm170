@@ -324,6 +324,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        from vllm.v1.worker.gpu.qwen_mtp_utils import (
+            qwen_mtp_pp_optimizations_enabled,
+        )
+
+        self._qwen_mtp_async_relay = qwen_mtp_pp_optimizations_enabled(
+            self.vllm_config, self.device
+        )
+        if self._qwen_mtp_async_relay:
+            logger.info("Qwen4Exp MTP PP relay without CPU indexing waits enabled")
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -1117,10 +1126,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
                 if draft_tokens is not None:
-                    valid = idx_mapping >= 0
-                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
-                        valid
-                    ]
+                    if self._qwen_mtp_async_relay:
+                        from vllm.v1.worker.gpu.qwen_mtp_utils import (
+                            copy_pp_draft_tokens,
+                        )
+
+                        copy_pp_draft_tokens(
+                            self.req_states.draft_tokens, draft_tokens, idx_mapping
+                        )
+                    else:
+                        valid = idx_mapping >= 0
+                        self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
+                            valid
+                        ]
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:

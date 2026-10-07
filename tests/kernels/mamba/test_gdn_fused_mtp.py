@@ -208,6 +208,9 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     layer.forward_cuda = types.MethodType(
         QwenGatedDeltaNetAttention.forward_cuda, layer
     )
+    layer._forward_input_projection = types.MethodType(
+        QwenGatedDeltaNetAttention._forward_input_projection, layer
+    )
 
     def packed_op(
         actual_qkvz: torch.Tensor,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import partial
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,9 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from tests.utils import large_gpu_test
+from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
@@ -32,7 +36,152 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpPLELayer,
     _get_ple_embedding_quant_method,
 )
+from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+    ShortConvAttentionMetadataBuilder,
+)
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
+
+
+@pytest.mark.parametrize(
+    "builder_cls",
+    [ShortConvAttentionMetadataBuilder, PleShortConvAttentionMetadataBuilder],
+)
+def test_only_ple_skips_unused_causal_convolution_metadata(builder_cls):
+    """Other short-conv consumers still receive their prefill kernel metadata."""
+    device = torch.device("cpu")
+    builder = builder_cls(
+        MambaSpec(block_size=16, shapes=((16, 64),), dtypes=(torch.float32,)),
+        ["short_conv"],
+        VllmConfig(),
+        device,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[21], query_lens=[5]), 16, device
+    )
+    common.is_prefilling = torch.tensor([True])
+    metadata = builder.build(0, common)
+    assert metadata.num_prefills == 1
+    assert metadata.query_start_loc_p.tolist() == [0, 5]
+    if builder_cls is ShortConvAttentionMetadataBuilder:
+        assert metadata.nums_dict[8]["tot"] == 1
+        assert metadata.batch_ptr is not None
+        assert metadata.token_chunk_offset_ptr is not None
+    else:
+        assert metadata.nums_dict is None
+        assert metadata.batch_ptr is None
+        assert metadata.token_chunk_offset_ptr is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("full_graph", [False, True])
+@pytest.mark.parametrize(
+    "query_lens,drafts,spec_rows,non_spec_rows,token_order",
+    [
+        pytest.param([4, 2, 0], [3, 1, -1], [0, 1], [], None, id="spec-padding"),
+        pytest.param(
+            [3, 1, 2, 5, 0],
+            [2, -1, 1, -1, -1],
+            [0, 2],
+            [1, 3],
+            [0, 1, 2, 4, 5, 3, 6, 7, 8, 9, 10],
+            id="mixed-padding",
+        ),
+        pytest.param([1, 5], [-1, -1], [], [0, 1], None, id="non-spec"),
+    ],
+)
+def test_ple_metadata_preserves_request_and_token_order(
+    device, full_graph, query_lens, drafts, spec_rows, non_spec_rows, token_order
+):
+    """Preserve PLE routing and offsets without unused convolution metadata."""
+    if device == "cuda" and not current_platform.is_cuda():
+        pytest.skip("CUDA required")
+    device = torch.device(device)
+    config = VllmConfig()
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE
+    )
+    config.compilation_config.max_cudagraph_capture_size = 32
+    builder = PleShortConvAttentionMetadataBuilder(
+        MambaSpec(block_size=16, shapes=((16, 64),), dtypes=(torch.float32,)),
+        ["ple"],
+        config,
+        device,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[q + 16 for q in query_lens], query_lens=query_lens),
+        16,
+        device,
+        arange_block_indices=True,
+    )
+    common.is_prefilling = torch.tensor(
+        [q > 1 and d < 0 for q, d in zip(query_lens, drafts)]
+    )
+    # Token padding is independent of the sum of per-request query lengths.
+    common.num_actual_tokens += 3
+    accepted = torch.arange(1, len(query_lens) + 1, dtype=torch.int32, device=device)
+    drafts_cpu = torch.tensor(drafts, dtype=torch.int32)
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=drafts_cpu,
+    )
+
+    def check(actual, expected):
+        torch.testing.assert_close(
+            actual, torch.tensor(expected, dtype=actual.dtype, device=device)
+        )
+
+    assert metadata.num_spec_decodes == len(spec_rows)
+    assert metadata.num_decodes == sum(query_lens[i] == 1 for i in non_spec_rows)
+    assert metadata.num_prefills == sum(query_lens[i] > 1 for i in non_spec_rows)
+    if spec_rows:
+        torch.testing.assert_close(
+            metadata.spec_state_indices_tensor[: len(spec_rows)],
+            common.block_table_tensor[spec_rows, 0],
+        )
+        torch.testing.assert_close(
+            metadata.num_accepted_tokens[: len(spec_rows)], accepted[spec_rows]
+        )
+        check(
+            metadata.spec_query_start_loc[: len(spec_rows) + 1],
+            [0, *accumulate(query_lens[i] for i in spec_rows)],
+        )
+        if full_graph and not non_spec_rows:
+            check(metadata.spec_state_indices_tensor[len(spec_rows) :], [NULL_BLOCK_ID])
+            check(metadata.num_accepted_tokens[len(spec_rows) :], [1])
+            check(
+                metadata.spec_query_start_loc[len(spec_rows) + 1 :], [sum(query_lens)]
+            )
+            assert (
+                metadata.spec_state_indices_tensor.data_ptr()
+                == builder.spec_state_indices_tensor.data_ptr()
+            )
+    if non_spec_rows:
+        torch.testing.assert_close(
+            metadata.state_indices_tensor, common.block_table_tensor[non_spec_rows, 0]
+        )
+        prefill_lens = [query_lens[i] for i in non_spec_rows if query_lens[i] > 1]
+        check(metadata.query_start_loc_p, [0, *accumulate(prefill_lens)])
+        check(metadata.has_initial_states_p, [True] * len(prefill_lens))
+    if token_order is not None:
+        check(
+            torch.cat((metadata.spec_token_indx, metadata.non_spec_token_indx)),
+            token_order,
+        )
+    else:
+        assert metadata.spec_token_indx is None
+        assert metadata.non_spec_token_indx is None
+    assert metadata.nums_dict is None
+    assert metadata.batch_ptr is None
+    assert metadata.token_chunk_offset_ptr is None
 
 
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
@@ -428,7 +577,7 @@ def test_cpu_ple_embedding_custom_op_copies_lookup_to_output(monkeypatch) -> Non
     torch.testing.assert_close(output, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_pinned_ple_embedding_gathers_directly_from_host(
     weight_dtype: torch.dtype,
@@ -468,7 +617,7 @@ def test_pinned_ple_embedding_gathers_directly_from_host(
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 def test_pinned_ple_embedding_replays_in_cuda_graph() -> None:
     weight = torch.arange(
         32,
@@ -487,7 +636,7 @@ def test_pinned_ple_embedding_replays_in_cuda_graph() -> None:
         vocab_end=8,
         scale=1.0,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -506,7 +655,7 @@ def test_pinned_ple_embedding_replays_in_cuda_graph() -> None:
     torch.testing.assert_close(output.cpu(), weight[6:8].unsqueeze(0))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 def test_fused_ple_ngram_hash_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -571,7 +720,7 @@ def test_fused_ple_ngram_hash_matches_reference(
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("strided_state", [False, True])
 def test_fused_ple_prefill_short_conv_matches_fallback(
     monkeypatch: pytest.MonkeyPatch,
@@ -653,7 +802,7 @@ def test_fused_ple_prefill_short_conv_matches_fallback(
     torch.testing.assert_close(actual_state, reference_state, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("accepted_tokens", [1, 2, 3, 4])
 @pytest.mark.parametrize("strided_state", [False, True])
 def test_fused_ple_spec_short_conv_matches_fallback(
