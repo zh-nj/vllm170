@@ -77,6 +77,114 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## DeepSeek-V4.1-Flash 启动示例
+
+以下示例使用 5 张 GPU，配置 PP5 / TP1、DSpark 5-token 推测解码和 FULL CUDA Graph。
+两条命令共用 `26661` 端口，选择其中一条启动；请按实际部署环境调整 GPU 编号、vLLM 路径、模型目录和 SSD 目录。
+
+### DeepSeek-V4.1-Flash-1017：Engram CPU 卸载
+
+使用 `DeepSeek-V4.1-Flash-1017` 模型，启用 Engram CPU 卸载。
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=2,3,4,5,6 \
+NCCL_P2P_DISABLE=0 \
+NCCL_BUFFSIZE=1048576 \
+NCCL_MAX_NCHANNELS=8 \
+HF_HUB_OFFLINE=1 \
+VLLM_PP_LAYER_PARTITION=8,8,8,8,8 \
+VLLM_DSV41_HOST_HEADROOM_GIB=12 \
+VLLM_DSV41_PREFILL_WORKSPACE_TOKENS=65536 \
+VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT=1 \
+VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE=1 \
+VLLM_MARLIN_M_ALIGN=1 \
+VLLM_DSV41_ROUTER_GEMM_ALIGN=split \
+/mnt/data/apps/vllma100/vllm170/.venv/bin/vllm serve /media/z/data6/models/DeepSeek-V4.1-Flash-1017 \
+  --served-model-name dsv41f \
+  --host 0.0.0.0 \
+  --port 26661 \
+  --pipeline-parallel-size 5 \
+  --tensor-parallel-size 1 \
+  --tokenizer-mode deepseek_v41 \
+  --attention-backend TRITON_MLA_SPARSE_DSV41 \
+  --moe-backend mxfp4_int8_sm80 \
+  --override-generation-config '{"temperature":1.0,"top_p":0.95}' \
+  --default-chat-template-kwargs '{"reasoning_effort":"max"}' \
+  --limit-mm-per-prompt '{"image":999}' \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes 2700000000 \
+  --block-size 128 \
+  --max-model-len 1048576 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 8 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy","moe_backend":"mxfp4_int8_sm80","enforce_eager":false,"enable_adaptive_verification":false,"dspark_pipeline_stage_ranks":[1,2,3]}' \
+  --gpu-memory-utilization 0.98 \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
+  --no-enable-flashinfer-autotune \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --long-prefill-token-threshold 256 \
+  --enable-adaptive-long-prefill \
+  --engram-config '{"cpu_offload":true,"embedding_across_dp":false}' \
+  --additional-config '{"dsv41_sm80_moe_tilelang":true,"dsv41_sm80_fused_swa_metadata":true,"dsv41_sm80_target_prepare_ahead":true,"dsv41_sm80_moe_hybrid_prefill":true,"dsv41_sm80_moe_small_tail_prefill":true,"ced_prefill":true}'
+```
+
+### DeepSeek-V4.1-Flash：Engram SSD 卸载
+
+使用 `DeepSeek-V4.1-Flash` 模型，将 Engram 权重卸载到 `/media/z/data6/vllm-engram-ssd`，
+scale 保留在内存。此配置将应用层 CPU 行缓存设为 `0.0` GiB，并启用批量读取和预取。
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=2,3,4,5,6 \
+NCCL_P2P_DISABLE=0 \
+NCCL_BUFFSIZE=1048576 \
+NCCL_MAX_NCHANNELS=8 \
+HF_HUB_OFFLINE=1 \
+VLLM_PP_LAYER_PARTITION=8,8,8,8,8 \
+VLLM_DSV41_HOST_HEADROOM_GIB=12 \
+VLLM_DSV41_PREFILL_WORKSPACE_TOKENS=65536 \
+VLLM_DEEPSEEK_V4_ENGRAM_GPU_DEQUANT=1 \
+VLLM_DEEPSEEK_V4_DECODE_TOPK_CACHE=1 \
+VLLM_MARLIN_M_ALIGN=1 \
+VLLM_DSV41_ROUTER_GEMM_ALIGN=split \
+/mnt/data/apps/vllma100/vllm170/.venv/bin/vllm serve /media/z/data6/models/DeepSeek-V4.1-Flash \
+  --served-model-name dsv41f \
+  --host 0.0.0.0 \
+  --port 26661 \
+  --pipeline-parallel-size 5 \
+  --tensor-parallel-size 1 \
+  --tokenizer-mode deepseek_v41 \
+  --attention-backend TRITON_MLA_SPARSE_DSV41 \
+  --moe-backend mxfp4_int8_sm80 \
+  --override-generation-config '{"temperature":1.0,"top_p":0.95}' \
+  --default-chat-template-kwargs '{"reasoning_effort":"max"}' \
+  --limit-mm-per-prompt '{"image":999}' \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes 2700000000 \
+  --block-size 128 \
+  --max-model-len 1048576 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 8 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy","moe_backend":"mxfp4_int8_sm80","enforce_eager":false,"enable_adaptive_verification":false,"dspark_pipeline_stage_ranks":[1,2,3]}' \
+  --gpu-memory-utilization 0.98 \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
+  --no-enable-flashinfer-autotune \
+  --reasoning-parser deepseek_v41 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v41 \
+  --long-prefill-token-threshold 256 \
+  --enable-adaptive-long-prefill \
+  --engram-config '{"cpu_offload":true,"embedding_across_dp":false,"ssd_offload_path":"/media/z/data6/vllm-engram-ssd","cpu_cache_gb":0.0,"ssd_scale_in_ram":true,"ssd_io_workers":8,"ssd_batch_reads":true,"ssd_prefetch":true}' \
+  --additional-config '{"dsv41_sm80_moe_tilelang":true,"dsv41_sm80_fused_swa_metadata":true,"dsv41_sm80_target_prepare_ahead":true,"dsv41_sm80_moe_hybrid_prefill":true,"dsv41_sm80_moe_small_tail_prefill":true,"ced_prefill":true}'
+```
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.
